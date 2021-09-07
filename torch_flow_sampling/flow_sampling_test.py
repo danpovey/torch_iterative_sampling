@@ -3,11 +3,29 @@
 
 import random
 import torch
-from torch_mutual_information import mutual_information_recursion
+from torch_flow_sampling import flow_sample
 
 
-def test_mutual_information_basic():
-    print("Running test_mutual_information_basic()")
+def test_flow_sampling_basic():
+    print("Running test_flow_sampling_basic()")
+
+    B = 30
+    N = 32
+    logits = torch.randn(B, N)
+    interp_prob = 0.5
+
+    sampled = flow_sample(logits, interp_prob)
+    assert torch.allclose(sampled.sum(dim=1), torch.tensor([1.0]))
+
+    proportion_interp = ((sampled != 0).sum() / B) - 1.0
+    print(f"interp_prob={interp_prob}, proportion_interp={proportion_interp} (should usually be < interp_prob)")
+
+
+
+    print("Sampled = ", sampled)
+
+
+    return
 
     for _iter in range(100):
         (B, S, T) = (random.randint(1, 10),
@@ -70,8 +88,8 @@ def test_mutual_information_basic():
                 px.requires_grad = True
                 py.requires_grad = True
 
-                #m = mutual_information_recursion(px, py, None)
-                m = mutual_information_recursion(px, py, boundary)
+                #m = flow_sampling_recursion(px, py, None)
+                m = flow_sampling_recursion(px, py, boundary)
 
                 print("m = ", m, ", size = ", m.shape)
                 #print("exp(m) = ", m.exp())
@@ -92,8 +110,8 @@ def test_mutual_information_basic():
                 assert 0
 
 
-def test_mutual_information_deriv():
-    print("Running test_mutual_information_deriv()")
+def test_flow_sampling_deriv():
+    print("Running test_flow_sampling_deriv()")
 
     for _iter in range(100):
         (B, S, T) = (random.randint(1, 10),
@@ -155,7 +173,7 @@ def test_mutual_information_deriv():
                 px.requires_grad = True
                 py.requires_grad = True
 
-                m = mutual_information_recursion(px, py, boundary)
+                m = flow_sampling_recursion(px, py, boundary)
 
                 #print("m = ", m)
                 #print("exp(m) = ", m.exp())
@@ -170,7 +188,7 @@ def test_mutual_information_deriv():
                 m.backward(gradient=m_grad)
                 delta = 1.0e-04
                 delta_px = delta * torch.randn_like(px)
-                m2 = mutual_information_recursion(px + delta_px, py, boundary)
+                m2 = flow_sampling_recursion(px + delta_px, py, boundary)
                 delta_m = m2 - m
                 observed_delta = (delta_m * m_grad).sum().to('cpu')
                 predicted_delta = (delta_px * px.grad).sum().to('cpu')
@@ -184,7 +202,7 @@ def test_mutual_information_deriv():
                     assert 0
 
                 delta_py = delta * torch.randn_like(py)
-                m2 = mutual_information_recursion(px, py + delta_py, boundary)
+                m2 = flow_sampling_recursion(px, py + delta_py, boundary)
                 delta_m = m2 - m
                 observed_delta = (delta_m * m_grad).sum().to('cpu')
                 predicted_delta = (delta_py * py.grad).sum().to('cpu')
@@ -205,6 +223,6 @@ def test_mutual_information_deriv():
 
 
 if __name__ == "__main__":
-    #torch.set_printoptions(edgeitems=30)
-    test_mutual_information_basic()
-    test_mutual_information_deriv()
+    torch.set_printoptions(edgeitems=30)
+    test_flow_sampling_basic()
+    test_flow_sampling_deriv()
