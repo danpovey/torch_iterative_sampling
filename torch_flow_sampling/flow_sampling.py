@@ -74,7 +74,7 @@ def _flow_sampling_backward_dispatcher(
             cumsum, rand, ans_indexes, ans_grad, interp_prob,
             straight_through_scale)
     else:
-        return torch_flow_sampling_cuda.flow_sampling_backward_cpu(
+        return torch_flow_sampling_cpu.flow_sampling_backward_cpu(
             cumsum, rand, ans_indexes, ans_grad, interp_prob,
             straight_through_scale)
 
@@ -190,7 +190,7 @@ class FlowSamplingFunction(torch.autograd.Function):
 def flow_sample(logits: torch.Tensor,
                 interp_prob: float,
                 dim: int = -1,
-                straight_through_scale: float = 1.0) -> torch.Tensor:
+                straight_through_scale: float = 0.0) -> torch.Tensor:
     """Forward propagation for flow-based sampling algorithm.  The forward
      algorithm is quite easy to explain.
 

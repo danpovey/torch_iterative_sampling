@@ -381,16 +381,22 @@
 
 
 /*
-  Return the index i into cumsum, such that cumsum[i] <= r < cumsum[i+1]
+  Return the index i into cumsum, such that cumsum[i - 1] <= r < cumsum[i]
+  (this is the inclusive cumulative sum, which is why we have i - 1 and i,
+  not i and i + 1).
+  We take cumsum[-1] to be negative infinity (we could almost equivalently
+  say 0, since we expect r >= 0).
 
-  Note: if r is less than cumsum[0] or greater than cumsum[N-1], this function
+  Note: if r is less than 0 or greater than cumsum[N-1], this function
   will return 0 or N-1 respectively; i.e. we won't go out of the available
   range.
  */
 template <typename IterType, typename ScalarType> int find_class(
     IterType cumsum, ScalarType r) {
+  // First search for the 'begin' element such that
+  // cumsum[begin] <= r < cumsum[begin+1]
   int N = cumsum.size(0),
-      begin = 0, end = N;
+      begin = -1, end = N - 1;
   while (end > begin + 1) {
     int mid = begin + (end - begin) / 2;
     if (cumsum[mid] <= r)
@@ -398,7 +404,7 @@ template <typename IterType, typename ScalarType> int find_class(
     else
       end = mid;
   }
-  return begin;
+  return begin + 1;
 }
 
 
