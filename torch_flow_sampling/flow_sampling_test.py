@@ -35,6 +35,39 @@ def test_flow_sampling_basic():
     return
 
 
+def test_flow_sampling_basic_cuda():
+    if not torch.cuda.is_available():
+        return
+    print("Running test_flow_sampling_basic_cuda()")
+
+
+    B = 30
+    N = 32
+    device=torch.device('cuda')
+    logits = torch.randn(B, N, device=device)
+    loss_grad = torch.randn(B, N, device=device)
+    interp_prob = 0.5
+
+
+    logits.requires_grad = True
+    sampled = flow_sample(logits, interp_prob)
+    print("sampled = ", sampled)
+    assert torch.allclose(sampled.sum(dim=1), torch.tensor([1.0], device=device))
+
+
+    loss = (sampled * loss_grad).sum()
+    loss.backward()
+
+    proportion_interp = ((sampled != 0).sum() / B) - 1.0
+    print(f"interp_prob={interp_prob}, proportion_interp={proportion_interp} (should usually be < interp_prob)")
+
+
+    print("Sampled = ", sampled)
+    print("logits_grad = ", logits.grad, ", sum = ", logits.grad.sum())
+
+    return
+
+
 def test_list_is_zero_mean(l: List[torch.Tensor]) -> None:
     """
     Tests that a provided list of Tensors has zero mean.  The Tensors must all have
@@ -55,7 +88,7 @@ def test_list_is_zero_mean(l: List[torch.Tensor]) -> None:
     y_meansq = y.mean(dim=0) ** 2  # shape = (D,), squared mean.
     y_meansq_div_var = y_meansq / y_var  # shape = (D,), mean^2 / var.
                                          # Average value should be about 1/N
-    avg_meansq = y_meansq_div_var.mean().item()
+    avg_meansq = y_meansq_div_var.mean().to('cpu').item()
     ratio = (avg_meansq / (1/(N-1)))
     print(f"avg_meansq_div_var = {avg_meansq}, vs. {1/(N-1)}, ratio = {ratio}")
     assert ratio > 0.75 and ratio < 1.25
@@ -95,95 +128,102 @@ def test_flow_sampling_linear1():
 
 def test_flow_sampling_linear():
     print("Running test_flow_sampling_linear()")
-    # Testing that the expected value of our sampling operation is the
-    # same as the softmax.
+    for device in ([torch.device('cpu'), torch.device('cuda')] if torch.cuda.is_available() else [torch.device('cpu')]):
 
-    # Caution: we need to have logits with a relatively low variance, and
-    # a fairly small number of classes, and a large number of elements in
-    # the list below (for _ in range(...)) for the statistical test to
-    # work out.  It can fail if some classes are so rarely sampled
-    # that we never see a sample of the class in the entire list-- or
-    # at least, if this happens for enough classes, and frequently enough,
-    # that it shows up in the globally averaged stats.
-    B = 30
-    N = 32
-    logits = 0.5 * torch.randn(B, N)
-    interp_prob = 0.5
+        # Testing that the expected value of our sampling operation is the
+        # same as the softmax.
 
-    expectation = logits.softmax(dim=1)
+        # Caution: we need to have logits with a relatively low variance, and
+        # a fairly small number of classes, and a large number of elements in
+        # the list below (for _ in range(...)) for the statistical test to
+        # work out.  It can fail if some classes are so rarely sampled
+        # that we never see a sample of the class in the entire list-- or
+        # at least, if this happens for enough classes, and frequently enough,
+        # that it shows up in the globally averaged stats.
+        B = 30
+        N = 32
+        logits = 0.5 * torch.randn(B, N)
+        interp_prob = 0.5
 
-    # We had to make the list length here quite long (1000) to get the test to
-    # (usually) pass.  This has to do with rarely sampled classes.
-    sampled = [ flow_sample(logits, interp_prob) - expectation for _ in range(1000) ]
+        expectation = logits.softmax(dim=1)
 
-    test_list_is_zero_mean(sampled)
+        # We had to make the list length here quite long (1000) to get the test to
+        # (usually) pass.  This has to do with rarely sampled classes.
+        sampled = [ flow_sample(logits, interp_prob) - expectation for _ in range(1000) ]
 
+        print(f"Testing zero-mean for device={device}")
+        test_list_is_zero_mean(sampled)
 
 
 def test_flow_sampling_linear_deriv():
     print("Running test_flow_sampling_linear_deriv()")
 
-    # Tests that for a linear loss funtion, the derivative given by our code is
-    # the same, in expectation, as the derivative given by our code.
+    for device in ([torch.device('cpu'), torch.device('cuda')] if torch.cuda.is_available() else [torch.device('cpu')]):
+        # Tests that for a linear loss funtion, the derivative given by our code is
+        # the same, in expectation, as the derivative given by our code.
 
 
-    # Caution: we need to have logits with a relatively low variance, and
-    # a fairly small number of classes, and a large number of elements in
-    # the list below (for _ in range(...)) for the statistical test to
-    # work out.  It can fail if some classes are so rarely sampled
-    # that we never see a sample of the class in the entire list-- or
-    # at least, if this happens for enough classes, and frequently enough,
-    # that it shows up in the globally averaged stats.
-    B = 30
-    N = 32
-    logits = 0.5 * torch.randn(B, N)
-    interp_prob = 0.5
+        # Caution: we need to have logits with a relatively low variance, and
+        # a fairly small number of classes, and a large number of elements in
+        # the list below (for _ in range(...)) for the statistical test to
+        # work out.  It can fail if some classes are so rarely sampled
+        # that we never see a sample of the class in the entire list-- or
+        # at least, if this happens for enough classes, and frequently enough,
+        # that it shows up in the globally averaged stats.
+        B = random.randint(50, 256) if device == torch.device('cuda') else random.randint(30, 50)
+        N = random.randint(32, 500) if device == torch.device('cuda') else random.randint(30, 50)
+        logits = 0.5 * torch.randn(B, N)
+        interp_prob = 0.5
 
-    loss_deriv = torch.randn(B, N)
+        loss_deriv = torch.randn(B, N)
 
-    logits.requires_grad = True
-    expectation = logits.softmax(dim=1)
+        logits.requires_grad = True
+        expectation = logits.softmax(dim=1)
 
-    loss = (expectation * loss_deriv).sum()
-    loss.backward()
-
-    exact_grad = logits.grad.detach()
-    logits.grad = None
-
-
-    if True:
-        # test with straight_through_scale=1.0
-        loss = (flow_sample(logits, interp_prob, straight_through_scale=1.0) * loss_deriv).sum()
+        loss = (expectation * loss_deriv).sum()
         loss.backward()
-        sampled_grad = logits.grad.detach()
-        assert torch.allclose(sampled_grad, exact_grad)
 
+        exact_grad = logits.grad.detach()
+        logits.grad = None
 
-    for straight_through_scale in (0.0, 0.5):
-        sampled_grads = []
-        for i in range(2000):
-            loss = (flow_sample(logits, interp_prob, straight_through_scale=straight_through_scale) * loss_deriv).sum()
+        if True:
+            # test with straight_through_scale=1.0
+            loss = (flow_sample(logits, interp_prob, straight_through_scale=1.0) * loss_deriv).sum()
             loss.backward()
             sampled_grad = logits.grad.detach()
-            sampled_grads.append(sampled_grad)
-            logits.grad = None
+            if not torch.allclose(sampled_grad, exact_grad, atol=1.0e-04):
+                print(f"B = {B}, N = {N}, sampled_grad={sampled_grad}, exact_grad={exact_grad}")
+                assert 0, "sampled_grad != exact_grad"
 
-            if i < 5:
-                print(f"straight_through_scale={straight_through_scale}, sampled_grads norm = {torch.linalg.norm(sampled_grad)}, exact norm = {torch.linalg.norm(exact_grad)}")
+        for straight_through_scale in (0.0, 0.5):
+            sampled_grads = []
+            # Use B * 50 for the number of samples, because as B gets larger, each class becomes rarer
+            # on average, so for the law of large numbers to work we need larger numbers of samples..
+            for i in range(B * 50):
+                loss = (flow_sample(logits, interp_prob, straight_through_scale=straight_through_scale) * loss_deriv).sum()
+                loss.backward()
+                sampled_grad = logits.grad.detach()
+                sampled_grads.append(sampled_grad)
+                logits.grad = None
+
+                if i < 5:
+                    print(f"straight_through_scale={straight_through_scale}, sampled_grads norm = {torch.linalg.norm(sampled_grad)}, exact norm = {torch.linalg.norm(exact_grad)}")
 
 
-        diff_grads = [ sampled_grad - exact_grad for sampled_grad in sampled_grads ]
+            diff_grads = [ sampled_grad - exact_grad for sampled_grad in sampled_grads ]
 
-        print(f"Testing same-mean property for sampled_grads vs exact_grad with straight_through_scale={straight_through_scale}")
-        test_list_is_zero_mean(diff_grads)
-
-
+            print(f"Testing same-mean property for sampled_grads vs exact_grad with straight_through_scale={straight_through_scale}, device={device}, B={B}, N={N}")
+            test_list_is_zero_mean(diff_grads)
 
 
 if __name__ == "__main__":
     torch.set_printoptions(edgeitems=30)
-    test_flow_sampling_basic()
-    test_flow_sampling_linear1()
-    test_flow_sampling_linear()
-    test_flow_sampling_linear_deriv()
+    # Caution!  This is very slow, can take half an hour.
+    # Some of the statistical tests require a lot of samples
+    for _ in range(4):
+        test_flow_sampling_basic()
+        test_flow_sampling_basic_cuda()
+        test_flow_sampling_linear1()
+        test_flow_sampling_linear()
+        test_flow_sampling_linear_deriv()
     print("Done")

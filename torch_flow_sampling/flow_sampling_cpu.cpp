@@ -444,8 +444,8 @@ std::vector<torch::Tensor> flow_sampling_cpu(torch::Tensor cumsum,
   TORCH_CHECK(cumsum.device().is_cpu() && rand.device().is_cpu(),
               "inputs must be CPU tensors");
 
-  auto scalar_t = cumsum.scalar_type();
-  auto opts = torch::TensorOptions().dtype(scalar_t).device(cumsum.device());
+  auto scalar_type = cumsum.scalar_type();
+  auto opts = torch::TensorOptions().dtype(scalar_type).device(cumsum.device());
 
   const int B = cumsum.size(0),
       N = cumsum.size(1);
@@ -456,7 +456,7 @@ std::vector<torch::Tensor> flow_sampling_cpu(torch::Tensor cumsum,
 
   torch::Tensor ans_indexes = torch::empty({B, 2}, int32_opts);
 
-  AT_DISPATCH_FLOATING_TYPES(scalar_t, "flow_sampling_cpu_loop", ([&] {
+  AT_DISPATCH_FLOATING_TYPES(scalar_type, "flow_sampling_cpu_loop", ([&] {
         auto cumsum_a = cumsum.packed_accessor32<scalar_t, 2>(),
             rand_a = rand.packed_accessor32<scalar_t, 2>(),
             ans_a = ans.packed_accessor32<scalar_t, 2>();
@@ -526,8 +526,8 @@ torch::Tensor flow_sampling_backward_cpu(
   TORCH_CHECK(straight_through_scale >= 0.0 && straight_through_scale <= 1.0);
 
 
-  auto scalar_t = cumsum.scalar_type();
-  auto opts = torch::TensorOptions().dtype(scalar_t).device(cumsum.device());
+  auto scalar_type = cumsum.scalar_type();
+  auto opts = torch::TensorOptions().dtype(scalar_type).device(cumsum.device());
 
   const int B = cumsum.size(0),
       N = cumsum.size(1);
@@ -549,7 +549,7 @@ torch::Tensor flow_sampling_backward_cpu(
        torch::zeros({B, N}, opts) :
        torch::empty({B, N}, opts));
 
-  AT_DISPATCH_FLOATING_TYPES(scalar_t, "flow_sampling_cpu_backward_loop", ([&] {
+  AT_DISPATCH_FLOATING_TYPES(cumsum.scalar_type(), "flow_sampling_cpu_backward_loop", ([&] {
         auto cumsum_a = cumsum.packed_accessor32<scalar_t, 2>(),
             rand_a = rand.packed_accessor32<scalar_t, 2>(),
             ans_grad_a = ans_grad.packed_accessor32<scalar_t, 2>(),
