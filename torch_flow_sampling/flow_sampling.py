@@ -190,7 +190,8 @@ class FlowSamplingFunction(torch.autograd.Function):
 def flow_sample(logits: torch.Tensor,
                 interp_prob: float,
                 dim: int = -1,
-                straight_through_scale: float = 0.0) -> torch.Tensor:
+                straight_through_scale: float = 0.0,
+                rand: Optional[Tensor] = None) -> torch.Tensor:
     """Forward propagation for flow-based sampling algorithm.  The forward
      algorithm is quite easy to explain.
 
@@ -215,6 +216,9 @@ def flow_sample(logits: torch.Tensor,
             informing the backprop machinery.  You can use nonzero straight_through_scale
             values, particularly early in training, to get a parameter derivative that is biased
             but likely has lower variance.
+          rand:  If provided, must be a uniformly distributed random tensor
+            with shape: (B, 2) where B = logits.numel() / logits.shape[dim].
+            This is intended to be used for testing only.
 
         Return:
             Returns a tensor `result` of shape (*, N), like `logits`.  Will satisfy
@@ -243,7 +247,8 @@ def flow_sample(logits: torch.Tensor,
     shape = logits.shape
     logits = logits.reshape(-1, shape[-1])
     B = logits.shape[0]
-    rand = torch.rand(B, 3, dtype=logits.dtype, device=logits.device)
+    if rand is None:
+        rand = torch.rand(B, 3, dtype=logits.dtype, device=logits.device)
     ans = FlowSamplingFunction.apply(logits, rand, interp_prob,
                                      straight_through_scale)
     ans = ans.reshape(shape)

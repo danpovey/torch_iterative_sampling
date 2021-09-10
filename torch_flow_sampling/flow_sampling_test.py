@@ -68,6 +68,46 @@ def test_flow_sampling_basic_cuda():
     return
 
 
+def test_flow_sampling_basic_cuda_cpu():
+    if not torch.cuda.is_available():
+        return
+    # Test that CUDA and CPU compuations are the same.
+    print("Running test_flow_sampling_basic_cuda_cpu()")
+
+    device=torch.device('cuda')
+    cpu=torch.device('cpu')
+
+    B = random.randint(30, 80)
+    N = random.randint(30, 100)
+    device=torch.device('cuda')
+    logits = torch.randn(B, N)
+    loss_grad = torch.randn(B, N)
+    rand = torch.rand(B, 3)
+    interp_prob = 0.5
+
+
+    logits.requires_grad = True
+    sampled = flow_sample(logits, interp_prob, rand=rand)
+
+    logits_cuda = logits.detach().to(device)
+    logits_cuda.requires_grad = True
+    sampled_cuda = flow_sample(logits_cuda, interp_prob, rand=rand.to(device))
+    print("sampled=", sampled)
+    print("sampled_cuda=", sampled_cuda)
+    assert torch.allclose(sampled, sampled_cuda.to('cpu'), atol=1.0e-04)
+
+    loss = (sampled * loss_grad).sum()
+    loss.backward()
+
+    loss_cuda = (sampled_cuda * loss_grad.to(device)).sum()
+    loss_cuda.backward()
+
+    assert torch.allclose(logits.grad, logits_cuda.grad.to('cpu'), atol=1.0e-04)
+
+    return
+
+
+
 def test_list_is_zero_mean(l: List[torch.Tensor]) -> None:
     """
     Tests that a provided list of Tensors has zero mean.  The Tensors must all have
@@ -170,8 +210,8 @@ def test_flow_sampling_linear_deriv():
         # that we never see a sample of the class in the entire list-- or
         # at least, if this happens for enough classes, and frequently enough,
         # that it shows up in the globally averaged stats.
-        B = random.randint(50, 256) if device == torch.device('cuda') else random.randint(30, 50)
-        N = random.randint(32, 500) if device == torch.device('cuda') else random.randint(30, 50)
+        B = random.randint(50, 500) if device == torch.device('cuda') else random.randint(30, 50)
+        N = random.randint(32, 270) if device == torch.device('cuda') else random.randint(30, 50)
         logits = 0.5 * torch.randn(B, N)
         interp_prob = 0.5
 
@@ -197,9 +237,9 @@ def test_flow_sampling_linear_deriv():
 
         for straight_through_scale in (0.0, 0.5):
             sampled_grads = []
-            # Use B * 50 for the number of samples, because as B gets larger, each class becomes rarer
+            # Use N * 50 for the number of samples, because as N gets larger, each class becomes rarer
             # on average, so for the law of large numbers to work we need larger numbers of samples..
-            for i in range(B * 50):
+            for i in range(N * 50):
                 loss = (flow_sample(logits, interp_prob, straight_through_scale=straight_through_scale) * loss_deriv).sum()
                 loss.backward()
                 sampled_grad = logits.grad.detach()
@@ -222,6 +262,7 @@ if __name__ == "__main__":
     # Some of the statistical tests require a lot of samples
     for _ in range(4):
         test_flow_sampling_basic()
+        test_flow_sampling_basic_cuda_cpu()
         test_flow_sampling_basic_cuda()
         test_flow_sampling_linear1()
         test_flow_sampling_linear()
