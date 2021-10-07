@@ -41,29 +41,25 @@ def test_flow_sampling_basic_cuda():
     print("Running test_flow_sampling_basic_cuda()")
 
 
-    B = 30
-    N = 32
+    shape = [345, 14, 2, 256]
     device=torch.device('cuda')
-    logits = torch.randn(B, N, device=device)
-    loss_grad = torch.randn(B, N, device=device)
+    logits = torch.randn(*shape, device=device)
+    loss_grad = torch.randn(*shape, device=device)
     interp_prob = 0.5
 
 
     logits.requires_grad = True
     sampled = flow_sample(logits, interp_prob)
-    print("sampled = ", sampled)
-    assert torch.allclose(sampled.sum(dim=1), torch.tensor([1.0], device=device))
+    assert torch.allclose(sampled.sum(dim=-1), torch.tensor([1.0], device=device))
 
 
     loss = (sampled * loss_grad).sum()
     loss.backward()
 
-    proportion_interp = ((sampled != 0).sum() / B) - 1.0
+    proportion_interp = ((sampled != 0).sum() / (sampled.numel() // sampled.shape[-1]) - 1.0)
     print(f"interp_prob={interp_prob}, proportion_interp={proportion_interp} (should usually be < interp_prob)")
 
 
-    print("Sampled = ", sampled)
-    print("logits_grad = ", logits.grad, ", sum = ", logits.grad.sum())
 
     return
 

@@ -176,7 +176,6 @@ class FlowSamplingFunction(torch.autograd.Function):
             ctx.save_for_backward(cumsum, rand, ans_indexes)
         return ans
 
-
     @staticmethod
     def backward(ctx, ans_grad: Tensor) -> Tuple[torch.Tensor, None, None, None]:
         (cumsum, rand, ans_indexes) = ctx.saved_tensors

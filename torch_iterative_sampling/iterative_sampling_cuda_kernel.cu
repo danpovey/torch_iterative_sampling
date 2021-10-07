@@ -2,7 +2,7 @@
 #include <c10/cuda/CUDAStream.h>  // for getCurrentCUDAStream()
 #include <cooperative_groups.h>
 #include <cmath>  // for INFINITY
-
+#include <stdio.h>
 
 extern __shared__ int extern_buf[];
 // `extern_buf` is general-purpose shared memory.
@@ -158,19 +158,20 @@ void flow_sampling_kernel(
        All threads return the sum.
  */
 template <typename scalar_t>
-__forceinline__ __device__ scalar_t within_warp_reduce_sum(__volatile__ scalar_t *buf,
+__forceinline__ __device__ scalar_t within_tile_reduce_sum(__volatile__ scalar_t *buf,
+                                                           cooperative_groups::thread_group tile,
                                                            scalar_t val) {
   // Each iteration halves the number of active threads Each thread adds its
   // partial sum[i] to sum[lane+i]
   for (int i = blockDim.x / 2; i > 0; i /= 2) {
     buf[threadIdx.x] = val;
-    __syncwarp();
+    tile.sync();
     if (threadIdx.x < i)
       val += buf[threadIdx.x + i];
   }
   if (threadIdx.x == 0) {
     buf[0] = val;
-    __syncwarp();
+    tile.sync();
   }
   return buf[0];  // All threads return the summed value.
 }
@@ -253,7 +254,7 @@ void flow_sampling_backward_kernel(
       z_grad -= prob * o_grad;
     }
     // all threads get the sum of their group.
-    z_grad = within_warp_reduce_sum(group_reduce_buf, z_grad);
+    z_grad = within_tile_reduce_sum(group_reduce_buf, group_tile, z_grad);
   }
 
   int32_t i1, i2;
