@@ -40,7 +40,7 @@ __device__ __forceinline__ int find_class(
 
 
 /*
-  Forward of flow_sampling.
+  Forward of iterative_sampling.
 
   The thread-block will be of shape  (blockDim.x, blockDim.y)
   where blockDim.x, e.g. 16, corresponds to a group of threads assigned to process a
@@ -61,7 +61,7 @@ __device__ __forceinline__ int find_class(
              of shape (B, N)
       rand:  Accessor to a tensor of random numbers, of shape (B, 3).
            Probably the easiest way to see how they are used is to
-           look at the CPU code in flow_sampling_cpu.cpp
+           look at the CPU code in iterative_sampling_cpu.cpp
       out: Accessor to the output (which will be empty/undefined at entry),
            of shape (B, N)
 
@@ -72,7 +72,7 @@ __device__ __forceinline__ int find_class(
 */
 template <typename scalar_t>
 __global__
-void flow_sampling_kernel(
+void iterative_sampling_kernel(
     torch::PackedTensorAccessor32<scalar_t, 2> cumsum,   // B, N
     torch::PackedTensorAccessor32<scalar_t, 2> rand,   // B, 3
     torch::PackedTensorAccessor32<scalar_t, 2> ans,    // B, N
@@ -180,10 +180,10 @@ __forceinline__ __device__ scalar_t within_tile_reduce_sum(__volatile__ scalar_t
 
 /*
   Backward kernel for flow sampling.  Please see the corresponding CPU code in
-  flow_sampling_cpu.cpp to understand the algorithm and inputs.
+  iterative_sampling_cpu.cpp to understand the algorithm and inputs.
 
   The block and grid dimensions are the same as we documented above for
-  flow_sampling_kernel(); however, it needs a little more shared memory
+  iterative_sampling_kernel(); however, it needs a little more shared memory
   to be allocated.
 
   When this kernel is invoked, the suer must specify the amount of shared memory
@@ -194,7 +194,7 @@ __forceinline__ __device__ scalar_t within_tile_reduce_sum(__volatile__ scalar_t
  */
 template <typename scalar_t>
 __global__
-void flow_sampling_backward_kernel(
+void iterative_sampling_backward_kernel(
     torch::PackedTensorAccessor32<scalar_t, 2> cumsum,   // B, N
     torch::PackedTensorAccessor32<scalar_t, 2> rand,   // B, 3
     torch::PackedTensorAccessor32<scalar_t, 2> ans_grad,    // B, N
@@ -312,8 +312,8 @@ void flow_sampling_backward_kernel(
 
 
 
-// See flow_sampling_cpu() in flow_sampline_cpu.cpp, for documentation.
-std::vector<torch::Tensor> flow_sampling_cuda(torch::Tensor cumsum,
+// See iterative_sampling_cpu() in iterative_sampline_cpu.cpp, for documentation.
+std::vector<torch::Tensor> iterative_sampling_cuda(torch::Tensor cumsum,
                                               torch::Tensor rand,
                                               float interp_prob) {
   TORCH_CHECK(cumsum.dim() == 2, "cumsum must be 2-dimensional");
@@ -345,9 +345,9 @@ std::vector<torch::Tensor> flow_sampling_cuda(torch::Tensor cumsum,
   dim3 blockDim(threads_per_group, groups_per_block, 1),
       gridDim(1, num_blocks, 1);
 
-  AT_DISPATCH_FLOATING_TYPES(scalar_type, "flow_sampling_cuda_stub", ([&] {
+  AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_cuda_stub", ([&] {
         int extern_memory_bytes = groups_per_block * N * sizeof(scalar_t);
-        flow_sampling_kernel<scalar_t><<<gridDim, blockDim, extern_memory_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        iterative_sampling_kernel<scalar_t><<<gridDim, blockDim, extern_memory_bytes, at::cuda::getCurrentCUDAStream()>>>(
             cumsum.packed_accessor32<scalar_t, 2>(),
             rand.packed_accessor32<scalar_t, 2>(),
             ans.packed_accessor32<scalar_t, 2>(),
@@ -360,12 +360,12 @@ std::vector<torch::Tensor> flow_sampling_cuda(torch::Tensor cumsum,
 
 
 /*
-  Backward of flow sampling, please see flow_sampling_cpu.cpp for more
+  Backward of flow sampling, please see iterative_sampling_cpu.cpp for more
   documentation.
 
   Returns logits_grad.
 */
-torch::Tensor flow_sampling_backward_cuda(
+torch::Tensor iterative_sampling_backward_cuda(
     torch::Tensor cumsum,
     torch::Tensor rand,
     torch::Tensor ans_indexes,
@@ -407,9 +407,9 @@ torch::Tensor flow_sampling_backward_cuda(
   dim3 blockDim(threads_per_group, groups_per_block, 1),
       gridDim(1, num_blocks, 1);
 
-  AT_DISPATCH_FLOATING_TYPES(scalar_type, "flow_sampling_backward_cuda_stub", ([&] {
+  AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_backward_cuda_stub", ([&] {
         int extern_memory_bytes =  groups_per_block * (N + threads_per_group) * sizeof(scalar_t);
-        flow_sampling_backward_kernel<scalar_t><<<gridDim, blockDim, extern_memory_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        iterative_sampling_backward_kernel<scalar_t><<<gridDim, blockDim, extern_memory_bytes, at::cuda::getCurrentCUDAStream()>>>(
             cumsum.packed_accessor32<scalar_t, 2>(),
             rand.packed_accessor32<scalar_t, 2>(),
             ans_grad.packed_accessor32<scalar_t, 2>(),

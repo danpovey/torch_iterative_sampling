@@ -3,12 +3,12 @@
 
 import random
 import torch
-from torch_flow_sampling import flow_sample
+from torch_iterative_sampling import iterative_sample
 from typing import List
 
 
-def test_flow_sampling_basic():
-    print("Running test_flow_sampling_basic()")
+def test_iterative_sampling_basic():
+    print("Running test_iterative_sampling_basic()")
 
     B = 30
     N = 32
@@ -18,7 +18,7 @@ def test_flow_sampling_basic():
 
 
     logits.requires_grad = True
-    sampled = flow_sample(logits, interp_prob)
+    sampled = iterative_sample(logits, interp_prob)
     assert torch.allclose(sampled.sum(dim=1), torch.tensor([1.0]))
 
 
@@ -35,10 +35,10 @@ def test_flow_sampling_basic():
     return
 
 
-def test_flow_sampling_basic_cuda():
+def test_iterative_sampling_basic_cuda():
     if not torch.cuda.is_available():
         return
-    print("Running test_flow_sampling_basic_cuda()")
+    print("Running test_iterative_sampling_basic_cuda()")
 
 
     shape = [345, 14, 2, 256]
@@ -49,7 +49,7 @@ def test_flow_sampling_basic_cuda():
 
 
     logits.requires_grad = True
-    sampled = flow_sample(logits, interp_prob)
+    sampled = iterative_sample(logits, interp_prob)
     assert torch.allclose(sampled.sum(dim=-1), torch.tensor([1.0], device=device))
 
 
@@ -64,11 +64,11 @@ def test_flow_sampling_basic_cuda():
     return
 
 
-def test_flow_sampling_basic_cuda_cpu():
+def test_iterative_sampling_basic_cuda_cpu():
     if not torch.cuda.is_available():
         return
     # Test that CUDA and CPU compuations are the same.
-    print("Running test_flow_sampling_basic_cuda_cpu()")
+    print("Running test_iterative_sampling_basic_cuda_cpu()")
 
     device=torch.device('cuda')
     cpu=torch.device('cpu')
@@ -83,11 +83,11 @@ def test_flow_sampling_basic_cuda_cpu():
 
 
     logits.requires_grad = True
-    sampled = flow_sample(logits, interp_prob, rand=rand)
+    sampled = iterative_sample(logits, interp_prob, rand=rand)
 
     logits_cuda = logits.detach().to(device)
     logits_cuda.requires_grad = True
-    sampled_cuda = flow_sample(logits_cuda, interp_prob, rand=rand.to(device))
+    sampled_cuda = iterative_sample(logits_cuda, interp_prob, rand=rand.to(device))
     print("sampled=", sampled)
     print("sampled_cuda=", sampled_cuda)
     assert torch.allclose(sampled, sampled_cuda.to('cpu'), atol=1.0e-04)
@@ -135,8 +135,8 @@ def test_list_is_zero_mean(l: List[torch.Tensor]) -> None:
 # >>> avg_meansq_div_var = 0.010024802759289742, vs. 0.010101010101010102, ratio = 0.9924554731696843
 
 
-def test_flow_sampling_linear1():
-    print("Running test_flow_sampling_linear1()")
+def test_iterative_sampling_linear1():
+    print("Running test_iterative_sampling_linear1()")
 
     # Testing that the expected value of our sampling operation is the
     # same as the softmax.
@@ -155,15 +155,15 @@ def test_flow_sampling_linear1():
 
     expectation = logits.softmax(dim=1)
 
-    avg_sampled = torch.stack([ flow_sample(logits, interp_prob) for _ in range(300) ], dim=0).mean(dim=0)
+    avg_sampled = torch.stack([ iterative_sample(logits, interp_prob) for _ in range(300) ], dim=0).mean(dim=0)
 
     print("Expectation = ", expectation)
     print("vs. Avg_sampled = ", avg_sampled)
 
 
 
-def test_flow_sampling_linear():
-    print("Running test_flow_sampling_linear()")
+def test_iterative_sampling_linear():
+    print("Running test_iterative_sampling_linear()")
     for device in ([torch.device('cpu'), torch.device('cuda')] if torch.cuda.is_available() else [torch.device('cpu')]):
 
         # Testing that the expected value of our sampling operation is the
@@ -185,14 +185,14 @@ def test_flow_sampling_linear():
 
         # We had to make the list length here quite long (1000) to get the test to
         # (usually) pass.  This has to do with rarely sampled classes.
-        sampled = [ flow_sample(logits, interp_prob) - expectation for _ in range(1000) ]
+        sampled = [ iterative_sample(logits, interp_prob) - expectation for _ in range(1000) ]
 
         print(f"Testing zero-mean for device={device}")
         test_list_is_zero_mean(sampled)
 
 
-def test_flow_sampling_linear_deriv():
-    print("Running test_flow_sampling_linear_deriv()")
+def test_iterative_sampling_linear_deriv():
+    print("Running test_iterative_sampling_linear_deriv()")
 
     for device in ([torch.device('cpu'), torch.device('cuda')] if torch.cuda.is_available() else [torch.device('cpu')]):
         # Tests that for a linear loss funtion, the derivative given by our code is
@@ -224,7 +224,7 @@ def test_flow_sampling_linear_deriv():
 
         if True:
             # test with straight_through_scale=1.0
-            loss = (flow_sample(logits, interp_prob, straight_through_scale=1.0) * loss_deriv).sum()
+            loss = (iterative_sample(logits, interp_prob, straight_through_scale=1.0) * loss_deriv).sum()
             loss.backward()
             sampled_grad = logits.grad.detach()
             if not torch.allclose(sampled_grad, exact_grad, atol=1.0e-04):
@@ -236,7 +236,7 @@ def test_flow_sampling_linear_deriv():
             # Use N * 50 for the number of samples, because as N gets larger, each class becomes rarer
             # on average, so for the law of large numbers to work we need larger numbers of samples..
             for i in range(N * 50):
-                loss = (flow_sample(logits, interp_prob, straight_through_scale=straight_through_scale) * loss_deriv).sum()
+                loss = (iterative_sample(logits, interp_prob, straight_through_scale=straight_through_scale) * loss_deriv).sum()
                 loss.backward()
                 sampled_grad = logits.grad.detach()
                 sampled_grads.append(sampled_grad)
@@ -257,10 +257,10 @@ if __name__ == "__main__":
     # Caution!  This is very slow, can take half an hour.
     # Some of the statistical tests require a lot of samples
     for _ in range(4):
-        test_flow_sampling_basic()
-        test_flow_sampling_basic_cuda_cpu()
-        test_flow_sampling_basic_cuda()
-        test_flow_sampling_linear1()
-        test_flow_sampling_linear()
-        test_flow_sampling_linear_deriv()
+        test_iterative_sampling_basic()
+        test_iterative_sampling_basic_cuda_cpu()
+        test_iterative_sampling_basic_cuda()
+        test_iterative_sampling_linear1()
+        test_iterative_sampling_linear()
+        test_iterative_sampling_linear_deriv()
     print("Done")

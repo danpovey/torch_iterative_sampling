@@ -2,6 +2,8 @@
 #include <torch/extension.h>
 
 
+
+
 /*
   BACKPROP NOTES
 
@@ -381,22 +383,37 @@
 
 
 /*
-  Return the index i into cumsum, such that cumsum[i - 1] <= r < cumsum[i]
-  (this is the inclusive cumulative sum, which is why we have i - 1 and i,
-  not i and i + 1).
-  We take cumsum[-1] to be negative infinity (we could almost equivalently
-  say 0, since we expect r >= 0).
-
-  Note: if r is less than 0 or greater than cumsum[N-1], this function
-  will return 0 or N-1 respectively; i.e. we won't go out of the available
-  range.
- */
+  Return the index i into cumsum, with begin <= i < end,
+  such that cumsum[i] <= r < cumsum[i + 1].
+  We assume that cumsum[begin] <= r < cumsum[end], and we do not
+  access those two elements.
+*/
 template <typename IterType, typename ScalarType> int find_class(
-    IterType cumsum, ScalarType r) {
-  // First search for the 'begin' element such that
-  // cumsum[begin] <= r < cumsum[begin+1]
+    IterType cumsum, int begin, int end, ScalarType r) {
+  // First search for the element i with  begin <= i < end,
+  // such that
+  // cumsum[i] <= r < cumsum[i+1]
   int N = cumsum.size(0),
-      begin = -1, end = N - 1;
+      begin = 0, end = N;
+  while (end > begin + 1) {
+    int mid = begin + (end - begin) / 2;
+    if (cumsum[mid] <= r)
+      begin = mid;
+    else
+      end = mid;
+  }
+  return begin;
+}
+
+
+/*
+  Return the index i into cumsum, with begin <= i < end,
+  such that cumsum[i] <= r < cumsum[i + 1].
+  We assume that cumsum[begin] <= r < cumsum[end], and we do not
+  access those two elements.
+*/
+template <ScalarType> inline int find_class_in_vec(
+    std::vector<ScalarType> &cumsum, int begin, int end, ScalarType r) {
   while (end > begin + 1) {
     int mid = begin + (end - begin) / 2;
     if (cumsum[mid] <= r)
@@ -407,63 +424,214 @@ template <typename IterType, typename ScalarType> int find_class(
   return begin + 1;
 }
 
+/*
+  Randomly discretize the weight `weight` (which we expect to satisfy 0 <= weight <= 1),
+  into a value 0 <= ans <= 1 which is limited to M discrete increments.
+
+    weight: a value satisfying 0 <= weight <= 1
+       M:  an integer greater than 1, e.g. 256.
+       r:  a pointer to a a random value 0 <= *r <= 1, that will determine the random
+           component of the discretized value.  At exit, it will be modified to a new
+           value 0 <= *r <= 1 that can be treated as a "new" random value (by zooming
+           into the interval we chose).
+
+ */
+template <ScalarType> inline scalar_t discretize_weight(scalar_t weight, int M, scalar_t *r) {
+  assert(weight >= 0 && weight <= 1.0);
+  // e.g. if M == 128, we divide the range [0..1] into 127 equal intervals, so that we
+  // can represent both 0 and 1.
+  scalar_t weight_scaled = weight * (M - 1);
+  int lower_val = (int) weight_scaled;  // rounds down.
+  if (lower_val >= M - 2) {
+    // This should only happen if weight == 1.0 (hence weight_scaled == M - 1).
+    lower_val = M - 2;
+  }
+  scalar_t residual = weight_scaled - lower_val;
+  asert(residual >= 0.0 && residual <= 1.0);
+  if (*r < residual) {
+    *r = *r / residual;  // make it a "new" random value by zooming in.
+    return (lower_val + 1) / scalar_t(M - 1);
+  } else {
+    *r = (*r - residual) / (1.0 - residual);
+    return lower_val / scalar_t(M - 1);
+    assert(*r >= 0.0 && *r <= 1.0); // TODO: remove assertion.
+  }
+}
+
+
+float Exp(float f) {
+  return expf(f);
+}
+double Exp(double f) {
+  return exp(f);
+}
+
 
 /*
-  Forward of flow_sampling.  See """... """ comment of `flow_sampling` in
-  flow_sampling.py for documentation of the behavior of this function.
+  Forward of iterative_sampling.  See """... """ comment of `iterative_sampling` in
+  iterative_sampling.py for documentation of the behavior of this function.
 
-    cumsum: inclusive cumulative sum of input class probabilities,
-      of shape (B, N) where B is the batch dim and N is the number
-      of classes.  E.g. cumsum = [[ 0.1 0.3 0.4 1.0 ], [ 0.05, 0.25, 0.7, 1.0]].
-      The code will assume that the last element is exactly 1.0,
-      even if that is not the case.
-    rand:  A uniformly distributed random tensor (on [0,1]) of shape (B, 3).
-       rand[b][0] determines sample1; rand[b][1] determines
-       sample2; and rand[b][2] determines how we interpolate the two (i.e. d,
-       in the math above, see FORWARD ALGORITHM above.
-    interp_prob:  A value with 0 < interp_prob <= 1 that determines
-       the proportion of the time the output will be interpolated between
-       two one-hot vectors (caution: this includes interpolation between
-       two instances of the *same* one-hot vector).
+    cumsum: (exclusive) cumulative probabilities of input classes, of shape (B, N) where B is the
+        batch size and N is the number of classes, so element cumsum[b][0] would be 0.0,
+        cumsum[b][1] = the first probability, cumsum[b][2] = sum of 1st and 2nd probabilities, and so on.
+    alpha:  normalization factors, of shape (B), which is the same as the *
+            in `probs`.  Numbers satisfying:
+                torch.allclose((1 - (-probs * alpha.unsqueeze(-1)).exp()).sum(dim=-1), K),
+             i.e. \sum_i (1 - exp(-alpha * probs_i)) == K.
+     rand:  random numbers in range [0,1], of shape (B)
+   rand:
+     K:   number of samples to choose
+     M:   number of levels of discretization of the interval [0,1], for
+          the class weights at the output
+
    Return:
-       Returns (ans, ans_indexes),
-       where:
-          ans is the result of sampling (one-hot or interpolated one-hot
-          vectors, with the same shape as cumsum), and
-          ans_indexes is a tensor of shape (B, 2) of int32_t, that will
-          be required by the backward code.
+       Returns (indexes, weights), where:
+       indexes: a Tensor of shape (B, K) and type torch::kInt64, containing,
+               for each B, a series of K distinct sampled integers in the
+               range [0,N-1].
+       weights: a Tensor of shape (B, K) of type the same as probs (e.g. float),
+               containing the discretized weights corresponding to each index,
+               converted back to float values in the range [0,1].  These will
+               in general be larger than the corresponding weights in `probs`,
+               because we divide by the probability of choosing each class,
+               in order to preserve expectations.
 */
-std::vector<torch::Tensor> flow_sampling_cpu(torch::Tensor cumsum,
-                                             torch::Tensor rand,
-                                             float interp_prob) {
-  TORCH_CHECK(cumsum.dim() == 2, "cumsum must be 2-dimensional");
-  TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
-  TORCH_CHECK(cumsum.size(0) == rand.size(0) &&
-              rand.size(1) == 3, "rand has unexpected shape");
-  TORCH_CHECK(interp_prob > 0.0 && interp_prob <= 1.0);
-  TORCH_CHECK(cumsum.device().is_cpu() && rand.device().is_cpu(),
+std::vector<torch::Tensor> iterative_sampling_cpu(torch::Tensor probs,
+                                                  torch::Tensor alpha,
+                                                  torch::Tensor rand,
+                                                  int K,
+                                                  int M) {
+  TORCH_CHECK(probs.dim() == 2, "cumsum must be 2-dimensional");
+  int B = probs.size(0),
+      N = probs.size(1);
+
+  TORCH_CHECK(alpha.dim() == 1, "alpha must be 1-dimensional");
+  TORCH_CHECK(rand.dim() == 1, "rand must be 1-dimensional");
+  TORCH_CHECK(K > 0 && K < N);
+  TORCH_CHECK(M > 1);
+  TORCH_CHECK(alpha.size(0) == B);
+  TORCH_CHECK(rand.size(0) == B);
+
+
+  TORCH_CHECK(probs.device().is_cpu() && alpha.device().is_cpu() &&
+              rand.device().is_cpu(),
               "inputs must be CPU tensors");
 
-  auto scalar_type = cumsum.scalar_type();
-  auto opts = torch::TensorOptions().dtype(scalar_type).device(cumsum.device());
+  auto scalar_type = probs.scalar_type();
 
-  const int B = cumsum.size(0),
-      N = cumsum.size(1);
+  auto opts = torch::TensorOptions().dtype(scalar_type).device(probs.device()),
+      long_opts = torch::TensorOptions().dtype(torch::kInt64).device(probs.device());
 
-  torch::Tensor ans = torch::zeros({B, N}, opts);
 
-  auto int32_opts = torch::TensorOptions().dtype(torch::kInt32).device(cumsum.device());
+  torch::Tensor indexes = torch::zeros({B, N}, long_opts),
+      weights = torch::zeros({B, N}, opts);
 
-  torch::Tensor ans_indexes = torch::empty({B, 2}, int32_opts);
 
-  AT_DISPATCH_FLOATING_TYPES(scalar_type, "flow_sampling_cpu_loop", ([&] {
+  AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_cpu_loop", ([&] {
         auto cumsum_a = cumsum.packed_accessor32<scalar_t, 2>(),
-            rand_a = rand.packed_accessor32<scalar_t, 2>(),
-            ans_a = ans.packed_accessor32<scalar_t, 2>();
-        auto ans_indexes_a = ans_indexes.packed_accessor32<int32_t, 2>();
-        float lower_bound = (1.0 - interp_prob) * 0.5,
-            upper_bound = (1.0 + interp_prob) * 0.5;
+            weights_a = weights.packed_accessor32<scalar_t, 2>();
+        auto alpha_a = alpha.packed_accessor32<scalar_t, 1>(),
+            rand_a = rand.packed_accessor32<scalar_t, 1>();
+        auto indexes_a = indexes.packed_accessor32<int32_t, 2>();
+
+
+        // at iteration k, prev_classes [0] contains -1;
+        // prev_classes[1,2,..k] contains the previously chosen k classes (all
+        // distinct), in sorted order; and prev_classes[k+1] contains N.
+        std::vector<int32_t> prev_classes(K + 1);
+
+        // at iteration k, prev_cumsum[c] for 0 <= c <= k contain the cumulative
+        // probabilities after subtracting the probability mass due to the
+        // previously chosen classes (sorted by class-index, not iteration).
+        //
+        // At iteration k we have already chosen k classes.  This
+        // breaks up the remaining probability mass (excluding those k classes)
+        // into k+1 intervals.  Counting the values accessible in "cumsum",
+        // interval i (with 0 <= i <= k) starts at cumsum[b][prev_classes[i]+1],
+        // and ends at cumsum[b][prev_classes[i+1]].
+        //
+        // In cur_cumsum, we store the cumulative sum *excluding* the intervals
+        // corresponding to the previously chosen classes.  On iteration k,
+        // cur_cumsum[0] will always contain 0 and cur_cumsum[i] for 0 < i <= k
+        // will contain the start of interval i, with the intervals belonging to
+        // previously chosen classes subtracted.
+        std::vector<scalar_t> cur_cumsum(K);
+
         for (int b = 0; b < B; b++) {
+          prev_classes[0] = -1;
+          prev_classes[1] = N;
+          cur_cumsum[0] = 0.0;
+
+          // at iteration k, chosen_sum contains the sum of the probabilities of
+          // classes chosen on iters 0,1,..k-1.
+          scalar_t chosen_sum = 0.0;
+
+          auto this_cumsum_a = cumsum_a[b];
+          auto this_indexes_a = indexes_a[b];
+          auto this_weights_a = weights_a[b];
+
+          scalar_t r = rand_a[b],  // r is a new random value on [0..1].
+              alpha = alpha_a[b];   // alpha is the constant that will determine
+                                    // the scaling-up of probabilities, to
+                                    // preserve expectations.
+
+          for (int k = 0; k < K; ++k) {
+            // i will be some value 0 <= i <= k.
+            int i = find_class_in_vec(cur_cumsum, 0, k + 1, r);
+
+            // class_range
+            int class_range_begin = prev_classes[i] + 1,
+                class_range_end = prev_classes[i + 1];
+            // shift r...
+            r = r - cur_cumsum[i] + this_cumsum_a[class_range_begin];
+
+            int c = find_class(this_cumsum_a,
+                               class_range_begin,
+                               class_range_end, r);
+            // c is the class chosen.
+            this_indexes_a[k] = c;
+
+            scalar_t this_class_prob = this_cum_sum_a[c + 1] - this_cum_sum_a[c];
+            // We can now treat r as a "new" random value on [0,1].
+            r = (r - this_cum_sum_a[c]) / this_class_prob;
+
+
+            scalar_t prob_of_choosing_class = 1.0 - exp(-alpha * this_class_prob);
+            // We assign the class a weight of "class_weight" in the output,
+            // which is larger than its actual probability, so the output can have the same expected
+            // value as the input.
+            scalar_t class_weight = this_class_prob / prob_of_choosing_class,
+                discretized_class_weight = discretize_weight(class_weight, M, &r);
+
+            this_weights_a[k] = discretized_class_weight;
+
+            // could unroll this loop.  mostly an issue if K is large.
+            for (int k2 = k; k2 > i + 1; --k2) {
+              cur_cumsum[k2] = cur_cumsum[k2 - 1] - this_class_prob;
+            }
+            cur_cumsum[i + 1] = cur_cumsum[i] + (this_cumsum_a[c] -
+                                                 this_cumsum_a[class_range_begin]);
+
+
+            chosen_sum += this_class_prob;
+            // Reduce the random value r so that it is in the range [0..1.0-chosen_sum],
+            // which is the size of the reduced interval after subtracting the probability
+            // mass due to previously chosen classes.
+            r = r * (1.0 - chosen_sum);
+          }
+
+
+
+
+
+
+
+
+
+          scalar_t chosen_cumsum
+
+
+
           auto this_cumsum_a = cumsum_a[b];
           scalar_t d = rand_a[b][2],
               e = (d < lower_bound ? 0.0 :
@@ -501,7 +669,7 @@ std::vector<torch::Tensor> flow_sampling_cpu(torch::Tensor cumsum,
 
 
 /*
-   backward of flow_sampling.  Returns logits_grad; note, `logits` is the
+   backward of iterative_sampling.  Returns logits_grad; note, `logits` is the
    original log-probs from which `cumsum` was derived by softmax and then
    cumulative summation.
    We don't return a grad for `rand`; actually, such a thing is not even
@@ -511,7 +679,7 @@ std::vector<torch::Tensor> flow_sampling_cpu(torch::Tensor cumsum,
    deterministic function of the original `logits` and `rand`.  They are
    only correct in a sense involving expectations.
 */
-torch::Tensor flow_sampling_backward_cpu(
+torch::Tensor iterative_sampling_backward_cpu(
     torch::Tensor cumsum,
     torch::Tensor rand,
     torch::Tensor ans_indexes,
@@ -549,7 +717,7 @@ torch::Tensor flow_sampling_backward_cpu(
        torch::zeros({B, N}, opts) :
        torch::empty({B, N}, opts));
 
-  AT_DISPATCH_FLOATING_TYPES(cumsum.scalar_type(), "flow_sampling_cpu_backward_loop", ([&] {
+  AT_DISPATCH_FLOATING_TYPES(cumsum.scalar_type(), "iterative_sampling_cpu_backward_loop", ([&] {
         auto cumsum_a = cumsum.packed_accessor32<scalar_t, 2>(),
             rand_a = rand.packed_accessor32<scalar_t, 2>(),
             ans_grad_a = ans_grad.packed_accessor32<scalar_t, 2>(),
@@ -644,6 +812,6 @@ torch::Tensor flow_sampling_backward_cpu(
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("flow_sampling_cpu", &flow_sampling_cpu, "Flow sampling forward function (CPU)");
-  m.def("flow_sampling_backward_cpu", &flow_sampling_backward_cpu, "Flow sampling backward function (CPU)");
+  m.def("iterative_sampling_cpu", &iterative_sampling_cpu, "Flow sampling forward function (CPU)");
+  m.def("iterative_sampling_backward_cpu", &iterative_sampling_backward_cpu, "Flow sampling backward function (CPU)");
 }

@@ -1,1 +1,1 @@
-from .flow_sampling import flow_sample
+from .iterative_sampling import iterative_sample

@@ -13,38 +13,38 @@ def _resolve(name):
 
 
 try:
-    import torch_flow_sampling_cpu
+    import torch_iterative_sampling_cpu
 except ImportError:
     if VERBOSE:
-        print('Falling back to JIT compiling torch_flow_sampling_cpu')
-    torch_flow_sampling_cpu = load(
-        name='torch_flow_sampling_cpu',
+        print('Falling back to JIT compiling torch_iterative_sampling_cpu')
+    torch_iterative_sampling_cpu = load(
+        name='torch_iterative_sampling_cpu',
         sources=[
-            _resolve('flow_sampling_cpu.cpp'),
+            _resolve('iterative_sampling_cpu.cpp'),
         ],
         verbose=VERBOSE,
     )
 
 
 try:
-        import torch_flow_sampling_cuda
+        import torch_iterative_sampling_cuda
 except ImportError:
     if VERBOSE:
-        print('Falling back to JIT compiling torch_flow_sampling_cuda')
-    torch_flow_sampling_cuda = None
+        print('Falling back to JIT compiling torch_iterative_sampling_cuda')
+    torch_iterative_sampling_cuda = None
     if torch.cuda.is_available():
-        torch_flow_sampling_cuda = load(
-            name='torch_flow_sampling_cuda',
+        torch_iterative_sampling_cuda = load(
+            name='torch_iterative_sampling_cuda',
             sources=[
-                _resolve('flow_sampling_cuda.cpp'),
-                _resolve('flow_sampling_cuda_kernel.cu'),
+                _resolve('iterative_sampling_cuda.cpp'),
+                _resolve('iterative_sampling_cuda_kernel.cu'),
             ],
             verbose=VERBOSE,
         )
 
 
 
-def _flow_sampling_forward_dispatcher(
+def _iterative_sampling_forward_dispatcher(
         cumsum: torch.Tensor, rand: torch.Tensor, interp_prob: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Returns (output, output_indexes)
@@ -52,15 +52,15 @@ def _flow_sampling_forward_dispatcher(
     shape [output.shape[0], 2] that is required by the backward-pass code.
     """
     if cumsum.is_cuda:
-        if torch_flow_sampling_cuda is None:
+        if torch_iterative_sampling_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
-        return tuple(torch_flow_sampling_cuda.flow_sampling_cuda(
+        return tuple(torch_iterative_sampling_cuda.iterative_sampling_cuda(
             cumsum, rand, interp_prob))
     else:
-        return tuple(torch_flow_sampling_cpu.flow_sampling_cpu(
+        return tuple(torch_iterative_sampling_cpu.iterative_sampling_cpu(
             cumsum, rand, interp_prob))
 
-def _flow_sampling_backward_dispatcher(
+def _iterative_sampling_backward_dispatcher(
         cumsum: torch.Tensor,
         rand: torch.Tensor,
         ans_indexes: torch.Tensor,
@@ -68,18 +68,18 @@ def _flow_sampling_backward_dispatcher(
         interp_prob: float,
         straight_through_scale: float) -> torch.Tensor:
     if cumsum.is_cuda:
-        if torch_flow_sampling_cuda is None:
+        if torch_iterative_sampling_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
-        return torch_flow_sampling_cuda.flow_sampling_backward_cuda(
+        return torch_iterative_sampling_cuda.iterative_sampling_backward_cuda(
             cumsum, rand, ans_indexes, ans_grad, interp_prob,
             straight_through_scale)
     else:
-        return torch_flow_sampling_cpu.flow_sampling_backward_cpu(
+        return torch_iterative_sampling_cpu.iterative_sampling_backward_cpu(
             cumsum, rand, ans_indexes, ans_grad, interp_prob,
             straight_through_scale)
 
 
-class FlowSamplingFunction(torch.autograd.Function):
+class IterativeSamplingFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx,
                 logits: torch.Tensor,
@@ -158,7 +158,7 @@ class FlowSamplingFunction(torch.autograd.Function):
             in a suitable sense defined on the output distribution, assuming the random numbers are
             differently generated each time.
 
-            See comment block labeled BACKPROP NOTES in flow_sampling_cpu.cpp, and
+            See comment block labeled BACKPROP NOTES in iterative_sampling_cpu.cpp, and
             "NOTES ON PROOF" for discussion of the sense in which the algorithm is correct.
         """
         (B, N) = logits.shape
@@ -171,7 +171,7 @@ class FlowSamplingFunction(torch.autograd.Function):
         assert 0 <= straight_through_scale and straight_through_scale <= 1.0
         ctx.interp_prob = interp_prob
         ctx.straight_through_scale = straight_through_scale
-        (ans, ans_indexes) = _flow_sampling_forward_dispatcher(cumsum, rand, interp_prob)
+        (ans, ans_indexes) = _iterative_sampling_forward_dispatcher(cumsum, rand, interp_prob)
         if logits.requires_grad:
             ctx.save_for_backward(cumsum, rand, ans_indexes)
         return ans
@@ -179,14 +179,14 @@ class FlowSamplingFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, ans_grad: Tensor) -> Tuple[torch.Tensor, None, None, None]:
         (cumsum, rand, ans_indexes) = ctx.saved_tensors
-        logits_grad = _flow_sampling_backward_dispatcher(
+        logits_grad = _iterative_sampling_backward_dispatcher(
             cumsum, rand, ans_indexes, ans_grad,
             ctx.interp_prob, ctx.straight_through_scale)
         return (logits_grad, None, None, None)
 
 
 
-def flow_sample(logits: torch.Tensor,
+def iterative_sample(logits: torch.Tensor,
                 interp_prob: float,
                 dim: int = -1,
                 straight_through_scale: float = 0.0,
@@ -235,7 +235,7 @@ def flow_sample(logits: torch.Tensor,
 
            The backprop for this is a little complicated and involves the concept
            of flow of probability mass; we'll describe it in the C++ code.
-           See comment block labeled BACKPROP in flow_sampling_cpu.cpp.
+           See comment block labeled BACKPROP in iterative_sampling_cpu.cpp.
         """
     ndim = logits.ndim
     if dim < 0:
@@ -248,7 +248,7 @@ def flow_sample(logits: torch.Tensor,
     B = logits.shape[0]
     if rand is None:
         rand = torch.rand(B, 3, dtype=logits.dtype, device=logits.device)
-    ans = FlowSamplingFunction.apply(logits, rand, interp_prob,
+    ans = IterativeSamplingFunction.apply(logits, rand, interp_prob,
                                      straight_through_scale)
     ans = ans.reshape(shape)
     if dim != ndim - 1:
