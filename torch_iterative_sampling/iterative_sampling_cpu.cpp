@@ -119,8 +119,6 @@ double Pow(double f, double p) {
         batch size and N is the number of classes, so element cumsum[b][k] is the sum of
         probs[b][i] for 0 <= i < k.
         Implicitly the final element (not present) would be 1.0.
-    values:  Values that we are trying to represent.  Might be the same as the `probs`
-        that we exclusive-prefix-summed to form `cumsum`.
     rand:  random numbers uniformly distributed on [0,1], of shape (B,S), where
          S is the number of separate sequences of samples we are choosing from each
          distribution in `cumsum`.
@@ -130,7 +128,7 @@ double Pow(double f, double p) {
      M:   number of levels of discretization of the interval [0,1], for
           the class weights at the output
 
-  Returns (indexes, sampled_values, scales), where:
+  Returns (indexes, scales), where:
 
       indexes: a Tensor of shape (B, S, K) and type torch::kInt64, containing,
                for each B, a series of K distinct sampled integers in the
@@ -143,12 +141,10 @@ double Pow(double f, double p) {
                when modeling the probabilities of these sequences.
 */
 std::vector<torch::Tensor> iterative_sampling_cpu(torch::Tensor cumsum,
-                                                  torch::Tensor values,
                                                   torch::Tensor rand,
                                                   int K,
                                                   int M) {
   TORCH_CHECK(cumsum.dim() == 2, "cumsum must be 2-dimensional");
-  TORCH_CHECK(values.dim() == 2, "values must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
 
   int B = cumsum.size(0),
@@ -158,7 +154,6 @@ std::vector<torch::Tensor> iterative_sampling_cpu(torch::Tensor cumsum,
   TORCH_CHECK(K > 0 && K < N);
   TORCH_CHECK(M > 1);
   TORCH_CHECK(rand.size(0) == B);
-  TORCH_CHECK(values.size(0) == B && values.size(1) == N);
 
   TORCH_CHECK(cumsum.device().is_cpu() && alpha.device().is_cpu() &&
               rand.device().is_cpu(),
@@ -175,7 +170,6 @@ std::vector<torch::Tensor> iterative_sampling_cpu(torch::Tensor cumsum,
 
   AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_cpu_loop", ([&] {
         auto cumsum_a = cumsum.packed_accessor32<scalar_t, 2>(),
-            values_a = values.packed_accessor32<scalar_t, 2>(),
             scales_a = scales.packed_accessor32<scalar_t, 2>();
         auto rand_a = rand.packed_accessor32<scalar_t, 1>();
         auto indexes_a = indexes.packed_accessor32<int64_t, 2>();
@@ -205,10 +199,8 @@ std::vector<torch::Tensor> iterative_sampling_cpu(torch::Tensor cumsum,
 
         for (int b = 0; b < B; ++b) {
 
-          auto this_cumsum_a = cumsum_a[b],
-              this_values_a = values_a[b];
+          auto this_cumsum_a = cumsum_a[b];
           auto this_indexes_a = indexes_a[b];
-          auto this_sampled_values_a = sampled_values_a[b];
           auto this_scales_a = scales_a[b];
 
           for (int s = 0; s < S; ++s) {
@@ -264,18 +256,6 @@ std::vector<torch::Tensor> iterative_sampling_cpu(torch::Tensor cumsum,
               // We can now treat r as a "new" random value on [0,1].
 
 
-
-              // in practice, 'value' may be the same as 'this_class_prob'.
-              scalar_t value = this_values_a[c];
-
-              // Scale by the inverse prob of choosing this class (in the entire
-              // sequence), so the output can have the same expected value as
-              // the input.
-              scalar_t sampled_value = value / prob_of_choosing_class,
-                  discretized_sampled_value = discretize_weight(sampled_value, M, &r);
-
-              this_sampled_values_a[k] = discretized_sampled_value;
-
               // Update prev_classes and cur_cumsum.
               prev_classes[k + 2] = N;
               // TODO: could unroll the next loop (speed here is mostly an issue only if K is large).
@@ -306,7 +286,7 @@ std::vector<torch::Tensor> iterative_sampling_cpu(torch::Tensor cumsum,
           }
         }
       }));
-  return std::vector<torch::Tensor>({indexes, sampled_values, scales});
+  return std::vector<torch::Tensor>({indexes, scales});
 }
 
 

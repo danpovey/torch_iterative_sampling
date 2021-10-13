@@ -14,7 +14,8 @@ def _resolve(name):
 
 
 try:
-    import torch_iterative_sampling_cpu
+    pass # TEMP
+    #import torch_iterative_sampling_cpu
 except ImportError:
     if VERBOSE:
         print('Falling back to JIT compiling torch_iterative_sampling_cpu')
@@ -301,7 +302,7 @@ def exclusive_cumsum(x: Tensor, dim: int) -> Tensor:
 
 class PredictorInputParams(nn.Module):
     def __init__(self, num_classes: int, predictor_dim: int,
-                 seq_len: int)
+                 seq_len: int) -> None:
         """
         This module stores some embedding parameters that are part of how we predict the
         probabilities of the classes and weights.
@@ -475,7 +476,7 @@ class _ClassesTotalLogprob(torch.autograd.Function):
             return ans
 
     @staticmethod
-    def backward(ctx: Tensor, ans_grad: Tensor) -> Tuple[Tensor, NoneType, NoneType, NoneType]:
+    def backward(ctx: Tensor, ans_grad: Tensor) -> Tuple[Tensor, None, None, None]:
         """
         Backward method which only returns a derivative for class_probs; obtaining
         derivatives w.r.t. the other elements is rather nontrivial as we have to consider
@@ -704,3 +705,271 @@ def fake_parameterized_dropout(probs: Tensor,
             close to zero or one.
     """
     return _FakeParameterizedDropout.apply(probs, zero_one, values, random_rate, epsilon)
+
+
+
+
+
+class SamplingBottleneckModule(nn.Module):
+    def __init__(self, dim: int , num_classes: int ,
+                 seq_len: int = 8,
+                 num_discretization_levels: int = 128,
+                 random_prob: float = 0.5):
+        """
+    Create sampling bottleneck module.  This uses an iterative sampling algorithm to
+    represent the hidden feature by a fixed number of randomly chosen classes (e.g. 8
+    classes drawn from 512 possible classes), together with values in the range [0,1]
+    for all of the randomly chosen classes.  The basic idea is that we turn the
+    hidden feature into a categorical distribution over a number of classes, and
+    we transmit that distribution in a randomized, lossy way that focuses modeling
+    power on the classes that dominate the distribution.  So it's somewhat like
+    a discrete sampling operation-- in fact, it is such an operation-- but we allow
+    much more information to pass through than just a single class label.
+
+    Args:
+      dim: feature dimension before and after this module, e.g. 512.
+    num_classes:  The number of discrete classes we form a distribution over, e.g. 512.
+    seq_len:  The number of (distinct) classes we sample from the distribution when
+           transmitting information over this channel
+    num_discretization_levels:  The number of levels we discretize the interval [0,1]
+           into when transmitting values, e.g. 128.
+    random_prob:  The probability that we randomize a particular frame, versus
+           using the expectation.
+        """
+        self.dim = dim
+        self.K = seq_len
+        self.N = num_classes
+        self.M = num_discretization_levels
+        self.random_prob = random_prob
+
+
+        # We assume there is a layer-norm just prior to this module, so we don't
+        # include layer norm on the input.
+
+        # to_both_softmax is a linear projection that will go to a softmax to
+        # the probs and values
+        self.to_both_softmax = nn.Linear(dim, num_classes, bias=False)
+        # the output of to_values_softmax gets added to the output of to_both_softmax,
+        # and it becomes the values (so the values are not just copies of the probs).
+        # This would be zero if probs == values, we initialize it to zero.
+        self.to_values_softmax = nn.Linear(dim, num_classes, bias=False)
+
+
+        self.to_output = nn.Linear(num_classes, dim, bias=False)
+        self.layer_norm = nn.LayerNorm(dim)
+
+        self._reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.constant_(self.to_value_softmax.weight, 0.0)
+
+    def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Forward function.
+        Args:
+            x: a Tensor of shape (*, F) where F is the number of input features/channels,
+               equal to `dim` arg to constructor.
+         num_seqs:  The number of parallel sequences (S).  Should probably be 1 unless
+               you are planning to model these probabilities
+        Returns (y, class_indexes, weight_indexes), where:
+
+           y: a Tensor of shape (*, F), like x, where F is the `dim` arg to this class's
+               constructor.  This is the main output, to be given to
+               later modules' forward function.
+          class_indexes:  a LongTensor of shape (*, num_seqs, seq_len) containing
+               the randomly sampled classes in the range [0..num_classes-1] == [0..N-1]
+               Will be useful if you want to model the probabilities of the output
+               of this layer.
+          values_indexes:  a LongTensor of shape (*, num_seqs, seq_len) containing
+               the values of the randomly sampled classes, whose elements are in
+               the range [0..num_discretization_levels-1] == [0..M-1]
+               Will be useful if you want to model the probabilities of the output
+               of this layer.
+        """
+        # logprobs has shape (*, C); it is the input to the softmax that determines the
+        # probabilities of sampling different classes on each iteration of sampling.
+        # (Not the same as the marginal probabilities).
+        probs = self.to_both_softmax(x)
+        probs = torch.softmax(probs, dim=-1)
+
+        # values also has shape (*, C); it is expected to be similar to `probs`,
+        # since we want to bias towards transmitting the larger values.
+        values = probs + self.to_values_softmax(x)
+        values = torch.softmax(values, dim=-1)
+
+        alpha = compute_normalizer(probs, self.seq_len)
+
+
+
+
+def compute_marginals(probs: Tensor, K: int) -> Tensor:
+    """
+    Args:
+     probs: a Tensor of float with shape (*, N), interpreted as
+       the probabilities of categorical distributions over N classes (should
+       sum to 1 and be nonnegative).
+     K: the number of times to (conceptually) sample from the distribution
+      `probs`, always excluding previously-chosen classes.
+
+    Returns: the marginal probability, for each class, of selecting
+       that class at any point during K rounds of selecting a new, previously
+       unchosen class with probability proportional to `probs`.
+       The result will be of shape (*, N), and the sum of the result over
+       then N axis will equal K (or be very close to K).  Returned
+       elements will be in the interval [0,1].
+    """
+    alpha = compute_normalizer(probs, K)
+    return 1 - ((1 - probs) ** alpha.unsqueeze(-1))
+
+class _ComputeNormalizer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, K: int) -> Tensor:
+        # Please see compute_normalizer() below for documentation of the interface.
+        # We are solving
+        # \sum_{i=0}^{N-1}  1 - (1-x_i) ** alpha == K
+        # i.e.:
+        # \sum_{i=0}^{N-1}  1 - exp(alpha * log(1-x_i)) == K
+        #
+        # Let us define y_i = log(1-x_i).  Then we are solving:
+        #
+        # \sum_{i=0}^{N-1}  1 - exp(alpha * y_i) == K
+        #
+        #  K-N + \sum_{i=0}^{N-1} exp(alpha * y_i)  == 0  (eqn. 1)
+        # d(LHS)/d(alpha) where LHS means left hand side of (eqn. 1) is:
+        #  d = \sum_{i=0}^{N-1} y_i exp(alpha * y_i)
+        #
+        # An iterative solution (we'll see whether this converges) is:
+        #    alpha := alpha - err / d
+        # where err is the LHS of (eqn. 1).
+
+        requires_grad = x.requires_grad
+        x = x.detach()
+        y = (1 - x).log()
+
+        N = x.shape[-1]
+        alpha = torch.empty(list(x.shape)[:-1], device=x.device,
+                            dtype=x.dtype).fill_(K)
+
+        for i in range(3):
+            exp = torch.exp(alpha.unsqueeze(-1) * y)
+            err = exp.sum(dim=-1) + (K - N)
+            d = (exp * y).sum(dim=-1)
+            alpha -= err / d
+            if __name__ == '__main__':
+                print(f"Iter {i}, alpha={alpha}, exp={exp}, err={err}, d={d}")
+
+        # in:
+        #  K-N + \sum_{i=0}^{N-1} exp(alpha * y_i) == 0  (eqn. 1),
+        # d(LHS)/dy_i = alpha * exp(alpha * y_i).
+        # d(alpha)/d(LHS) = -1/d = -1 / (sum_{i=0}^{N-1} (y_i * exp(alpha * y_i)))
+        # ... so
+        # but we want d(alpha)/d(x_i), which is:
+        # d(alpha)/d(LHS) d(LHS)/dy_i  dy_i/dx_i.            (2)
+        # dy_i/dx_i is: -1/(1-x).
+        # So we can write (2) as:
+        #    (alpha * exp(alpha * y_i)) / (d * (1-x))
+        if requires_grad:
+            ctx.deriv = (alpha.unsqueeze(-1) * exp) / (d.unsqueeze(-1) * (1 - x))
+        return alpha
+
+    @staticmethod
+    def backward(ctx, alpha_grad: Tensor) -> Tuple[Tensor, None]:
+        return alpha_grad.unsqueeze(-1) * ctx.deriv, None
+
+
+
+def compute_normalizer(x: Tensor, K: int) -> Tensor:
+    """
+    Args:
+     x: a Tensor of float with shape (*, N), interpreted as
+     the probabilities of categorical distributions over N classes (should
+     sum to 1 and be nonnegative).
+
+      K: an integer satifying 0 < K < N.
+
+    Returns a Tensor alpha of shape (*), satisfying:
+
+        (1 - exp(-x * alpha.unsqueeze(-1))).sum(dim=-1) == K
+
+    I.e., that:
+
+          \sum_{i=0}^{N-1}  1 - exp(-alpha * x_i) == K.
+
+    This will satisfy alpha >= K.  alpha, if an integer, would be the
+    number of draws from the distribution x, such that the
+    expected number of distinct classes chosen after that many draws
+    would equal approximately K.  We can get this formula by using a Poisson assumption,
+    with alpha * x_i being the expectation (the lambda parameter of the
+    Poisson); another way to formulate this is to say that the probability of never
+    choosing class i is 1 - (1 - x_i) ** alpha (this is equivalent
+    for small alpha, using -x_i as an approximation of log(1-x_i)).  The
+    version with exp() is more straightforward to differetiate though.  This
+    does not really need to be super exact for our application, just fairly
+    close.  Anyway, the two versions get very similar as K gets larger, because
+    then alpha gets larger and the x_i's that are large make less
+    difference.
+    """
+    return _ComputeNormalizer.apply(x, K)
+
+    N = x.shape[-1]
+    alpha_shape = list(x.shape)[:-1]
+
+    alpha = torch.empty(alpha_shape, device=x.device, dtype=x.dtype).fill_(K)
+
+
+    print(f"x = {x}")
+    for i in range(3):
+        exp = torch.exp(-alpha.unsqueeze(-1) * x)
+        err = exp.sum(dim=-1) + (K - N)
+        minus_d = (exp * x).sum(dim=-1)
+        alpha += err / minus_d
+        print(f"Iter {i}, alpha={alpha}, exp={exp}, err={err}, minus_d={minus_d}")
+        # d2/d(alpha2) of LHS is:
+        #  d1 = \sum_{i=0}^{N-1} x_i^2 exp(-alpha * x_i)
+    return alpha
+
+
+
+def _test_normalizer():
+    dim = 20
+    K = 5
+    torch.set_default_dtype(torch.double)
+    for i in range(5):  # setting i too large will cause test failure, because
+                        # the iterative procedure converges more slowly when the
+                        # probs have a large range, and we use i below as a
+                        # scale.
+        B = 5  # Batch size
+        probs = (torch.randn(B, dim) * i * 0.5).softmax(dim=-1)
+        probs.requires_grad = True
+        alpha = compute_normalizer(probs, K)
+        print(f"Grad check, scale={i}")
+        # atol=1.0 might seem large, but the gradients used by torch.autograd.gradcheck
+
+        alpha_grad = torch.randn(*alpha.shape)
+        (alpha * alpha_grad).sum().backward()
+        probs_grad = probs.grad
+
+        probs_delta = torch.randn(*probs.shape) * 0.0001
+
+        alpha_delta = compute_normalizer(probs + probs_delta, K) - alpha
+
+        observed_delta = (alpha_delta * alpha_grad).sum()
+        predicted_delta = (probs_delta * probs_grad).sum()
+        # Caution: for i=4, the difference can sometimes be large.  These will sometimes even be
+        # the opposite sign, if it happened that alpha_delta is nearly orthogonal to the change
+        # in alpha.
+        print(f"For i={i}, observed_delta={observed_delta} vs. predicted_delta={predicted_delta}")
+        #torch.autograd.gradcheck(compute_normalizer, (probs, K), eps=1.0e-06, rtol=0.025, atol=1.0)
+
+def _test_compute_marginals():
+    probs = (torch.randn(10, 20, 30) * 2.0).softmax(dim=-1)
+    K = 8
+    marginals = compute_marginals(probs, K)
+    err = marginals.sum(dim = -1) - K
+    avg_err = (err * err).mean().sqrt()
+    print("avg_err of marginals is ", avg_err)
+    assert avg_err < 0.2
+
+if __name__ == '__main__':
+    _test_compute_marginals()
+    _test_normalizer()

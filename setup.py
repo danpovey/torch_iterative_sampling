@@ -10,14 +10,12 @@ with open('requirements.txt') as f:
 
 long_description = """
 This package implements a Torch extension that is an efficient CUDA
-and C++ parallel algorithm for an operator that samples from a
-categorical distribution passed in as a tensor of un-normalized log
-probabilities.  The output will be a one-hot vector most of the time;
-and some of the time it will be a value interpolated between two
-one-hot vectors.
-
-We call it "flow sampling" because the derivation of the algorithm
-(particularly the derivative computation) invokes fluid flow.
+and C++ parallel algorithm for an operator that samples multiple
+distinct samples, with associated weights, from a categorical distribution,
+outputting a discretized version of the categorical distribution whose expected
+value equals the input, and which gets closer to it the more
+samples you use.   This is done in such a way that it's straightforward
+to model the probability of the output distribution.
 
 [TODO]: webpage, etc.
 """
@@ -26,19 +24,19 @@ We call it "flow sampling" because the derivation of the algorithm
 def configure_extensions():
     out = [
         CppExtension(
-            'torch_flow_sampling_cpu',
+            'torch_iterative_sampling_cpu',
             [
-                os.path.join('torch_flow_sampling', 'flow_sampling_cpu.cpp'),
+                os.path.join('torch_iterative_sampling', 'iterative_sampling_cpu.cpp'),
             ],
         )
     ]
     try:
         out.append(
             CUDAExtension(
-                'torch_flow_sampling_cuda',
+                'torch_iterative_sampling_cuda',
                 [
-                    os.path.join('torch_flow_sampling', 'flow_sampling_cuda.cpp'),
-                    os.path.join('torch_flow_sampling', 'flow_sampling_cuda_kernel.cu'),
+                    os.path.join('torch_iterative_sampling', 'iterative_sampling_cuda.cpp'),
+                    os.path.join('torch_iterative_sampling', 'iterative_sampling_cuda_kernel.cu'),
                 ],
             )
         )
@@ -48,7 +46,7 @@ def configure_extensions():
 
 
 setup(
-    name='torch_flow_sampling',
+    name='torch_iterative_sampling',
     version='1.0.0',
     description='Differentiable sampling of a categorical variable',
     long_description=long_description,
