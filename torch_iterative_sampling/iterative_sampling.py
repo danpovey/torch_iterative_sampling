@@ -750,11 +750,11 @@ def discretize_values(values: Tensor,
 
 
 class SamplingBottleneckModule(nn.Module):
-    def __init__(self, dim: int , num_classes: int ,
+    def __init__(self, dim: int , num_classes: int,
                  seq_len: int = 8,
                  num_discretization_levels: int = 128,
-                 random_prob: float = 0.5,
-                 epsilon: float = 0.01):
+                 random_rate: float = 0.5,
+                 epsilon: float = 0.01) -> None:
         """
     Create sampling bottleneck module.  This uses an iterative sampling algorithm to
     represent the hidden feature by a fixed number of randomly chosen classes (e.g. 8
@@ -779,6 +779,7 @@ class SamplingBottleneckModule(nn.Module):
            a value close to zero is more theoretically accurate but may lead to
            some derivatives being quite large.
         """
+        super(SamplingBottleneckModule, self).__init__()
         self.dim = dim
         self.K = seq_len
         self.N = num_classes
@@ -804,8 +805,8 @@ class SamplingBottleneckModule(nn.Module):
 
         self._reset_parameters()
 
-    def reset_parameters(self):
-        nn.init.constant_(self.to_value_softmax.weight, 0.)
+    def _reset_parameters(self):
+        nn.init.constant_(self.to_values_softmax.weight, 0.)
 
     def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -843,7 +844,7 @@ class SamplingBottleneckModule(nn.Module):
 
         # compute marginal probabilities of selecting any given class at any point
         # in the sequence of K distinct samples.
-        marginals = compute_marginals(probs, self.seq_len)
+        marginals = compute_marginals(probs, self.K)
 
         cumsum = exclusive_cumsum(probs, dim=-1)
 
@@ -1064,7 +1065,20 @@ def _test_discretize_values():
     assert torch.allclose(values.grad, grad)
 
 
+def _test_sampling_bottleneck():
+    dim = 256
+    num_classes = 512
+    m = SamplingBottleneckModule(dim, num_classes)
+    feats = torch.randn(30, 4, dim)
+
+    y, class_indexes, value_indexes = m(feats)
+
+    print(f"Shapes of: y={y.shape}, class_indexes={class_indexes.shape}, value_indexes={value_indexes.shape}")
+
+    print("y part = ", y[0])
+
 if __name__ == '__main__':
+    _test_sampling_bottleneck()
     _test_discretize_values()
     _test_compute_marginals()
     _test_normalizer()
