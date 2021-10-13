@@ -708,6 +708,42 @@ def fake_parameterized_dropout(probs: Tensor,
 
 
 
+class _WithGradOf(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, y):
+        """
+        Returns x but will assign the gradient to y.
+        """
+        return x
+
+    @staticmethod
+    def backward(ctx, ans_grad) -> Tuple[None, Tensor]:
+        return None, ans_grad
+
+
+def discretize_values(values: Tensor,
+                      num_discretization_levels: int) -> Tuple[Tensor, Tensor]:
+    """
+    Pseudo-randomly discretize an input tensor, whose elements must be in the
+    interval [0,1], into a fixed number of levels, e.g. 128.  The pseudo-random
+    part has to do with rounding.
+
+    Args:
+       values: a Tensor of arbitrary shape
+       num_discretization_levels:  The number of discrete values that we divide
+           the interval [0,1] into, e.g. 128.
+    Returns (y, indexes), where:
+         y: a randomly discretized version of `values`, whose elements will
+           differ from the corresponding elements of `values` by no more than
+           1/(num_discretization_levels - 1).  Derivatives go "straight through"
+           from this to `values`.
+         indexes: a LongTensor containing the discrete indexes corresponding
+           to `y`, in the range [0..num_discretization_levels-1].
+    """
+    indexes = (values * (num_discretization_levels - 1) + torch.rand_like(values)).to(dtype=torch.long)
+    ans = indexes * (1.0 / (num_discretization_levels - 1))
+    return _WithGradOf.apply(ans, values), indexes
+
 
 
 class SamplingBottleneckModule(nn.Module):
@@ -797,7 +833,16 @@ class SamplingBottleneckModule(nn.Module):
         values = probs + self.to_values_softmax(x)
         values = torch.softmax(values, dim=-1)
 
-        alpha = compute_normalizer(probs, self.seq_len)
+        # compute marginal probabilities of selecting any given class at any point
+        # in the sequence of K distinct samples.
+        marginals = compute_marginals(probs, self.seq_len)
+
+
+        cumsum = exclusive_cumsum(probs, dim=-1)
+
+        # indexes shape is (*, S, K)
+        indexes = iterative_sampling(cumsum, num_seqs)
+
 
 
 
@@ -970,6 +1015,27 @@ def _test_compute_marginals():
     print("avg_err of marginals is ", avg_err)
     assert avg_err < 0.2
 
+def _test_discretize_values():
+    values = torch.rand(10, 20, 30)
+    values.requires_grad = True
+    M = 32
+    discrete_values, indexes = discretize_values(values, M)
+
+    grad = torch.rand_like(values)
+
+    # These tests will work with very high but not 1 probability.
+    assert torch.min(discrete_values).item() == 0
+    assert torch.min(indexes).item() == 0
+    print("max is", torch.max(indexes).item())
+    assert torch.max(indexes).item() == M - 1
+    assert torch.max(discrete_values).item() == 1.0
+
+    discrete_values.backward(grad)
+
+    assert torch.allclose(values.grad, grad)
+
+
 if __name__ == '__main__':
+    _test_discretize_values()
     _test_compute_marginals()
     _test_normalizer()
