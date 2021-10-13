@@ -445,8 +445,6 @@ class PredictorInputParams(nn.Module):
 
 
 class _ClassesTotalLogprob(torch.autograd.Function):
-
-
     # see get_classes_total_logprob for more info on the interface
     @staticmethod
     def forward(ctx,
@@ -703,6 +701,11 @@ def fake_parameterized_dropout(probs: Tensor,
     epsilon:  A float value used to prevent division by zero in backprop; if too
             small, could lead to large derivatives being backpropagated when `probs` is
             close to zero or one.
+
+    Returns: A Tensor with the same shape as `probs`, `zero_one` and `values`, i.e.
+           (*, C), which is randomly somewhere between values * zero_one and values * probs.
+
+
     """
     return _FakeParameterizedDropout.apply(probs, zero_one, values, random_rate, epsilon)
 
@@ -750,7 +753,8 @@ class SamplingBottleneckModule(nn.Module):
     def __init__(self, dim: int , num_classes: int ,
                  seq_len: int = 8,
                  num_discretization_levels: int = 128,
-                 random_prob: float = 0.5):
+                 random_prob: float = 0.5,
+                 epsilon: float = 0.01):
         """
     Create sampling bottleneck module.  This uses an iterative sampling algorithm to
     represent the hidden feature by a fixed number of randomly chosen classes (e.g. 8
@@ -769,14 +773,18 @@ class SamplingBottleneckModule(nn.Module):
            transmitting information over this channel
     num_discretization_levels:  The number of levels we discretize the interval [0,1]
            into when transmitting values, e.g. 128.
-    random_prob:  The probability that we randomize a particular frame, versus
+    random_rate:  The probability that we randomize a particular frame, versus
            using the expectation.
+    epsilon: A value used in the backprop that affects derivatives w.r.t. probabilities;
+           a value close to zero is more theoretically accurate but may lead to
+           some derivatives being quite large.
         """
         self.dim = dim
         self.K = seq_len
         self.N = num_classes
         self.M = num_discretization_levels
-        self.random_prob = random_prob
+        self.random_rate = random_rate
+        self.epsilon = epsilon
 
 
         # We assume there is a layer-norm just prior to this module, so we don't
@@ -797,7 +805,7 @@ class SamplingBottleneckModule(nn.Module):
         self._reset_parameters()
 
     def reset_parameters(self):
-        nn.init.constant_(self.to_value_softmax.weight, 0.0)
+        nn.init.constant_(self.to_value_softmax.weight, 0.)
 
     def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -807,7 +815,7 @@ class SamplingBottleneckModule(nn.Module):
                equal to `dim` arg to constructor.
          num_seqs:  The number of parallel sequences (S).  Should probably be 1 unless
                you are planning to model these probabilities
-        Returns (y, class_indexes, weight_indexes), where:
+        Returns (y, class_indexes, value_indexes), where:
 
            y: a Tensor of shape (*, F), like x, where F is the `dim` arg to this class's
                constructor.  This is the main output, to be given to
@@ -816,7 +824,7 @@ class SamplingBottleneckModule(nn.Module):
                the randomly sampled classes in the range [0..num_classes-1] == [0..N-1]
                Will be useful if you want to model the probabilities of the output
                of this layer.
-          values_indexes:  a LongTensor of shape (*, num_seqs, seq_len) containing
+          value_indexes:  a LongTensor of shape (*, num_seqs, seq_len) containing
                the values of the randomly sampled classes, whose elements are in
                the range [0..num_discretization_levels-1] == [0..M-1]
                Will be useful if you want to model the probabilities of the output
@@ -837,12 +845,33 @@ class SamplingBottleneckModule(nn.Module):
         # in the sequence of K distinct samples.
         marginals = compute_marginals(probs, self.seq_len)
 
-
         cumsum = exclusive_cumsum(probs, dim=-1)
 
         # indexes shape is (*, S, K)
-        indexes = iterative_sampling(cumsum, num_seqs)
+        class_indexes = iterative_sampling(cumsum, num_seqs)
 
+        discrete_values, value_indexes = discretize_values(values, self.M)
+
+        if not self.training:
+            # in eval mode, don't use the discretized values.
+            discrete_values = values
+
+
+        class_indexes_0 = class_indexes.select(dim=-2, index=0)
+        zero_one = torch.zeros_like(values)
+        # Put 1.0 in the zero_one vector at positions specified by `class_indexes_0`.
+        zero_one.scatter_(-1, class_indexes_0.unsqueeze(-1), 1.0)
+
+        random_rate = 0.0 if not self.training else self.random_rate
+
+        y = fake_parameterized_dropout(probs, zero_one, values,
+                                       random_rate=random_rate,
+                                       epsilon=self.epsilon)
+
+        y = self.to_output(y)
+        y = self.layer_norm(y)
+
+        return y, class_indexes, value_indexes
 
 
 
