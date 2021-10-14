@@ -46,251 +46,55 @@ except ImportError:
 
 
 
-def _iterative_sampling_forward_dispatcher(
-        cumsum: torch.Tensor, rand: torch.Tensor, interp_prob: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns (output, output_indexes)
-    where output is the sample, and output_indexes is a torch.Tensor of dtype=int32 and
-    shape [output.shape[0], 2] that is required by the backward-pass code.
-    """
-    if cumsum.is_cuda:
-        if torch_iterative_sampling_cuda is None:
-            raise EnvironmentError(f'Failed to load native CUDA module')
-        return tuple(torch_iterative_sampling_cuda.iterative_sampling_cuda(
-            cumsum, rand, interp_prob))
-    else:
-        return tuple(torch_iterative_sampling_cpu.iterative_sampling_cpu(
-            cumsum, rand, interp_prob))
 
-def _iterative_sampling_backward_dispatcher(
+def _iterative_sample_dispatcher(
         cumsum: torch.Tensor,
         rand: torch.Tensor,
-        ans_indexes: torch.Tensor,
-        ans_grad: torch.Tensor,
-        interp_prob: float,
-        straight_through_scale: float) -> torch.Tensor:
+        seq_len: int) -> torch.Tensor:
+    """
+    Dispatcher for iterative
+    """
     if cumsum.is_cuda:
-        if torch_iterative_sampling_cuda is None:
+        if torch_iterative_sample_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
-        return torch_iterative_sampling_cuda.iterative_sampling_backward_cuda(
-            cumsum, rand, ans_indexes, ans_grad, interp_prob,
-            straight_through_scale)
+        return torch_iterative_sample_cuda.iterative_sample_cuda(
+            cumsum, rand, seq_len)
     else:
-        return torch_iterative_sampling_cpu.iterative_sampling_backward_cpu(
-            cumsum, rand, ans_indexes, ans_grad, interp_prob,
-            straight_through_scale)
-
-
-class IterativeSamplingFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx,
-                logits: torch.Tensor,
-                rand: torch.Tensor,
-                interp_prob: float,
-                straight_through_scale: float = 1.0
-    ) -> torch.Tensor:
-        """
-        Forward propagation for flow-based algorithm for differentiably
-        sampling from a categorical distribution.  The forward algorithm
-        is relatively easy to explain.
-
-        Args:
-            logits:  A tensor of size (B, N) where B might be the batch size and N is
-              the number of classes to sample from.  These will be interpreted as
-              un-normalized log probabilities, known informally as logits.
-              The softmax of `logits` is the distribution we sample from.
-            rand:  A random tensor of i.i.d uniformly distributed random values of
-              size (B, 3).  We make this an explicit function of this object for
-              clarity, although we could just as easily compute it internally.
-              It will be used in both forward and backward passes.  We require that
-              this has requires_grad = False (we don't compute its derivative).
-            interp_prob:  A value which must satisfy 0 < interp_prob <= 1.  It is
-              the probability with which the output will be interpolated between
-              two one-hot vectors, instead of being a single one-hot vector
-              (actually the proportion of interpolated one-hot vectors will be
-              smaller than this because we sometimes interpolate between two
-              instances of the same class).  Smaller interp_prob gives output that
-              is closer to really being one-hot, but with spikier derivatives.
-            straight_through_scale:  With straight_through_scale = 0.0, the backprop
-              returns the correct derivative; with straight_through_scale = 1.0,
-              the backpropagated derivative is the one you would
-              get if this function had returned logits.softmax(dim=1), and we had
-              then replaced the output with this function's real output without
-              informing the backprop machinery.  You can use nonzero straight_through_scale values,
-              particularly early in training, to get a derivative that is biased
-              but with a smaller variance.
-
-          Return:
-              Returns a tensor `result` of shape (B, N), like `logits`.  Will satisfy
-              torch.all(result.sum(dim=1) == 1), i.e. each row sums to 1 and each row
-              has exactly 1 or 2 columns nonzero.  The result is as if you had
-              done as follows, which randomly selects two independent elements from the
-              categorical distribution, and interpolates them with probability
-              `interp_prob`, else picks one of the two.
-
-
-            .. code-block::
-
-               (B, N) = logits.shape
-               probs = logits.softmax(dim=1)
-               cum_probs = torch.cumsum(probs, dim=1)
-               indexes1 = torch.searchsorted(cum_probs, rand[:,0:1])
-               indexes2 = torch.searchsorted(cum_probs, rand[:,1:2])
-               ans = torch.zeros(B, N)
-               for b in range(B):
-                 lower_bound = (1 - interp_prob) * 0.5:
-                 upper_bound = (1 + interp_prob) * 0.5:
-                 r = rand(b, 2)
-                 if r < lower_bound or indexes1[b] == indexes2[b]:
-                    ans[indexes1[b]] = 1.0
-                 elif r > upper_bound:
-                    ans[indexes2[b]] = 1.0
-                 else:
-                    e = (r - lower_bound) / interp_prob  # 0 <= e <= 1
-                    ans[indexes1[b]] = 1.0 - e
-                    ans[indexes2[b]] = e
-                return ans
-
-            However, the derivatives are not the same as if you had done the above, even
-            if straight_through_scale == 0.0.  In fact, the code above does not compute any derivatives
-            at all for `logits`; and it is not even possible to compute derivatives w.r.t
-            `logits` for this result that would be meaningful for a fixed value of `rand`,
-            because the output varies discontinuously as the logits change.
-            Nevertheless, the derivatives we do return (assuming straight_through_scale==0.0) are valid
-            in a suitable sense defined on the output distribution, assuming the random numbers are
-            differently generated each time.
-
-            See comment block labeled BACKPROP NOTES in iterative_sampling_cpu.cpp, and
-            "NOTES ON PROOF" for discussion of the sense in which the algorithm is correct.
-        """
-        (B, N) = logits.shape
-        assert rand.shape == (B, 3)
-        assert not rand.requires_grad
-        with torch.no_grad():
-            cumsum = torch.cumsum(torch.softmax(logits, dim=1), dim=1)
-
-        assert 0 < interp_prob and interp_prob <= 1.0
-        assert 0 <= straight_through_scale and straight_through_scale <= 1.0
-        ctx.interp_prob = interp_prob
-        ctx.straight_through_scale = straight_through_scale
-        (ans, ans_indexes) = _iterative_sampling_forward_dispatcher(cumsum, rand, interp_prob)
-        if logits.requires_grad:
-            ctx.save_for_backward(cumsum, rand, ans_indexes)
-        return ans
-
-    @staticmethod
-    def backward(ctx, ans_grad: Tensor) -> Tuple[torch.Tensor, None, None, None]:
-        (cumsum, rand, ans_indexes) = ctx.saved_tensors
-        logits_grad = _iterative_sampling_backward_dispatcher(
-            cumsum, rand, ans_indexes, ans_grad,
-            ctx.interp_prob, ctx.straight_through_scale)
-        return (logits_grad, None, None, None)
+        return torch_iterative_sample_cpu.iterative_sample_cpu(
+            cumsum, rand, seq_len)
 
 
 
 def iterative_sample(probs: torch.Tensor,
-                     values: torch.Tensor,
-                     S: int,
-                     K: int,
-                     M: int,
-                     random_prob: float = 0.5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward propagation for iterative sampling algorithm.  This is not (currently)
-    differentiable (later we can make it so); but it can be embedded in a larger process
-    that can be treated as differentiable with straight-through derivatives (since the
-    expected output, treated as a vector, is the same as the input).
+                     num_seqs: int,
+                     seq_len: int) -> torch.Tensor:
+    """Sample repeatedly from the categorical distribution in `probs`, each time
+      only selecting from classes that were not previously seen.
 
       Args:
-          probs:  A tensor of probabilities of discrete classes (at least, it can be
-                  interpreted that way), of shape (*, N) where N is the number of classes.
+          probs:  A tensor of probabilities of discrete classes, of shape (*, N)
+                  where N is the number of classes.
                   Is expected to sum to one (over the N indexes), and be nonnegative.
-                  Note:  any gradient w.r.t. `probs` will be zero, reflecting that
-                  `probs` does not affect the expected value of the output and that we
-                  are using `straight-through` derivatives that reflect the expectation.
-         values:  May be the same tensor as `probs` but does not have to be.
-                  Its elements must be limited to [0,1].  Must have shape (*, N), the same as
-                  `probs`.  The expected output of the random process will have expectation
-                  equal to `values`.  As `probs` approaches zero, the corresponding
-                  `values` will be multiplied by the inverse of `probs` if those
-                  indexes are chosen, so be careful that `values` doesn't approach
-                  zero faster than `probs`.
-              S:  The number of separate sequences to sample, e.g. 2 or 4.  If you are
-                  not going to be modeling the probabilities, you can just use S == 1;
-                  otherwise, larger S will be give more precise probabilities, but use more
-                  memory.
-              K:  The sequence length, e.g. 4 or 8, we'll have to experiment.  Larger
-                  K will allow the model to focus on the finer details of the vector;
-                  smaller K will focus modeling power on the large-scale structure.
-              M:  The number of discrete probability values that we can output;
-                  this allows us to use a discrete model for these vectors.  E.g., 128.
-             random_prob:  The probability with which we use the randomized version
-                  of "probs" at the output; you can think of this as similar to
-                  a dropout probability, although with probability `random_prob` the
-                  input is merely randomly approximated, not completely zeroed out.
-                  In eval mode (self.training == false), we will always treat
-                  random_prob as 0.0.
-      Returns (ovalues, indexes, samp_values, scales, alpha), where:
-
-               ovalues:  A tensor of shape (*, N) which will be exactly the same
-                  as `values` if random_prob == 0.0 or we are in eval mode
-                  (self.training == false).  Otherwise, depending on the value of
-                  random_prob, some elements will be somewhat random and sparse
-                  (but with an expectation equal to `values`).  This is a deterministic
-                  function of the slices of `indexes` and `samp_values` that have an S
-                  index of 0.
-
-                indexes: A LongTensor of shape (*, S, K) with
-                  the randomly chosen indexes in the range [0..N-1].
-                  The values will all be distinct along the K axis.
-
-                samp_values: A LongTensor of shape (*, S, K) indicating
-                  the values of the randomly chosen outputs at the dimensions given by `indexes`.
-                  This will contain values in [0..M-1], which should be divided by M-1 to
-                  get the indicated value.
-
-                scales: A tensor with shape (*, S, K) containing, at each index k,
-                  1. / (1. - sum), where `sum` is the sum of the values
-                  of the input `probs` evaluated only at indexes 0 <= j < k, i.e.
-                  that sum over j.  Will be >= 1.  This will be convenient when
-                  modeling the probabilities of the randomly chosen values.
-
-                alpha: A tensor with shape (*, S) containing the "alpha" values;
-                  see compute_normalizer() for information.  These are to be used as
-                  an auxiliary input to the predictor, because they determine the lowest
-                  possible value of the `weights` in cases where the `probs` and
-                  `values` inputs are identical.
-
-            The only returned value that may have requires_grad == True is `values`;
-            the others must be treated as non-differentiable.  The backprop just forwards
-            the grad of `ovalues` to `values`; this is valid to the extent that the
-            loss function is a (locally) linear function of `ovalues`.
-            Backpropagating the log-probabilities with which we predicct the
-            indexes and weights to the inputs is a little complicated, and we
-            may address it later; but for now it is not supported.
+       num_seqs:  The number of parallel sequences to sample; must be > 0.
+       seq_len:   The length of the sequences of sample; must be strictly between
+                  9 and N.
+       Returns:
+                  Returns a LongTensor of shape (*, S, K), containing the sampled
+                  indexes, with elements in the range [0..N-1].  Each element
+                  of each sequence is sampled with probability proportional to
+                  `probs`, excluding from consideration classes already sampled
+                  within that sequence.
     """
-    ndim = logits.ndim
-    if dim < 0:
-        dim += ndim
-    assert dim < ndim
-    if dim != ndim - 1:
-        logits = logits.transpose(dim, ndim - 1)
-    shape = logits.shape
-    logits = logits.reshape(-1, shape[-1])
-    B = logits.shape[0]
-    if rand is None:
-        rand = torch.rand(B, 3, dtype=logits.dtype, device=logits.device)
-    ans = IterativeSamplingFunction.apply(logits, rand, interp_prob,
-                                          straight_through_scale)
-    ans = ans.reshape(shape)
-    if dim != ndim - 1:
-        ans = ans.transpose(dim, ndim - 1)
-    return ans
+    N = probs.shape[-1]
+    rest_shape = probs.shape[:-1]
+    probs = probs.reshape(-1, N)
+    cumsum = exclusive_cumsum(probs, dim=-1)
+    B = probs.shape[0]
+    rand = torch.rand(B, num_seqs, dtype=probs.dtype, device=probs.device)
+    indexes = _iterative_sample_dispatcher(cumsum, rand, seq_len)
 
 
-#        num_seqs:  Number of parallel sequences we sample.  E.g. 2 or 4.  View the
-#             parallel sequences as a discrete-sampling approximation to an integral.
-#             Referred to elsewhere as S.
-#        discretization_levels:  The number of levels M that we break up the interval [0,1
-#            into (enables treating the distribution over output values as discrete)
+    return indexes
 
 
 def exclusive_cumsum(x: Tensor, dim: int) -> Tensor:
@@ -614,7 +418,7 @@ class _FakeParameterizedDropout:
     @staticmethod
     def apply(ctx, probs: Tensor, zero_one: Tensor,
               values: Tensor, random_rate: float = 0.5,
-              epsilon: float = 0.01) -> Tensor:
+              epsilon: float = 0.1) -> Tensor:
         probs = probs.detach()
         values = values.detach()
 
@@ -644,8 +448,13 @@ class _FakeParameterizedDropout:
         # for fake_parameterized_dropout(): briefly, that we are interested
         # the derivative over the line integral from 0 to 1, which we approximate,
         # by (half the derivative at 0 + half the derivative at 1).
-        probs_grad_random = ans_grad * values * ((0.5*zero_one/(probs + epsilon)) +
-                                                 (0.5*(1-zero_one)/(1 + epsilon - probs)))
+        # look for (2), i.e. equation 2.
+        inv_p1 = 0.5 / (probs + epsilon)
+        inv_p2 = 0.5 / ((1.0 + epsilon) - probs)
+        s1 = inv_p1  +  epsilon * inv_p2
+        s2 = inv_p2  +  epsilon * inv_p1
+
+        probs_grad_random = ans_grad * values * (zero_one * s1) + ((1-zero_one) * s2)
         probs_grad_deterministic = ans_grad * values
 
         probs_grad = (frame_mask * probs_grad_random + (1-frame_mask) * probs_grad_deterministic)
@@ -658,7 +467,7 @@ def fake_parameterized_dropout(probs: Tensor,
                                zero_one: Tensor,
                                values: Tensor,
                                random_rate: float = 0.5,
-                               epsilon: float = 0.01) -> Tensor:
+                               epsilon: float = 0.1) -> Tensor:
     """
     This function returns (zero_one * values) if random_rate == 1.0 and
     (zero_one * probs) if random_rate == 0.0 or if we are in eval mode
@@ -677,7 +486,23 @@ def fake_parameterized_dropout(probs: Tensor,
        d(loss)/d(output) when zero_one == 1.
     What this amounts to is the following formula:
       probs_grad = output_grad * values * ((0.5/probs) * zero_one +
-                                           (0.5/(1-probs) * (1-zero_one)))
+                                           (0.5/(1-probs) * (1-zero_one))).
+    This formula unfortunately generates large derivatives when probs get close
+    to zero or one.  We can introduce an epsilon to stop this.
+    The above approach effectively had scales:
+         s1 = 0.5/probs
+         s2 = 0.5/(1-probs)
+    where s1 scales the derivatives for output=1 and s2 scales the derivatives for output=0.
+    For correctness in the simpler "linear" case, when we assume that the derivatives
+    at 0 and 1 are the same, we require:
+         s1 * probs + s2 * (1-probs) == 1.0            (1).
+    We want our formula with epsilon to satisfy (1) as a kind of baseline correctness.
+    For some epsilon > 0, we can use instead the following formula:
+         s1 = 0.5 * (1+epsilon)/(p+epsilon) + epsilon/(1+epsilon-p)         equation (2)
+         s2 = 0.5 * (1+epsilon)/(1+epsilon-p) + epsilon/(p+epsilon)
+    This satsisfies (1); you can check on wolfram alpha that the following formula:
+    p * 0.5 * (1.1/(p+0.1) + 0.1/(1.1-p))  +  (1-p) * 0.5 * (1.1/(1.1-p) + 0.1/(p+0.1))
+    is equivalent to 1 for 0 <= p <= 1.
 
 
     Args:
@@ -700,7 +525,8 @@ def fake_parameterized_dropout(probs: Tensor,
              vector-by-vector basis, we instead use the expectations, i.e. probs * values.
     epsilon:  A float value used to prevent division by zero in backprop; if too
             small, could lead to large derivatives being backpropagated when `probs` is
-            close to zero or one.
+            close to zero or one; if too large, can lead to biased derivatives
+            (w.r.t. the dropout probs).
 
     Returns: A Tensor with the same shape as `probs`, `zero_one` and `values`, i.e.
            (*, C), which is randomly somewhere between values * zero_one and values * probs.
@@ -754,7 +580,7 @@ class SamplingBottleneckModule(nn.Module):
                  seq_len: int = 8,
                  num_discretization_levels: int = 128,
                  random_rate: float = 0.5,
-                 epsilon: float = 0.01) -> None:
+                 epsilon: float = 0.1) -> None:
         """
     Create sampling bottleneck module.  This uses an iterative sampling algorithm to
     represent the hidden feature by a fixed number of randomly chosen classes (e.g. 8
@@ -816,11 +642,17 @@ class SamplingBottleneckModule(nn.Module):
                equal to `dim` arg to constructor.
          num_seqs:  The number of parallel sequences (S).  Should probably be 1 unless
                you are planning to model these probabilities
-        Returns (y, class_indexes, value_indexes), where:
+        Returns (y, probs, class_indexes, value_indexes), where:
 
            y: a Tensor of shape (*, F), like x, where F is the `dim` arg to this class's
                constructor.  This is the main output, to be given to
                later modules' forward function.
+          probs: a Tensor of shape (*, N) where N is the number of classes
+               (`num_classes` to constructor), giving the probabilities with which we
+               sampled the classes in `class_indexes`.  Currently without gradient,
+               to save a little memory.  This will be used when predicting
+               the classes in `class_indexes`, as a way to replace samples with
+               expectations to reduce the variance of the derivatives.
           class_indexes:  a LongTensor of shape (*, num_seqs, seq_len) containing
                the randomly sampled classes in the range [0..num_classes-1] == [0..N-1]
                Will be useful if you want to model the probabilities of the output
@@ -846,10 +678,8 @@ class SamplingBottleneckModule(nn.Module):
         # in the sequence of K distinct samples.
         marginals = compute_marginals(probs, self.K)
 
-        cumsum = exclusive_cumsum(probs, dim=-1)
-
         # indexes shape is (*, S, K)
-        class_indexes = iterative_sampling(cumsum, num_seqs)
+        class_indexes = iterative_sample(probs, num_seqs)
 
         discrete_values, value_indexes = discretize_values(values, self.M)
 

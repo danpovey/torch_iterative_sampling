@@ -8,26 +8,43 @@ extern __shared__ int extern_buf[];
 // `extern_buf` is general-purpose shared memory.
 
 
+
 /*
-  Return the index i into cumsum, such that cumsum[i - 1] <= r < cumsum[i]
-  (this is the inclusive cumulative sum, which is why we have i - 1 and i,
-  not i and i + 1).
-  We take cumsum[-1] to be negative infinity (we could almost equivalently
-  say 0, since we expect r >= 0).
+  This device function, intended to be called with the same args among all threads
+  in the tile `group_tile` (actually a group of blockDim.x threads),
+  returns, in all threads in the tile, the index i into cumsum, with begin <= i < end,
+  such that cumsum[i] <= r < cumsum[i + 1], where cumsum[i + 1] is never accessed
+  and is treated as if it were +infinity.  (TODO: see if this is really necessary).
 
-  Note: if r is less than 0 or greater than cumsum[N-1], this function
-  will return 0 or N-1 respectively; i.e. we won't go out of the available
-  range.
+  Args:
+         group_tile: represents the group of threads which will be calling this
+                 function (for synchronization).
+             cumsum: pointer to an array of ScalarType that we are searching in.
+             begin: first index in `cumsum` that we might return
+             end: one-past-the-last index in `cumsum` that we might return
+               (cumsum[end] will never be accessed and is treated as +infinity).
+               Must satisfy end > begin.
+             r:  value whose interval we are searching for in `cumsum`
+        shared_int:  A pointer to an int32_t in shared memory that is unique
+               to this tile.
 
-  This is the same as the CPU version, except for __device__ __forceinline__.
- */
-template <typename IterType, typename ScalarType>
-__device__ __forceinline__ int find_class(
-    IterType cumsum, ScalarType r) {
-  // First search for the 'begin' element such that
-  // cumsum[begin] <= r < cumsum[begin+1]
-  int N = cumsum.size(0),
-      begin = -1, end = N - 1;
+
+
+*/
+template <typename ScalarType>
+__forceinline__ __device__ int find_class(
+    cooperative_groups::thread_group group_tile,
+    ScalarType *cumsum, int begin, int end, ScalarType r, int32_t *shared_int) {
+
+  group_tile.sync();
+  int i = group_tile.thread_rank();  // Actually will equal threadIdx.x.
+  if (begin + i < end) {
+
+
+  }
+
+
+  assert(end > begin);
   while (end > begin + 1) {
     int mid = begin + (end - begin) / 2;
     if (cumsum[mid] <= r)
@@ -35,63 +52,123 @@ __device__ __forceinline__ int find_class(
     else
       end = mid;
   }
-  return begin + 1;
+  return begin;
 }
 
 
+
 /*
-  Forward of iterative_sampling.
+  kernel for iterative_sampling.
+
+  One kernel handles one batch index (b) of 'cumsum', including all 's' indexes
+  i.e. all sequences that correspond to that batch index.  As s gets larger
+  (more sequences), we compensate by using fewer threads per sequence.
+  Of course we have to process the 'k' index (the position in the sequence)
+  sequentially.
 
   The thread-block will be of shape  (blockDim.x, blockDim.y)
-  where blockDim.x, e.g. 16, corresponds to a group of threads assigned to process a
-  single 'b' (batch) index, and blockDim.y varies with 'b'.
-  We require that blockDim.x is no greater than the warp size, i.e.
-  no greater than 32 (this is because we do __syncwarp() in the code, not
-  __syncthreads()).
+  where blockDim.x, a power of two (e.g. 16 or 32), is the size of the
+  group of threads assigned to handle one sequence 0 <= s < S,
+  and blockDim.y equals S.
 
-  On the grid, the threads only vary in y (gridDim.x==1), so the formula for b is:
+  The grid size will be (gridDim.x), and we'll iterate over the
+  batch index b.
 
-    b = blockIdx.y * blockDim.y  +  threadIdx.y
 
   Template args:
       scalar_t: the floating-point type, e.g. float, double; maybe half
 
   Args:
-      cumsum:  Accessor to the (inclusive) cumulative sum of probabilities,
-             of shape (B, N)
-      rand:  Accessor to a tensor of random numbers, of shape (B, 3).
-           Probably the easiest way to see how they are used is to
-           look at the CPU code in iterative_sampling_cpu.cpp
-      out: Accessor to the output (which will be empty/undefined at entry),
-           of shape (B, N)
+      cumsum:  Accessor to the (exclusive) cumulative sum of probabilities,
+            of shape (B, N), i.e. (batch_size, num_classes)
+      rand:  Accessor to a tensor of random numbers, of shape (B, S),
+         i.e. (batch_size, num_sequences)
+      indexes (an output): Accessor to a LongTensor of chosen indexes, of
+          shape (B, S, K), i.e. (batch_size, num_sequences, seq_len)
 
   When this kernel is invoked, the suer must specify the amount of shared memory
-  to be allocated, via `extern_buf`.  This must be enough to store
-    (N * blockDim.y * sizeof(scalar_t)
+  to be allocated, via `extern_buf`.  The size of extern_buf must be:
+  row of
+
+     [TODO] * sizeof(scalar_t)
   bytes.
 */
 template <typename scalar_t>
 __global__
 void iterative_sampling_kernel(
     torch::PackedTensorAccessor32<scalar_t, 2> cumsum,   // B, N
-    torch::PackedTensorAccessor32<scalar_t, 2> rand,   // B, 3
-    torch::PackedTensorAccessor32<scalar_t, 2> ans,    // B, N
-    torch::PackedTensorAccessor32<int32_t, 2> ans_indexes, // B, 2
+    torch::PackedTensorAccessor32<scalar_t, 2> rand,   // B, S
+    torch::PackedTensorAccessor32<int64_t, 2> indexes, // S, K
     float interp_prob) {
   const int B = cumsum.size(0),
-      N = cumsum.size(1);
+      N = cumsum.size(1),
+      S = indexes.size(0),
+      K = indexes.size(1);
+
+  assert(S == blockDim.y);
 
   namespace cg = cooperative_groups;
   cg::thread_group group_tile = cg::tiled_partition(cg::this_thread_block(),
                                                     blockDim.x);
 
-  const int b = threadIdx.y + blockIdx.y * blockDim.y;
+
+  int s = threadIdx.y;  // each block of "blockDim.x" threads handles one 's'
+  // index (one sequence)
+
+  // each block handling a different sequence s has a different 'cur_cumsum'
+  // buffer, of size K.  This is a pointer to __shared__ memory.
+  scalar_t *cur_cumsum = (cumsum_buf + N) + K * s;
+
+  // each block handling a different sequence s has a different 'cur_classes'
+  // buffer, of size (K + 1).  This is a pointer to __shared__ memory.
+  int32_t *cur_classes = (int32_t*)(cumsum_buf + N + (K * S)) + (K + 1) * s;
+
+
+  // `shared_int` is a pointer to a single __shared__ integer that is common to
+  // each group of blockDim.x threads.
+  int32_t *shared_int =  (int32_t*)(cumsum_buf + N + (K * S)) + (K + 1) * S + s;
+
+
+  for (int b = blockIdx.x; b < B; b += gridDim.x) {
+    __syncthreads();
+    scalar_t *cumsum_buf = ((scalar_t*)extern_buf);
+
+    // load cumsum_buf
+    for (int n = threadIdx.x + threadIdx.y * blockDim.x; n < N;
+         n += blockDim.x * blockDim.y)
+      cumsum_buf[n] = cumsum[b][n];
+
+    __syncthreads();
+
+
+    if (threadIdx.x < 2) {
+      cur_cumsum[threadIdx.x] = 0.0;
+      cur_classes[threadIdx.x] = (threadIdx.x == 0 ? -1 : N);
+    }
+    group_tile.sync();
+
+    // iterative_sample_cpu() in iterative_sampling_cpu.cpp may be helpful for
+    // understanding this code, where the contents of 'cur_classes' and
+    // 'cur_cumsum' are documented.
+
+
+    scalar_t chosen_sum = 0.0,
+        r = rand[b][s];
+
+    for (int k = 0; k < K; ++k) {
+
+
+    }
+  }
+}
+
 
   // group_cumsum_buf is a pointer to a buffer of shared memory, that is used by
-  // this group `blockDim.x` threads, of size N, which will be used to
+  // this thread-block to store a row of `cumsum`.
+  group `blockDim.x` threads, of size N, which will be used to
   // store this row of `cumsum`.  Each such group of threads points to
   // a different section of the buffer.
-  scalar_t *group_cumsum_buf = ((scalar_t*)extern_buf) + (N * threadIdx.y);
+  scalar_t *cumsum_buf = ((scalar_t*)extern_buf) + (N * threadIdx.y);
 
   // Load 'cumsum'
   if (b < B) {
@@ -312,29 +389,47 @@ void iterative_sampling_backward_kernel(
 
 
 
-// See iterative_sampling_cpu() in iterative_sampline_cpu.cpp, for documentation.
-std::vector<torch::Tensor> iterative_sampling_cuda(torch::Tensor cumsum,
-                                              torch::Tensor rand,
-                                              float interp_prob) {
+/*
+  iterative_sample function, CUDA version.
+
+    cumsum: (exclusive) cumulative probabilities of input classes, of shape (B, N),
+        where B is the batch size and N is the number of classes, so element
+        cumsum[b][k] is the sum of probs[b][i] for 0 <= i < k.
+        Implicitly the final element (not present) would be 1.0.
+    rand:  random numbers uniformly distributed on [0,1], of shape (B,S), where
+         S is the number of separate sequences of samples we are choosing from
+         each distribution in `cumsum`.
+       K: length of the random sequence to draw; must satisfy 0 < K < N.
+
+  Returns:  Tensor of shape (B, S, K) and type torch::kInt64, containing,
+            for each B, a squence of K distinct sampled integers (class
+            labels) in the range [0..N-1], drawn with probability proportional
+            to the differences between `cumsum` elements, but always excluding
+            previously drawn classes within the current sequence.
+*/
+torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
+                                    torch::Tensor rand,
+                                    int K) {
   TORCH_CHECK(cumsum.dim() == 2, "cumsum must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
-  TORCH_CHECK(cumsum.size(0) == rand.size(0) &&
-              rand.size(1) == 3, "rand has unexpected shape");
-  TORCH_CHECK(interp_prob > 0.0 && interp_prob <= 1.0);
+
+  int B = cumsum.size(0),  // batch size
+      N = cumsum.size(1),  // num classes
+      S = rand.size(1);    // num sequences
+
+  TORCH_CHECK(K > 0 && K < N);  // K is sequence length
+  TORCH_CHECK(rand.size(0) == B);
+
   TORCH_CHECK(cumsum.device().is_cuda() && rand.device().is_cuda(),
               "inputs must be CUDA tensors");
 
-  auto scalar_type = cumsum.scalar_type();
-  auto opts = torch::TensorOptions().dtype(scalar_type).device(cumsum.device());
 
-  const int B = cumsum.size(0),
-      N = cumsum.size(1);
+  auto scalar_type = cumsum.scalar_type();  // presumably float or double
 
-  torch::Tensor ans = torch::empty({B, N}, opts);
+  auto opts = torch::TensorOptions().dtype(scalar_type).device(cumsum.device()),
+      long_opts = torch::TensorOptions().dtype(torch::kInt64).device(cumsum.device());
 
-  auto int32_opts = torch::TensorOptions().dtype(torch::kInt32).device(cumsum.device());
-
-  torch::Tensor ans_indexes = torch::empty({B, 2}, int32_opts);
+  torch::Tensor indexes = torch::empty({B, S, K}, long_opts);
 
 
   // Always use 16 x 16 thread-blocks for now.

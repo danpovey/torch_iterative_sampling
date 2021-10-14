@@ -2,38 +2,30 @@
 
 
 /*
-  Forward of flow sampling, CUDA version.
-  Please see the documentation for iterative_sampling_cpu() in iterative_sampling_cpu.cpp;
-  the interface is the same.
-  Returns (ans, ans_indexes).
-*/
-std::vector<torch::Tensor> iterative_sampling_cuda(torch::Tensor cumsum,
-                                              torch::Tensor rand,
-                                              float interp_prob);
+  iterative_sample function, CUDA version.
 
-/*
-   backward of iterative_sampling.  Returns logits_grad; note, `logits` is the
-   original log-probs from which `cumsum` was derived by softmax and then
-   cumulative summation.
-   We don't return a grad for `rand`; actually, such a thing is not even
-   possible as the the forward function is a discontinuous function of the
-   input.
-   These derivatives are not correct from the point of view of a
-   deterministic function of the original `logits` and `rand`.  They are
-   only correct in a sense involving expectations.  See BACKPROP NOTES
-   in iterative_sampling_cpu.cpp for a longer discussion.
+    cumsum: (exclusive) cumulative probabilities of input classes, of shape (B, N),
+        where B is the batch size and N is the number of classes, so element
+        cumsum[b][k] is the sum of probs[b][i] for 0 <= i < k.
+        Implicitly the final element (not present) would be 1.0.
+    rand:  random numbers uniformly distributed on [0,1], of shape (B,S), where
+         S is the number of separate sequences of samples we are choosing from
+         each distribution in `cumsum`.
+       K: length of the random sequence to draw; must satisfy 0 < K < N.
+
+  Returns:  Tensor of shape (B, S, K) and type torch::kInt64, containing,
+            for each B, a squence of K distinct sampled integers (class
+            labels) in the range [0..N-1], drawn with probability proportional
+            to the differences between `cumsum` elements, but always excluding
+            previously drawn classes within the current sequence.
 */
-torch::Tensor iterative_sampling_backward_cuda(
-    torch::Tensor cumsum,
-    torch::Tensor rand,
-    torch::Tensor ans_indexes,
-    torch::Tensor ans_grad,
-    float interp_prob,
-    float straight_through_scale);
+torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
+                                    torch::Tensor rand,
+                                    int K);
+
 
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("iterative_sampling_cuda", &iterative_sampling_cuda, "Flow sampling forward function (CUDA)");
-  m.def("iterative_sampling_backward_cuda", &iterative_sampling_backward_cuda, "Flow sampling backward function (CUDA)");
+  m.def("iterative_sample_cuda", &iterative_sampling_cuda, "Iterative sampling function (CUDA)");
 }
