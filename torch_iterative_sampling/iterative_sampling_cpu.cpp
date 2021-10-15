@@ -136,7 +136,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
   AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_cpu_loop", ([&] {
         auto cumsum_a = cumsum.packed_accessor32<scalar_t, 2>(),
             rand_a = rand.packed_accessor32<scalar_t, 2>();
-        auto indexes_a = indexes.packed_accessor32<int64_t, 2>();
+        auto indexes_a = indexes.packed_accessor32<int64_t, 3>();
 
 
         // At iteration k, cur_classes[0] contains -1; cur_classes[1,2,..k]
@@ -167,9 +167,9 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
         for (int b = 0; b < B; ++b) {
 
           auto this_cumsum_a = cumsum_a[b];
-          auto this_indexes_a = indexes_a[b];
 
           for (int s = 0; s < S; ++s) {
+            auto this_indexes_a = indexes_a[b][s];
             cur_classes[0] = -1;
             cur_classes[1] = N;
             cur_cumsum[0] = 0.0;
@@ -214,7 +214,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
               // It will be distinct from all previously chosen classes.
               this_indexes_a[k] = c;
 
-              scalar_t this_class_prob = (c + 1 == N ? 1.0 : this_cum_sum_a[c + 1]) - this_cum_sum_a[c];
+              scalar_t this_class_prob = (c + 1 == N ? 1.0 : this_cumsum_a[c + 1]) - this_cumsum_a[c];
               r = (r - this_cum_sum_a[c]) / this_class_prob;
               // mathematically, r should be in [0,1]; but make sure of this in case,
               // due to roundoff, it is just outside that interval.

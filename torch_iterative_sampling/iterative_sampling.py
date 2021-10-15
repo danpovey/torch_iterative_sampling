@@ -451,8 +451,8 @@ class _FakeParameterizedDropout:
         # look for (2), i.e. equation 2.
         inv_p1 = 0.5 / (probs + epsilon)
         inv_p2 = 0.5 / ((1.0 + epsilon) - probs)
-        s1 = inv_p1  +  epsilon * inv_p2
-        s2 = inv_p2  +  epsilon * inv_p1
+        s1 = inv_p1 + epsilon * inv_p2
+        s2 = inv_p2 + epsilon * inv_p1
 
         probs_grad_random = ans_grad * values * (zero_one * s1) + ((1-zero_one) * s2)
         probs_grad_deterministic = ans_grad * values
