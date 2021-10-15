@@ -1,5 +1,6 @@
 import os
 
+import random # for testing only
 import torch
 from torch import nn
 from torch import Tensor
@@ -54,7 +55,7 @@ def _iterative_sample_dispatcher(
     Dispatcher for iterative
     """
     if cumsum.is_cuda:
-        if torch_iterative_sample_cuda is None:
+        if torch_iterative_sampling_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
         return torch_iterative_sampling_cuda.iterative_sample_cuda(
             cumsum, rand, seq_len)
@@ -975,7 +976,43 @@ def _test_sampling_bottleneck():
 
     print("y part = ", y[0])
 
+
+def _show_products(a: Tensor, b: Tensor, a_name: str, b_name: str):
+    ab = (a * b).sum().to('cpu').item()
+    aa = (a * a).sum().to('cpu').item()
+    bb = (b * b).sum().to('cpu').item()
+    a_flip_b = (a.flip(dims=(0,)) * b).sum().to('cpu').item()
+    print(f"{a_name}*{b_name}:{ab}, {a_name}*{a_name}:{aa}, {b_name}*{b_name}:{bb}, {a_name}-flipped*{b_name}:{a_flip_b}")
+
+
+def _test_iterative_sample():
+    for device in 'cpu', 'cuda':
+        print("device=", device)
+        device = torch.device(device)
+        B = 32
+        N = 20
+        logprobs = 2 * torch.randn(B, N, device=device)
+        probs = logprobs.softmax(dim=-1)
+
+        num_seqs = random.randint(1, 5)
+
+        seq_len = 10
+        indexes = iterative_sample(probs, num_seqs=num_seqs, seq_len=seq_len)
+        #print("indexes = ", indexes)
+
+        indexes_0 = indexes[:,0,:]  # take 1st sequence.
+        zero_ones = torch.zeros(B, N, device=device)
+        zero_ones.scatter_(-1, indexes_0, 1.0)
+
+        expected_marginals = compute_marginals(probs, seq_len)
+
+        _show_products(zero_ones, expected_marginals, "seen", "expected")
+
+
+
+
 if __name__ == '__main__':
+    _test_iterative_sample()
     _test_sampling_bottleneck()
     _test_discretize_values()
     _test_compute_marginals()

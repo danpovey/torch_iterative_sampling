@@ -112,8 +112,8 @@ inline void wrap_if_outside_unit_interval(scalar_t *r) {
             to the differences between `cumsum` elements, but always excluding
             previously drawn classes within the current sequence.
 */
-torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
-                                   torch::Tensor rand,
+torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,  // [B][N]
+                                   torch::Tensor rand,   // [B][S]
                                    int K) {
   TORCH_CHECK(cumsum.dim() == 2, "cumsum must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
@@ -143,7 +143,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
         // At iteration k, cur_classes[0] contains -1; cur_classes[1,2,..k]
         // contains the previously chosen k classes (all distinct), in sorted
         // order from least to greatest; and cur_classes[k+1] contains N.
-        std::vector<int32_t> cur_classes(K + 1);
+        std::vector<int32_t> cur_classes(K + 2);
 
         // At iteration k, cur_cumsum[c] for 0 <= c <= k contains cumulative
         // probabilities after subtracting the probability mass due to the
@@ -163,7 +163,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
         // cur_cumsum[0] will always contain 0 and cur_cumsum[i] for 0 < i <= k
         // will contain the start of interval i, with the intervals belonging to
         // previously chosen classes subtracted.
-        std::vector<scalar_t> cur_cumsum(K);
+        std::vector<scalar_t> cur_cumsum(K + 1);
 
         for (int b = 0; b < B; ++b) {
 
@@ -215,8 +215,9 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
               // It will be distinct from all previously chosen classes.
               this_indexes_a[k] = c;
 
-              scalar_t this_class_prob = (c + 1 == N ? 1.0 : this_cumsum_a[c + 1]) - this_cumsum_a[c];
-              r = (r - this_cumsum_a[c]) / this_class_prob;
+              scalar_t this_class_cumsum = this_cumsum_a[c],
+                  this_class_prob = (c + 1 == N ? 1.0 : this_cumsum_a[c + 1]) - this_class_cumsum;
+              r = (r - this_class_cumsum) / this_class_prob;
               // mathematically, r should be in [0,1]; but make sure of this in case,
               // due to roundoff, it is just outside that interval.
               wrap_if_outside_unit_interval(&r);
@@ -235,7 +236,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
                 cur_cumsum[k2 + 1] = cur_cumsum[k2] - this_class_prob;
                 cur_classes[k2 + 1] = cur_classes[k2];
               }
-              cur_cumsum[i + 1] = cur_cumsum[i] + (this_cumsum_a[c] -
+              cur_cumsum[i + 1] = cur_cumsum[i] + (this_class_cumsum -
                                                    class_range_begin_cumsum);
               cur_classes[i + 1] = c;
 
