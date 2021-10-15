@@ -27,5 +27,5 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("iterative_sample_cuda", &iterative_sampling_cuda, "Iterative sampling function (CUDA)");
+  m.def("iterative_sample_cuda", &iterative_sample_cuda, "Iterative sampling function (CUDA)");
 }

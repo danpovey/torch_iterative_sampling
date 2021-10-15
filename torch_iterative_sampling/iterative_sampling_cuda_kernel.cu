@@ -21,7 +21,7 @@ extern __shared__ int extern_buf[];
                  function (for synchronization).
        shared_int:  A pointer to an int32_t in shared memory that is unique
               to this tile, to be used for inter-thread communication.
-           cumsum: pointer to an array of ScalarType that we are searching in.
+           cumsum: pointer to an array of scalar_t that we are searching in.
             begin: first index in `cumsum` that we might return
               end: one-past-the-last index in `cumsum` that we might return
                  (cumsum[end] will never be accessed and is treated as +infinity).
@@ -34,10 +34,10 @@ extern __shared__ int extern_buf[];
        This is undefined if r < cumsum[begin].
 
 */
-template <typename ScalarType>
+template <typename scalar_t>
 __forceinline__ __device__ int find_class(
     cooperative_groups::thread_group g, int32_t *shared_int,
-    ScalarType *cumsum, int begin, int end, ScalarType r) {
+    scalar_t *cumsum, int begin, int end, scalar_t r) {
 
   g.sync();
   int i = g.thread_rank(),  // Actually will equal threadIdx.x.
@@ -69,9 +69,9 @@ __forceinline__ __device__ int find_class(
 }
 
 
-template <ScalarType>
-__forceinline__ __device__ void wrap_if_outside_unit_interval(ScalarType *r) {
-  if (*r > 1.0 || r < 0.0) {
+template <typename scalar_t>
+__forceinline__ __device__ void wrap_if_outside_unit_interval(scalar_t *r) {
+  if (*r > 1.0 || *r < 0.0) {
     // should be very rare.
     printf("iterative_sampling_cpu.cpp: warning: wrapping %f\n", (float)(*r));
     // mathematically, r should still be in the range [0,1]; we wrap
@@ -141,6 +141,9 @@ void iterative_sampling_kernel(
   int s = threadIdx.y;  // each block of "blockDim.x" threads handles one 's'
   // index (one sequence)
 
+  // This buffer stores one row of `cumsum`; it points to __shared__ memory.
+  scalar_t *cumsum_buf = (scalar_t*)extern_buf;
+
   // each block handling a different sequence s has a different 'cur_cumsum'
   // buffer, of size K.  This is a pointer to __shared__ memory.
   scalar_t *cur_cumsum = (cumsum_buf + N) + K * s;
@@ -156,7 +159,6 @@ void iterative_sampling_kernel(
 
   for (int b = blockIdx.x; b < B; b += gridDim.x) {
     __syncthreads();
-    scalar_t *cumsum_buf = ((scalar_t*)extern_buf);
 
     // load cumsum_buf
     for (int n = threadIdx.x + threadIdx.y * blockDim.x; n < N;
@@ -201,23 +203,23 @@ void iterative_sampling_kernel(
       // of previously chosen classes that were numbered less than
       // class_range_begin.  Now r can be compared to elements of
       // `cumsum`.
-      scalar_t class_range_begin_cumsum = this_cumsum[class_range_begin]
-          r = r - cur_cumsum[i] + class_range_begin_cumsum;
+      scalar_t class_range_begin_cumsum = cumsum_buf[class_range_begin];
+      r = r - cur_cumsum[i] + class_range_begin_cumsum;
 
       int c = find_class(g, shared_int,
-                         this_cumsum,
+                         cumsum_buf,
                          class_range_begin,
                          class_range_end, r);
       // c is the class chosen, satisfying cumsum_buf[c] <= r <
       // cumsum_buf[c+1], where implicitly cumsum_buf[N] == 1.0.
       // It will be distinct from all previously chosen classes.
       if (threadIdx.x == 0) {
-        this_indexes_a[k] = c;
+        indexes_a[k] = c;
       }
 
       scalar_t this_class_cumsum = cumsum_buf[c],
           this_class_prob = (c + 1 == N ? 1.0 : cumsum_buf[c + 1]) - this_class_cumsum;
-      r = (r - this_cum_sum_a[c]) / this_class_prob;
+      r = (r - cumsum_buf[c]) / this_class_prob;
       // mathematically, r should be in [0,1]; but make sure of this in case,
       // due to roundoff, it is just outside that interval.
       wrap_if_outside_unit_interval(&r);
@@ -235,11 +237,11 @@ void iterative_sampling_kernel(
           // although it may have values greater than k.  If it loops more than
           // once, it will go from the higher values of `this_k` to the lower
           // ones.
-          int this_k = i + (iter * blockDim.x) + threadDim.x;
+          int this_k = i + (iter * blockDim.x) + threadIdx.x;
 
           // Caution: unlike most other variables, c_temp and cumsum_temp have different
           // values in different threads in the tile.
-          int32 c_temp;
+          int32_t c_temp;
           scalar_t cumsum_temp;
 
           if (this_k <= k) {
@@ -324,12 +326,6 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
       long_opts = torch::TensorOptions().dtype(torch::kInt64).device(cumsum.device());
 
   torch::Tensor indexes = torch::empty({B, S, K}, long_opts);
-
-
-  // Always use 16 x 16 thread-blocks for now.
-  int threads_per_group = 16,
-      groups_per_block = 16,
-      num_blocks = (B + groups_per_block - 1) / groups_per_block;
 
   dim3 blockDim(block_dim_x, block_dim_y, 1),
         gridDim(grid_dim_x, 1, 1);

@@ -6,7 +6,7 @@ from torch import Tensor
 from typing import Tuple, Optional, Union
 from torch.utils.cpp_extension import load
 
-VERBOSE = False
+VERBOSE = True
 
 
 def _resolve(name):
@@ -14,8 +14,7 @@ def _resolve(name):
 
 
 try:
-    pass # TEMP
-    #import torch_iterative_sampling_cpu
+    import torch_iterative_sampling_cpu
 except ImportError:
     if VERBOSE:
         print('Falling back to JIT compiling torch_iterative_sampling_cpu')
@@ -29,7 +28,7 @@ except ImportError:
 
 
 try:
-        import torch_iterative_sampling_cuda
+    import torch_iterative_sampling_cuda
 except ImportError:
     if VERBOSE:
         print('Falling back to JIT compiling torch_iterative_sampling_cuda')
@@ -57,10 +56,10 @@ def _iterative_sample_dispatcher(
     if cumsum.is_cuda:
         if torch_iterative_sample_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
-        return torch_iterative_sample_cuda.iterative_sample_cuda(
+        return torch_iterative_sampling_cuda.iterative_sample_cuda(
             cumsum, rand, seq_len)
     else:
-        return torch_iterative_sample_cpu.iterative_sample_cpu(
+        return torch_iterative_sampling_cpu.iterative_sample_cpu(
             cumsum, rand, seq_len)
 
 
@@ -92,7 +91,7 @@ def iterative_sample(probs: torch.Tensor,
     B = probs.shape[0]
     rand = torch.rand(B, num_seqs, dtype=probs.dtype, device=probs.device)
     indexes = _iterative_sample_dispatcher(cumsum, rand, seq_len)
-
+    indexes = indexes.view(*rest_shape, num_seqs, seq_len)
 
     return indexes
 
@@ -412,13 +411,13 @@ def get_weights_total_logprob(weight_prediction: Tensor,
 
 
 
-class _FakeParameterizedDropout:
+class _FakeParameterizedDropout(torch.autograd.Function):
     # Please see the function fake_parameterized_dropout() for a description of
     # the interface.
     @staticmethod
-    def apply(ctx, probs: Tensor, mask: Tensor,
-              values: Tensor, random_rate: float = 0.5,
-              epsilon: float = 0.1) -> Tensor:
+    def forward(ctx, probs: Tensor, mask: Tensor,
+                values: Tensor, random_rate: float = 0.5,
+                epsilon: float = 0.1) -> Tensor:
         probs = probs.detach()
         values = values.detach()
 
@@ -426,11 +425,11 @@ class _FakeParameterizedDropout:
         rest_shape = list(probs.shape)[:-1]
 
         # frame_mask is a bool tensor of shape (*, 1)
-        frame_mask = (torch.randn(*rest_shape, device=probs.device) < random_rate).unqueeze(-1)
-        ctx.saved_for_backward(probs, mask, values, frame_mask)
+        frame_mask = (torch.randn(*rest_shape, device=probs.device) < random_rate).unsqueeze(-1)
+        ctx.save_for_backward(probs, mask, values, frame_mask)
         ctx.epsilon = epsilon
 
-        actual_mask = (frame_mask * mask + (1-frame_mask) * probs)
+        actual_mask = (frame_mask * mask + torch.logical_not(frame_mask) * probs)
         ans = values * actual_mask
         return ans
 
@@ -441,7 +440,7 @@ class _FakeParameterizedDropout:
         epsilon = ctx.epsilon
 
         # `actual_mask` is what we multiplied the values by in the forward pass.
-        actual_mask = (frame_mask * mask + (1-frame_mask) * probs)
+        actual_mask = (frame_mask * mask + torch.logical_not(frame_mask) * probs)
 
         values_grad = ans_grad * actual_mask
 
@@ -459,9 +458,9 @@ class _FakeParameterizedDropout:
 
         s1, s2 = get_derivative_scales(probs, epsilon_tensor)
 
-        grad_factor_random = (mask * s1) + ((1-mask) * s2)
+        grad_factor_random = (mask * s1) + (torch.logical_not(mask) * s2)
         grad_factor_deterministic = 1.0
-        grad_factor = (frame_mask * grad_factor_random + (1-frame_mask) * grad_factor_deterministic)
+        grad_factor = (frame_mask * grad_factor_random + torch.logical_not(frame_mask) * grad_factor_deterministic)
         actual_mask_grad = ans_grad * values
         probs_grad = grad_factor * actual_mask_grad
 
@@ -671,9 +670,9 @@ class SamplingBottleneckModule(nn.Module):
         """
         super(SamplingBottleneckModule, self).__init__()
         self.dim = dim
-        self.K = seq_len
-        self.N = num_classes
-        self.M = num_discretization_levels
+        self.seq_len = seq_len
+        self.num_classes = num_classes
+        self.num_discretization_levels = num_discretization_levels
         self.random_rate = random_rate
         self.epsilon = epsilon
 
@@ -718,7 +717,7 @@ class SamplingBottleneckModule(nn.Module):
                the classes in `class_indexes`, as a way to replace samples with
                expectations to reduce the variance of the derivatives.
           class_indexes:  a LongTensor of shape (*, num_seqs, seq_len) containing
-               the randomly sampled classes in the range [0..num_classes-1] == [0..N-1]
+               the randomly sampled classes in the range [0..num_classes-1].
                Will be useful if you want to model the probabilities of the output
                of this layer.
           value_indexes:  a LongTensor of shape (*, num_seqs, seq_len) containing
@@ -740,22 +739,26 @@ class SamplingBottleneckModule(nn.Module):
 
         # compute marginal probabilities of selecting any given class at any point
         # in the sequence of K distinct samples.
-        marginals = compute_marginals(probs, self.K)
+        marginals = compute_marginals(probs, self.seq_len)
 
         # indexes shape is (*, S, K)
-        class_indexes = iterative_sample(probs, num_seqs)
+        class_indexes = iterative_sample(probs, num_seqs=num_seqs,
+                                         seq_len=self.seq_len)
 
-        discrete_values, value_indexes = discretize_values(values, self.M)
+        discrete_values, value_indexes = discretize_values(values,
+                                                           self.num_discretization_levels)
 
         if not self.training:
             # in eval mode, don't use the discretized values.
             discrete_values = values
 
-
+        print("class_indexes shape = ", class_indexes.shape)
         class_indexes_0 = class_indexes.select(dim=-2, index=0)
         mask = torch.zeros_like(values)
         # Put 1.0 in the mask vector at positions specified by `class_indexes_0`.
-        mask.scatter_(-1, class_indexes_0.unsqueeze(-1), 1.0)
+        print("mask shape = ", mask.shape)
+        print("class_indexes_0 shape = ", class_indexes_0.shape)
+        mask.scatter_(-1, class_indexes_0, 1.0)
 
         random_rate = 0.0 if not self.training else self.random_rate
 
@@ -960,6 +963,7 @@ def _test_discretize_values():
 
 
 def _test_sampling_bottleneck():
+    # just makes sure the forward function runs without crashing.
     dim = 256
     num_classes = 512
     m = SamplingBottleneckModule(dim, num_classes)

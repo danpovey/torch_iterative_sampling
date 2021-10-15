@@ -41,7 +41,8 @@ template <typename IterType, typename ScalarType> int find_class(
    Returns:
       A discretized value in [0,1] which will be a multiple of 1/(M-1).
  */
-template <ScalarType> inline scalar_t discretize_weight(scalar_t weight, int M, scalar_t *r) {
+template <typename scalar_t>
+inline scalar_t discretize_weight(scalar_t weight, int M, scalar_t *r) {
   assert(weight >= 0 && weight <= 1.0);
   assert(*r >= 0 && *r <= 1.0);
   // e.g. if M == 128, we divide the range [0..1] into 127 equal intervals, so that we
@@ -78,8 +79,9 @@ template <ScalarType> inline scalar_t discretize_weight(scalar_t weight, int M, 
 }
 
 
-template <ScalarType> inline void wrap_if_outside_unit_interval(ScalarType *r) {
-  if (*r > 1.0 || r < 0.0) {
+template <typename scalar_t>
+inline void wrap_if_outside_unit_interval(scalar_t *r) {
+  if (*r > 1.0 || *r < 0.0) {
     // should be very rare.
     printf("iterative_sampling_cpu.cpp: warning: wrapping %f\n", (float)(*r));
     // mathematically, r should still be in the range [0,1]; we wrap
@@ -128,8 +130,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
 
   auto scalar_type = cumsum.scalar_type();  // presumably float or double
 
-  auto opts = torch::TensorOptions().dtype(scalar_type).device(cumsum.device()),
-      long_opts = torch::TensorOptions().dtype(torch::kInt64).device(cumsum.device());
+  auto long_opts = torch::TensorOptions().dtype(torch::kInt64).device(cumsum.device());
 
   torch::Tensor indexes = torch::empty({B, S, K}, long_opts);
 
@@ -203,8 +204,8 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
               // of previously chosen classes that were numbered less than
               // class_range_begin.  Now r can be compared to elements of
               // `cumsum`.
-              scalar_t class_range_begin_cumsum = this_cumsum_a[class_range_begin]
-                  r = r - cur_cumsum[i] + class_range_begin_cumsum;
+              scalar_t class_range_begin_cumsum = this_cumsum_a[class_range_begin];
+              r = r - cur_cumsum[i] + class_range_begin_cumsum;
 
               int c = find_class(this_cumsum_a,
                                  class_range_begin,
@@ -215,7 +216,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,
               this_indexes_a[k] = c;
 
               scalar_t this_class_prob = (c + 1 == N ? 1.0 : this_cumsum_a[c + 1]) - this_cumsum_a[c];
-              r = (r - this_cum_sum_a[c]) / this_class_prob;
+              r = (r - this_cumsum_a[c]) / this_class_prob;
               // mathematically, r should be in [0,1]; but make sure of this in case,
               // due to roundoff, it is just outside that interval.
               wrap_if_outside_unit_interval(&r);
