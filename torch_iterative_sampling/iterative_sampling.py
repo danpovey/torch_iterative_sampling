@@ -412,8 +412,8 @@ def get_weights_total_logprob(weight_prediction: Tensor,
 
 
 
-class _FakeParameterizedDropout(torch.autograd.Function):
-    # Please see the function fake_parameterized_dropout() for a description of
+class _ParameterizedDropout(torch.autograd.Function):
+    # Please see the function parameterized_dropout() for a description of
     # the interface.
     @staticmethod
     def forward(ctx, probs: Tensor, mask: Tensor,
@@ -425,8 +425,9 @@ class _FakeParameterizedDropout(torch.autograd.Function):
         C = probs.shape[-1]
         rest_shape = list(probs.shape)[:-1]
 
-        # frame_mask is a bool tensor of shape (*, 1)
-        frame_mask = (torch.randn(*rest_shape, device=probs.device) < random_rate).unsqueeze(-1)
+        # frame_mask is a bool tensor of shape (*, 1), that's True on
+        # frames that will be random (i.e. use "mask" and not "probs").
+        frame_mask = (torch.rand(*rest_shape, device=probs.device) < random_rate).unsqueeze(-1)
         ctx.save_for_backward(probs, mask, values, frame_mask)
         ctx.epsilon = epsilon
 
@@ -555,11 +556,11 @@ def get_derivative_scales(probs: Tensor,
     return s1, s2
 
 
-def fake_parameterized_dropout(probs: Tensor,
-                               mask: Tensor,
-                               values: Tensor,
-                               random_rate: float = 0.5,
-                               epsilon: float = 0.1) -> Tensor:
+def parameterized_dropout(probs: Tensor,
+                          mask: Tensor,
+                          values: Tensor,
+                          random_rate: float = 0.5,
+                          epsilon: float = 0.1) -> Tensor:
     """
     This function returns (values * mask) if random_rate == 1.0 and
     (values * probs) if random_rate == 0.0 or if we are in eval mode
@@ -597,7 +598,7 @@ def fake_parameterized_dropout(probs: Tensor,
            (*, C), which is randomly somewhere between values * mask and values * probs.
 
     """
-    return _FakeParameterizedDropout.apply(probs, mask, values, random_rate, epsilon)
+    return _ParameterizedDropout.apply(probs, mask, values, random_rate, epsilon)
 
 
 
@@ -763,9 +764,9 @@ class SamplingBottleneckModule(nn.Module):
 
         random_rate = 0.0 if not self.training else self.random_rate
 
-        y = fake_parameterized_dropout(probs, mask, values,
-                                       random_rate=random_rate,
-                                       epsilon=self.epsilon)
+        y = parameterized_dropout(probs, mask, values,
+                                  random_rate=random_rate,
+                                  epsilon=self.epsilon)
 
         y = self.to_output(y)
         y = self.layer_norm(y)
@@ -977,16 +978,19 @@ def _test_sampling_bottleneck():
     print("y part = ", y[0])
 
 
-def _show_products(a: Tensor, b: Tensor, a_name: str, b_name: str):
+def _compare_seen_expected_products(a: Tensor, b: Tensor, a_name: str = "seen", b_name: str = "expected",
+                                    threshold: float = 0.02):
+    """
+    Compute and display products between a and b, and check that (a*b).sum() is close to (b*b).sum().
+    """
     ab = (a * b).sum().to('cpu').item()
     aa = (a * a).sum().to('cpu').item()
     bb = (b * b).sum().to('cpu').item()
     a_flip_b = (a.flip(dims=(0,)) * b).sum().to('cpu').item()
-    print(f"{a_name}*{b_name}:{ab}, {a_name}*{a_name}:{aa}, {b_name}*{b_name}:{bb}, {a_name}-flipped*{b_name}:{a_flip_b}")
+    err = (1.0 - ab / (0.5 * (ab + bb)))
+    print(f"{a_name}*{b_name}:{ab}, {a_name}*{a_name}:{aa}, {b_name}*{b_name}:{bb}, {a_name}-flipped*{b_name}:{a_flip_b}, rel_err={err}")
 
-    if a_name == "seen" and b_name == "expected":
-        ratio = ab / (0.5 * (ab + bb))
-        assert abs(ratio - 1.0) < 0.02
+    assert abs(err) < threshold
 
 
 def _test_iterative_sample():
@@ -1008,14 +1012,108 @@ def _test_iterative_sample():
         zero_ones = torch.zeros(B, N, device=device)
         zero_ones.scatter_(-1, indexes_0, 1.0)
 
+        # Check all indexes in each sequence are distinct.
+        assert zero_ones.sum().to('cpu').item() == indexes_0.numel()
+
         expected_marginals = compute_marginals(probs, seq_len)
 
-        _show_products(zero_ones, expected_marginals, "seen", "expected")
+        _compare_seen_expected_products(zero_ones, expected_marginals, "seen", "expected")
 
 
+def _test_get_derivative_scales():
+    probs = torch.rand(200, 300, 2)
+    epsilon_tensor = 0.1 + torch.rand(200, 300, 2)
+    for epsilon in [0.0, 0.1, 1.0, 2.0, epsilon_tensor]:
+        s1, s2 = get_derivative_scales(probs, epsilon)
+        one = (s1 * probs) + (s2 * (1-probs))
+        assert(torch.allclose(one, torch.ones_like(one)))
 
+
+def _test_parameterized_dropout():
+    probs = torch.rand(100, 200, 5)
+    mask = (torch.rand_like(probs) < probs)
+    values = torch.rand_like(probs)
+    probs.requires_grad = True
+    values.requires_grad = True
+
+    output_grad = torch.randn_like(probs)
+    quadratic_grad = torch.randn_like(probs)
+
+    for random_rate in (0.0, 0.5, 1.0):
+        for epsilon in (0.001, 0.1, 0.5, 1.0):
+            for quadratic_term in (0.0, 1.0, 3.0):
+                """
+                The 'quadratic_term' part requires an explanation.  (we assume you've read the docuemntation
+                for parameterized_dropout()).  We construct a loss function that is:
+
+                   (output * output_grad.sum() + 0.5 * quadratic_term * (output * output).sum())   (eq. 1)
+
+                (Remember, as epsilon -> 0, our backprop approach is supposed to approach exact
+                derivatives for any quadratic loss function).
+
+                What is the expected derivative contribution from the quadratic part of the
+                loss function?  We'll first compute the expected loss, which is the thing we
+                are supposed to be backpropping, and then compute the derivative of that.
+                Again considering just the quadratic part in (eq. 1), the expected loss
+                if random_rate == 1.0 (i.e. we use the random
+                      0.5 * quadratic_term * (probs * values * values).sum()   (eq. 2).
+                [note: with probability (1-probs), the output is zero so the squared
+                output would also be zero.]
+                If random_rate == 0.0, i.e. output == probs * values, it is:
+                      0.5 * quadratic_term * (probs * probs * values * values).sum()   (eq. 3).
+                In general, the quadratic part of the loss function is (expected value):
+                    0.5 * random_rate * quadratic_term * (probs * values * values).sum()  +
+                    0.5 * (1 - random_rate) * quadratic_term * (probs * probs * values * values).sum()  (eq. 4).
+                The derivative of this w.r.t. 'probs' is:
+                    (0.5 * random_rate * quadratic_term * values * values  +
+                     (1 - random_rate) * quadratic_term * probs * values * values).sum()  (eq. 5).
+                and the derivative of this w.r.t. 'values' is:
+                       (random_rate * quadratic_term * probs * values  +
+                     (1 - random_rate) * quadratic_term * probs * probs * values).sum()  (eq. 6).
+                """
+
+                probs.grad = None
+                values.grad = None
+
+                output = parameterized_dropout(probs, mask, values, random_rate, epsilon)
+                expected_output = values * probs
+                print(f"test_parameterized_dropout: random_rate={random_rate}, epsilon={epsilon}, quadratic_term={quadratic_term}:")
+                _compare_seen_expected_products(output, expected_output)
+
+                if random_rate == 0.0:
+                    assert torch.allclose(output, values * probs) # deterministic in this case.
+
+
+                (output * output_grad + 0.5 * quadratic_term * quadratic_grad * output * output).sum().backward()
+
+                expected_probs_grad = output_grad * values
+                # for next line, see (eq. 5) above
+                expected_probs_grad += quadratic_term * quadratic_grad * (0.5 * random_rate * values * values +
+                                                                          (1-random_rate) * probs * values * values)
+                expected_values_grad = output_grad * probs
+                # for next line, see (eq. 6) above
+                expected_values_grad += quadratic_term * quadratic_grad * (random_rate * probs * values +
+                                                                           (1-random_rate) * probs * probs * values)
+
+
+                # if all three of quadratic_term, epsilon and random_rate are nonzero,
+                # there is a risk of inaccuracy in expected vs. observed derivatives.
+                threshold=0.01 + (0.075 * quadratic_term * epsilon * random_rate)
+                if threshold > 0.015:
+                    print(f"Threshold={threshold}, since quadratic_term={quadratic_term} and epsilon={epsilon} and random_rate={random_rate}")
+
+                # Note: this test won't always succeed, and the threshold is heuristic, not based on
+                # a properly derived formula.  The threshold above can be played with
+                # if the failures bother you.
+                _compare_seen_expected_products(probs.grad, expected_probs_grad, "probs_grad", "expected_probs_grad",
+                                                threshold=threshold)
+                # Actually the expected-grad expression w.r.t. 'values' is valid regardless of these approximations,
+                # so no need to increase threshold here.
+                _compare_seen_expected_products(values.grad, expected_values_grad, "values_grad", "expected_values_grad")
 
 if __name__ == '__main__':
+    _test_parameterized_dropout()
+    _test_get_derivative_scales()
     _test_iterative_sample()
     _test_sampling_bottleneck()
     _test_discretize_values()
