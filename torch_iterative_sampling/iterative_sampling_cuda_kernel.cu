@@ -4,7 +4,7 @@
 #include <cmath>  // for INFINITY
 #include <stdio.h>
 
-extern __shared__ int extern_buf[];
+extern __shared__ char extern_buf[];
 // `extern_buf` is general-purpose shared memory.
 
 
@@ -69,15 +69,18 @@ __forceinline__ __device__ int find_class(
     // may go different numbers of times around this loop does not matter.
     end = min(end, begin + block_size);
   }
+#if 0
   if (blockIdx.x == 0 && threadIdx.y == 0) {
     printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, returning begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
            orig_begin, orig_end, begin,
            (float)cumsum[begin], (float)r, (float)cumsum[begin + 1]);
   }
+#endif
   if (!(r >= cumsum[begin] && (begin + 1 == orig_end || r < cumsum[begin + 1]))) {
     printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, search error:  begin,end=%d,%d, returning begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
            orig_begin, orig_end, begin, (float)cumsum[begin], (float)r, (float)cumsum[begin + 1]);
   }
+
   return begin;
 }
 
@@ -154,6 +157,7 @@ void iterative_sampling_kernel(
 
   // each block of "blockDim.x" threads handles one 's' index (one sequence)
   int s = threadIdx.y;
+  assert(s < S);
 
   // This buffer stores one row of `cumsum`, indexed 0..N-1; it points to
   // __shared__ memory.
@@ -215,6 +219,9 @@ void iterative_sampling_kernel(
       int class_range_begin = cur_classes[i] + 1,
           class_range_end = cur_classes[i + 1];
 
+      assert(class_range_begin >= 0 && class_range_begin < class_range_end &&
+             class_range_end <= N);
+
       // shift r by "adding back" the probability mass due to the subset
       // of previously chosen classes that were numbered less than
       // class_range_begin.  Now r can be compared to elements of
@@ -228,6 +235,9 @@ void iterative_sampling_kernel(
                          cumsum_buf,
                          class_range_begin,
                          class_range_end, r);
+
+      assert(c >= class_range_begin && c < class_range_end);
+
       // c is the class chosen, satisfying cumsum_buf[c] <= r <
       // cumsum_buf[c+1], where implicitly cumsum_buf[N] == 1.0.
       // It will be distinct from all previously chosen classes.
@@ -287,10 +297,13 @@ void iterative_sampling_kernel(
       // classes.  On the next iteration, we will search within this
       // reduced interval.
       r = r * (1.0 - chosen_sum);
+
+#if 0
       if (blockIdx.x == 0 && threadIdx.y == 0) {
         printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, r=%f, r_orig1=%f, r_orig=%f, chosen_sum=%f, this_class_prob=%f, this_class_cumsum=%f, class_range_begin_cumsum=%f, k=%d, i=%d, c=%d, class_range_begin=%d, class_range_end=%d\n", blockIdx.x, threadIdx.x, threadIdx.y,
                r, r_orig1, r_orig, chosen_sum, this_class_prob, this_class_cumsum, class_range_begin_cumsum, k, i, c, class_range_begin, class_range_end);
       }
+#endif
 
     }
   }
@@ -341,9 +354,12 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
       block_dim_y = S,
       block_dim_x = 32;
 
-  while (block_dim_x * S < 256 && block_dim_x < N) {
+  // actually block_dim_x must be 32 because for now cooperative_groups
+  // does not support tiles with size more than 32.
+  /*
+  while (block_dim_x * S < 256 && block_dim_x < N)
     block_dim_x *= 2;
-  }
+  */
 
 
   TORCH_CHECK(K > 0 && K < N);  // K is sequence length
@@ -373,8 +389,9 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
                                    (K + 2) * S * sizeof(int32_t) +
                                    S * sizeof(int32_t));
         fprintf(stderr, "N = %d, K = %d, S = %d, extern_memory_bytes = %d\n", N, K, S, extern_memory_bytes);
+        extern_memory_bytes += 1024;
 
-        iterative_sampling_kernel<scalar_t><<<gridDim, blockDim, extern_memory_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        iterative_sampling_kernel<scalar_t><<<gridDim, blockDim, extern_memory_bytes>>>(
             cumsum.packed_accessor32<scalar_t, 2>(),
             rand.packed_accessor32<scalar_t, 2>(),
             indexes.packed_accessor32<int64_t, 3>());

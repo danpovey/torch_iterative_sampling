@@ -984,19 +984,23 @@ def _show_products(a: Tensor, b: Tensor, a_name: str, b_name: str):
     a_flip_b = (a.flip(dims=(0,)) * b).sum().to('cpu').item()
     print(f"{a_name}*{b_name}:{ab}, {a_name}*{a_name}:{aa}, {b_name}*{b_name}:{bb}, {a_name}-flipped*{b_name}:{a_flip_b}")
 
+    if a_name == "seen" and b_name == "expected":
+        ratio = ab / (0.5 * (ab + bb))
+        assert abs(ratio - 1.0) < 0.02
+
 
 def _test_iterative_sample():
     for device in 'cpu', 'cuda':
         print("device=", device)
         device = torch.device(device)
-        B = 32
-        N = 20
+        B = 3000
+        N = 256
         logprobs = 2 * torch.randn(B, N, device=device)
         probs = logprobs.softmax(dim=-1)
 
-        num_seqs = random.randint(1, 5)
+        num_seqs = random.randint(1, 8)
 
-        seq_len = 10
+        seq_len = random.randint(5, 15)
         indexes = iterative_sample(probs, num_seqs=num_seqs, seq_len=seq_len)
         #print("indexes = ", indexes)
 
