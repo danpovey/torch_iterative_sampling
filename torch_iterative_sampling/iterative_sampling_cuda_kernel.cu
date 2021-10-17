@@ -38,6 +38,7 @@ template <typename scalar_t>
 __forceinline__ __device__ int find_class(
     cooperative_groups::thread_group &g, int32_t *shared_int,
     scalar_t *cumsum, int begin, int end, scalar_t r) {
+  assert(end > begin);
   int orig_begin=begin, orig_end=end;
 
   g.sync();
@@ -69,6 +70,7 @@ __forceinline__ __device__ int find_class(
     // may go different numbers of times around this loop does not matter.
     end = min(end, begin + block_size);
   }
+  assert(begin >= orig_begin && begin < orig_end);
 #if 0
   if (blockIdx.x == 0 && threadIdx.y == 0) {
     printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, returning begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
@@ -77,8 +79,9 @@ __forceinline__ __device__ int find_class(
   }
 #endif
   if (!(r >= cumsum[begin] && (begin + 1 == orig_end || r < cumsum[begin + 1]))) {
+    float y = (begin + 1 < orig_end ? cumsum[begin + 1] : -100);
     printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, search error:  begin,end=%d,%d, returning begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
-           orig_begin, orig_end, begin, (float)cumsum[begin], (float)r, (float)cumsum[begin + 1]);
+           orig_begin, orig_end, begin, (float)cumsum[begin], (float)r, y);
   }
 
   return begin;
@@ -132,7 +135,7 @@ __forceinline__ __device__ void wrap_if_outside_unit_interval(scalar_t *r) {
   When this kernel is invoked, the user must specify the amount of shared memory
   to be allocated, via `extern_buf`.  The size of extern_buf, in bytes, must be:
 
-      N * sizeof(scalar_t)           <-- for cumsum_buf
+     (N + 1) * sizeof(scalar_t)           <-- for cumsum_buf
      (K + 2) * S * sizeof(scalar_t)  <-- for cur_cumsum
    + (K + 2) * S * sizeof(int32_t)   <-- for cur_classes
    + S * sizeof(int32_t)             <-- for shared_int
@@ -159,7 +162,7 @@ void iterative_sampling_kernel(
   int s = threadIdx.y;
   assert(s < S);
 
-  // This buffer stores one row of `cumsum`, indexed 0..N-1; it points to
+  // This buffer stores one row of `cumsum`, indexed 0..N; it points to
   // __shared__ memory.
   scalar_t *cumsum_buf = (scalar_t*)extern_buf;
 
@@ -168,15 +171,15 @@ void iterative_sampling_kernel(
   // We store one more element in this buffer, vs. CPU code, that is never
   // actually needed but makes the code more similar to the 'cur_classes'
   // buffer and avoids if-statements.
-  scalar_t *cur_cumsum = (cumsum_buf + N) + (K + 2) * s;
+  scalar_t *cur_cumsum = (cumsum_buf + N + 1) + (K + 2) * s;
 
   // each block handling a different sequence s has a different 'cur_classes'
   // buffer, of size (K + 2).  This is a pointer to __shared__ memory.
-  int32_t *cur_classes = (int32_t*)(cumsum_buf + N + ((K + 2) * S)) + (K + 2) * s;
+  int32_t *cur_classes = (int32_t*)(cumsum_buf + N + 1 + ((K + 2) * S)) + (K + 2) * s;
 
   // `shared_int` is a pointer to a single __shared__ integer that is shared
   // within each tile of blockDim.x threads.
-  int32_t *shared_int =  (int32_t*)(cumsum_buf + N + ((K + 2) * S)) + (K + 2) * S + s;
+  int32_t *shared_int =  (int32_t*)(cumsum_buf + N + 1 + ((K + 2) * S)) + (K + 2) * S + s;
 
   for (int b = blockIdx.x; b < B; b += gridDim.x) {
     // iterative_sample_cpu() in iterative_sampling_cpu.cpp may be helpful for
@@ -189,6 +192,8 @@ void iterative_sampling_kernel(
     for (int n = threadIdx.x + threadIdx.y * blockDim.x; n < N;
          n += blockDim.x * blockDim.y)
       cumsum_buf[n] = cumsum[b][n];
+    if (threadIdx.x == 0)
+      cumsum_buf[N] = 1.0;  // avoids an if-statement in the loop.
 
     __syncthreads();
 
@@ -207,6 +212,8 @@ void iterative_sampling_kernel(
     for (int k = 0; k < K; ++k) {
       // Note: at this point, r is in the interval [0,1-chosen_sum]
       int i = find_class(g, shared_int, cur_cumsum, 0, k + 1, r);
+      assert(i >= 0 && i <= k);
+
       // i will now be (in all threadsin the tile), some value 0 <= i <= k, satisfying
       // cur_cumsum[i] <= r < cur_cumsum[i+1], where,
       // implicitly, cur_cumsum[k+1] == 1-chosen_sum, although
@@ -239,6 +246,9 @@ void iterative_sampling_kernel(
           }
         }
       }
+      assert(i >= 0 && i <= k); // temp.
+      assert(class_range_begin >= 0 && class_range_begin < class_range_end &&
+             class_range_end <= N);
 
       // shift r by "adding back" the probability mass due to the subset
       // of previously chosen classes that were numbered less than
@@ -247,9 +257,7 @@ void iterative_sampling_kernel(
       scalar_t class_range_begin_cumsum = cumsum_buf[class_range_begin];
       scalar_t r_orig1 = r;
       r = r - cur_cumsum[i] + class_range_begin_cumsum;
-      //assert(r >= 0 && r <= 1.0);
 
-      assert(class_range_begin < class_range_end && class_range_end <= N);
       int c = find_class(g, shared_int,
                          cumsum_buf,
                          class_range_begin,
@@ -265,7 +273,7 @@ void iterative_sampling_kernel(
       }
 
       scalar_t this_class_cumsum = cumsum_buf[c],
-          this_class_prob = (c + 1 == N ? 1.0 : cumsum_buf[c + 1]) - this_class_cumsum;
+          this_class_prob = cumsum_buf[c + 1] - this_class_cumsum;
       scalar_t r_orig = r;  //TEMP
       r = (r - this_class_cumsum) / this_class_prob;
       // mathematically, r should be in [0,1]; but make sure of this in case,
@@ -403,7 +411,7 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
   AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_cuda_stub", ([&] {
         // scalar_t is defined by the macro AT_DISPATCH_FLOATING_TYPES, should
         // equal scalar_type.
-        int extern_memory_bytes = (N * sizeof(scalar_t) +
+        int extern_memory_bytes = ((N + 1) * sizeof(scalar_t) +
                                    (K + 2) * S * sizeof(scalar_t) +
                                    (K + 2) * S * sizeof(int32_t) +
                                    S * sizeof(int32_t));

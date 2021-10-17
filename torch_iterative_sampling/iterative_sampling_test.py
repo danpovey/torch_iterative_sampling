@@ -7,19 +7,20 @@ from typing import List
 
 
 def test_iterative_sampling_train():
-    for seq_len in 1, 2, 4, 8:
+    for seq_len in 4, 1, 2, 8:
         print(f"Running test_iterative_sampling_train: seq_len={seq_len}")
         device = torch.device('cuda')
         dim = 256
         hidden_dim = 512
         num_classes = 512
-        num_discretization_levels = 128
+        num_discretization_levels = 256
         m = SamplingBottleneckModule(dim, num_classes,
                                      seq_len=seq_len,
                                      num_discretization_levels=num_discretization_levels,
                                      random_rate=1.0).to('cuda')
 
         m_rest = nn.Sequential(nn.Linear(dim, hidden_dim),
+                               nn.ReLU(hidden_dim),
                                nn.LayerNorm(hidden_dim),
                                nn.Linear(hidden_dim, dim)).to('cuda')
 
@@ -32,7 +33,11 @@ def test_iterative_sampling_train():
         # only the last dimension here ('dim') needs to match anything.
         feats_shape = (200, 30, dim)
 
-        entropy_scale = 0.1  # affects how much we penalize -entropy in training.
+        class_entropy_scale = 0.1  # affects how much we penalize -class_entropy in training.
+        frame_entropy_scale = 0.1  # affects how much we penalize -frame_entropy
+                                   # in training; but this is clamped so when it
+                                   # exceeds a certain value we no longer
+                                   # include it in the loss.
 
         # We figure out a reference loss, ref_loss, that reflects what the loss
         # would be if we were efficiently using the information passed through
@@ -123,7 +128,7 @@ def test_iterative_sampling_train():
             feats = torch.randn(*feats_shape, device=device)
 
             output, _, _, _, class_entropy, frame_entropy = m(feats)
-            output = m_rest(output)
+            #output = m_rest(output)
 
             # try to reconstruct the feats, after this information bottleneck.
             loss = ((feats - output) ** 2).sum() / feats.numel()
@@ -136,7 +141,7 @@ def test_iterative_sampling_train():
             # stop maximizing frame_entropy when it is greater than seq_len.
             frame_entropy = torch.clamp(frame_entropy, max=(math.log(seq_len*2)))
 
-            (loss  - (entropy_scale * (class_entropy + frame_entropy))).backward()
+            (loss  - class_entropy_scale * class_entropy - frame_entropy_scale * frame_entropy).backward()
             optim.step()
             optim.zero_grad()
 

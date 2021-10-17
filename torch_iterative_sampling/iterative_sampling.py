@@ -67,7 +67,8 @@ def _iterative_sample_dispatcher(
 
 def iterative_sample(probs: torch.Tensor,
                      num_seqs: int,
-                     seq_len: int) -> torch.Tensor:
+                     seq_len: int,
+) -> torch.Tensor:
     """Sample repeatedly from the categorical distribution in `probs`, each time
       only selecting from classes that were not previously seen.
 
@@ -88,6 +89,13 @@ def iterative_sample(probs: torch.Tensor,
     N = probs.shape[-1]
     rest_shape = probs.shape[:-1]
     probs = probs.reshape(-1, N)
+
+    assert probs.dtype in [torch.float32, torch.float64, torch.float16]
+    epsilon = (1.2e-07 if probs.dtype == torch.float32 else
+               (2.3e-16 if probs.dtype == torch.float64 else
+                9.8e-04)) # <-- assume float16, if supported.
+    probs = (probs * (1-N*epsilon)) + epsilon
+
     cumsum = exclusive_cumsum(probs, dim=-1)
     B = probs.shape[0]
     rand = torch.rand(B, num_seqs, dtype=probs.dtype, device=probs.device)
@@ -634,9 +642,11 @@ def discretize_values(values: Tensor,
          indexes: a LongTensor containing the discrete indexes corresponding
            to `y`, in the range [0..num_discretization_levels-1].
     """
-    indexes = (values * (num_discretization_levels - 1) + torch.rand_like(values)).to(dtype=torch.long)
+    # the 0.99999 is to ensure we don't get exactly one.
+    indexes = (values * (num_discretization_levels - 1) + 0.99999*torch.rand_like(values)).to(dtype=torch.long)
     ans = indexes * (1.0 / (num_discretization_levels - 1))
-    return _WithGradOf.apply(ans, values), indexes
+    y = _WithGradOf.apply(ans, values)
+    return y, indexes
 
 
 
@@ -776,7 +786,7 @@ class SamplingBottleneckModule(nn.Module):
 
         random_rate = 0.0 if not self.training else self.random_rate
 
-        y = parameterized_dropout(probs, mask, values,
+        y = parameterized_dropout(probs, mask, discrete_values,
                                   random_rate=random_rate,
                                   epsilon=self.epsilon)
 
