@@ -6,18 +6,26 @@ from torch_iterative_sampling import SamplingBottleneckModule
 from typing import List
 
 
+# below is a small part of the output of this program:
+# seq_len=8, minibatch=19500, loss=0.878 vs. ref_loss=0.713, ref_loss_shannon=0.736 class_entropy=6.235, frame_entropy=3.903
+# seq_len=4, minibatch=19500, loss=0.918 vs. ref_loss=0.848, ref_loss_shannon=0.844 class_entropy=6.232, frame_entropy=3.162
+# seq_len=2, minibatch=19500, loss=0.948 vs. ref_loss=0.924, ref_loss_shannon=0.912 class_entropy=6.227, frame_entropy=2.371l
+# seq_len=1, minibatch=19500, loss=0.965 vs. ref_loss=0.965, ref_loss_shannon=0.952 class_entropy=6.205, frame_entropy=0.671
+
+
 def test_iterative_sampling_train():
-    for seq_len in 4, 1, 2, 8:
+    for seq_len in 8, 4, 2, 1:
         print(f"Running test_iterative_sampling_train: seq_len={seq_len}")
         device = torch.device('cuda')
         dim = 256
         hidden_dim = 512
         num_classes = 512
-        num_discretization_levels = 256
+        num_discretization_levels = 512
         m = SamplingBottleneckModule(dim, num_classes,
                                      seq_len=seq_len,
                                      num_discretization_levels=num_discretization_levels,
-                                     random_rate=1.0).to('cuda')
+                                     random_rate=1.0,
+                                     epsilon=0.1).to('cuda')
 
         m_rest = nn.Sequential(nn.Linear(dim, hidden_dim),
                                nn.ReLU(hidden_dim),
@@ -113,6 +121,16 @@ def test_iterative_sampling_train():
         P = num_classes ** seq_len / math.factorial(seq_len)
         ref_loss = (dim - (math.log(P*P / (2*math.pi*math.log(P*P/(2*math.pi))))  * (1 + gamma/math.log(P)))) / dim
 
+
+        # Shannon's rate-distortion equation says rate = 1/2 log_2(sigma_x^2 / D),
+        # where sigma_x^2 is the input variance and D is the distortion.  Our
+        # `loss` can be interpreted as D / sigma_x^2, so we have:
+        #   1/loss = exp_2(2*rate) = 2 ** (2 * rate)
+        # .. here, the rate is the rate per dimension..
+        #  so, loss = 0.5 ** (2 * bits_per_dim)
+        #   loss = 0.5 ** (2 * (log(P)/log(2))/dim)
+        ref_loss_shannon = 0.5 ** (2 * (math.log(P) / math.log(2))/dim)
+
         # You might notice that with P large enough, the above expression could potentially be
         # negative, which makes no sense.  The flaw in the argument here arises once P gets
         # close to 2**D, because in that case a significant proportion of the initial clusters
@@ -123,8 +141,6 @@ def test_iterative_sampling_train():
 
         for i in range(20000):
 
-            if i % 1000 == 0:
-                scheduler.step()
             feats = torch.randn(*feats_shape, device=device)
 
             output, _, _, _, class_entropy, frame_entropy = m(feats)
@@ -134,7 +150,7 @@ def test_iterative_sampling_train():
             loss = ((feats - output) ** 2).sum() / feats.numel()
             if i % 500 == 0:
                 loss_val = loss.to('cpu').item()
-                print(f"seq_len={seq_len}, minibatch={i}, loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f}, "
+                print(f"seq_len={seq_len}, minibatch={i}, loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f}, ref_loss_shannon={ref_loss_shannon:.3f} "
                       f"class_entropy={class_entropy.to('cpu').item():.3f}, "
                       f"frame_entropy={frame_entropy.to('cpu').item():.3f}")
 
@@ -144,6 +160,8 @@ def test_iterative_sampling_train():
             (loss  - class_entropy_scale * class_entropy - frame_entropy_scale * frame_entropy).backward()
             optim.step()
             optim.zero_grad()
+            if i % 1000 == 0:
+                scheduler.step()
 
 
 

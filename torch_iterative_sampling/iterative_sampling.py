@@ -718,7 +718,7 @@ class SamplingBottleneckModule(nn.Module):
                equal to `dim` arg to constructor.
          num_seqs:  The number of parallel sequences (S).  Should probably be 1 unless
                you are planning to model these probabilities
-        Returns (y, probs, class_indexes, value_indexes), where:
+        Returns (y, probs, class_indexes, value_indexes, class_entropy, frame_entropy), where:
 
            y: a Tensor of shape (*, F), like x, where F is the `dim` arg to this class's
                constructor.  This is the main output, to be given to
@@ -739,6 +739,17 @@ class SamplingBottleneckModule(nn.Module):
                the range [0..num_discretization_levels-1] == [0..M-1]
                Will be useful if you want to model the probabilities of the output
                of this layer.
+          class_entropy: A scalar Tensor containing the entropy over classes,
+               of the distribution summed over all frames; will be close to
+               log(num_classes) if all classes are equally likely overall.
+               Might be useful if you want to ensure this stays large
+               (might help optimization by ensuring we don't waste classes).
+          frame_entropy: A scalar Tensor containing the per-frame entropy over
+               classes, reflecting the average uncertainty in the distribution over
+               classes on individual frames.  Will be less than class_entropy.
+               Might be useful if you want to ensure this doesn't get too
+               small (this might help optimization).
+
         """
         # logprobs has shape (*, C); it is the input to the softmax that determines the
         # probabilities of sampling different classes on each iteration of sampling.
@@ -988,6 +999,7 @@ def _test_discretize_values():
 
 def _test_sampling_bottleneck():
     # just makes sure the forward function runs without crashing.
+    # There is more extensive testing of this, including training in iterative_sampling_test.py
     dim = 256
     num_classes = 512
     num_discretization_levels = 128
@@ -995,7 +1007,7 @@ def _test_sampling_bottleneck():
                                  num_discretization_levels=num_discretization_levels)
     feats = torch.randn(30, 4, dim)
 
-    y, probs, class_indexes, value_indexes = m(feats)
+    y, probs, class_indexes, value_indexes, class_entropy, frame_entropy = m(feats)
 
     print(f"Shapes of: y={y.shape}, probs={probs.shape}, class_indexes={class_indexes.shape}, value_indexes={value_indexes.shape}")
 
