@@ -1,1 +1,1 @@
-from .iterative_sampling import iterative_sample
+from .iterative_sampling import iterative_sample, SamplingBottleneckModule

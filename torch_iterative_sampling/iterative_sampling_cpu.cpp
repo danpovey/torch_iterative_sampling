@@ -200,6 +200,20 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,  // [B][N]
               int class_range_begin = cur_classes[i] + 1,
                   class_range_end = cur_classes[i + 1];
 
+              if (!(class_range_end > class_range_begin)) {
+                // This code should be reached extremely rarely, and only due to numerical
+                // roundoff.
+                printf("iterative_sampling_cpu.cpp: roundoff detected (this message should be quite rare)\n");
+                for (i = 0; i <= k; i++) {
+                  if (cur_classes[i] + 1 < cur_classes[i + 1]) {
+                    r = 0.5 * (cur_cumsum[i] + cur_cumsum[i+1]);
+                    class_range_begin = cur_classes[i] + 1;
+                    class_range_end = cur_classes[i + 1];
+                    break;
+                  }
+                }
+              }
+
               // shift r by "adding back" the probability mass due to the subset
               // of previously chosen classes that were numbered less than
               // class_range_begin.  Now r can be compared to elements of

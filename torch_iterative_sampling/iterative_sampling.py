@@ -1,6 +1,6 @@
 import os
 
-import random # for testing only
+import random # for testing and diagnostics..
 import torch
 from torch import nn
 from torch import Tensor
@@ -586,8 +586,8 @@ def parameterized_dropout(probs: Tensor,
      values: A Tensor of shape (*, C), the same as probs_and mask; these are the
              values that are to be multiplied by a mask (or sometimes scaled by `probs`,
              if random_rate < 1).  The derivatives backpropagated to here are exact,
-             i.e. just output_grad * mask.  We require that elements of values
-             be in the interval [0,1] (needed for a formula involving epsilon).
+             i.e. just output_grad * mask.  We currently require that elements of values
+             be in the interval [0,1] (this is needed for a formula involving epsilon).
   random_rate:  A float value that determines how often we use the zero-one mask; the
              rest of the time, we use the expected value (probs).
     epsilon:  A float value used to prevent division by zero in backprop; controls
@@ -595,8 +595,8 @@ def parameterized_dropout(probs: Tensor,
              variance).
 
     Returns: A Tensor with the same shape as `probs`, `mask` and `values`, i.e.
-           (*, C), which is randomly somewhere between values * mask and values * probs.
-
+            (*, C), which is randomly somewhere between values * mask and
+            values * probs.
     """
     return _ParameterizedDropout.apply(probs, mask, values, random_rate, epsilon)
 
@@ -678,6 +678,7 @@ class SamplingBottleneckModule(nn.Module):
         self.random_rate = random_rate
         self.epsilon = epsilon
 
+        self.input_scale = nn.Parameter(torch.tensor([3.0]))
 
         # We assume there is a layer-norm just prior to this module, so we don't
         # include layer norm on the input.
@@ -699,7 +700,7 @@ class SamplingBottleneckModule(nn.Module):
     def _reset_parameters(self):
         nn.init.constant_(self.to_values_softmax.weight, 0.)
 
-    def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Forward function.
         Args:
@@ -716,8 +717,9 @@ class SamplingBottleneckModule(nn.Module):
                (`num_classes` to constructor), giving the probabilities with which we
                sampled the classes in `class_indexes`.  Currently without gradient,
                to save a little memory.  This will be used when predicting
-               the classes in `class_indexes`, as a way to replace samples with
-               expectations to reduce the variance of the derivatives.
+               the classes in `class_indexes`, replacing samples with
+               expectations in order to reduce the variance of the resulting
+               derivatives.
           class_indexes:  a LongTensor of shape (*, num_seqs, seq_len) containing
                the randomly sampled classes in the range [0..num_classes-1].
                Will be useful if you want to model the probabilities of the output
@@ -731,12 +733,25 @@ class SamplingBottleneckModule(nn.Module):
         # logprobs has shape (*, C); it is the input to the softmax that determines the
         # probabilities of sampling different classes on each iteration of sampling.
         # (Not the same as the marginal probabilities).
+
+
+
+        x = x * self.input_scale
         probs = self.to_both_softmax(x)
+        values = probs + self.to_values_softmax(x)
+
         probs = torch.softmax(probs, dim=-1)
+
+        avg_probs = probs.mean(dim=tuple(range(probs.ndim-1)))
+        class_entropy = -(avg_probs * (avg_probs + 1.0e-20).log()).sum()
+        frame_entropy = -(probs * (probs + 1.0e-20).log()).sum() / (probs.numel() / probs.shape[-1])
+        if random.random() < 0.001:
+            class_perplexity = class_entropy.exp().to('cpu').item()
+            frame_perplexity = frame_entropy.exp().to('cpu').item()
+            print(f"Class perplexity={class_perplexity}, frame perplexity={frame_perplexity}, vs. max possible {avg_probs.numel()}")
 
         # values also has shape (*, C); it is expected to be similar to `probs`,
         # since we want to bias towards transmitting the larger values.
-        values = probs + self.to_values_softmax(x)
         values = torch.softmax(values, dim=-1)
 
         # compute marginal probabilities of selecting any given class at any point
@@ -754,12 +769,9 @@ class SamplingBottleneckModule(nn.Module):
             # in eval mode, don't use the discretized values.
             discrete_values = values
 
-        print("class_indexes shape = ", class_indexes.shape)
         class_indexes_0 = class_indexes.select(dim=-2, index=0)
         mask = torch.zeros_like(values)
         # Put 1.0 in the mask vector at positions specified by `class_indexes_0`.
-        print("mask shape = ", mask.shape)
-        print("class_indexes_0 shape = ", class_indexes_0.shape)
         mask.scatter_(-1, class_indexes_0, 1.0)
 
         random_rate = 0.0 if not self.training else self.random_rate
@@ -771,7 +783,7 @@ class SamplingBottleneckModule(nn.Module):
         y = self.to_output(y)
         y = self.layer_norm(y)
 
-        return y, class_indexes, value_indexes
+        return y, probs, class_indexes, value_indexes, class_entropy, frame_entropy
 
 
 
@@ -968,12 +980,16 @@ def _test_sampling_bottleneck():
     # just makes sure the forward function runs without crashing.
     dim = 256
     num_classes = 512
-    m = SamplingBottleneckModule(dim, num_classes)
+    num_discretization_levels = 128
+    m = SamplingBottleneckModule(dim, num_classes,
+                                 num_discretization_levels=num_discretization_levels)
     feats = torch.randn(30, 4, dim)
 
-    y, class_indexes, value_indexes = m(feats)
+    y, probs, class_indexes, value_indexes = m(feats)
 
-    print(f"Shapes of: y={y.shape}, class_indexes={class_indexes.shape}, value_indexes={value_indexes.shape}")
+    print(f"Shapes of: y={y.shape}, probs={probs.shape}, class_indexes={class_indexes.shape}, value_indexes={value_indexes.shape}")
+
+    assert value_indexes.min() == 0 and value_indexes.max() < num_discretization_levels
 
     print("y part = ", y[0])
 

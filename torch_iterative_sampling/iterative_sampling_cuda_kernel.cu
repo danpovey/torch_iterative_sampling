@@ -219,8 +219,26 @@ void iterative_sampling_kernel(
       int class_range_begin = cur_classes[i] + 1,
           class_range_end = cur_classes[i + 1];
 
-      assert(class_range_begin >= 0 && class_range_begin < class_range_end &&
-             class_range_end <= N);
+      if (!((class_range_begin >= 0 && class_range_begin < class_range_end &&
+             class_range_end <= N))) {
+        // It will be extremely rare to reach this point; it can happen due
+        // to roundoff issues.
+
+        // Will eventually delete this print statement.
+        printf("[warning:]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, class_range_begin=%d, class_range_end=%d, k=%d, i=%d, x=%g,r=%g,y=%g,r-x=%g,y-r=%g, (1-chosen_sum)-r=%g\n", blockIdx.x, threadIdx.x, threadIdx.y,
+               class_range_begin, class_range_end, k, i,
+               cur_cumsum[i], r, cur_cumsum[i+1], r-cur_cumsum[i], cur_cumsum[i+1]-r, (1-chosen_sum)-r);
+
+        // Find the first position i that has a nonempty set of possible classes.
+        for (i = 0; i <= k; i++) {
+          if (cur_classes[i] + 1 < cur_classes[i + 1]) {
+            r = 0.5 * (cur_cumsum[i] + cur_cumsum[i+1]);
+            class_range_begin = cur_classes[i] + 1;
+            class_range_end = cur_classes[i + 1];
+            break;
+          }
+        }
+      }
 
       // shift r by "adding back" the probability mass due to the subset
       // of previously chosen classes that were numbered less than
@@ -231,6 +249,7 @@ void iterative_sampling_kernel(
       r = r - cur_cumsum[i] + class_range_begin_cumsum;
       //assert(r >= 0 && r <= 1.0);
 
+      assert(class_range_begin < class_range_end && class_range_end <= N);
       int c = find_class(g, shared_int,
                          cumsum_buf,
                          class_range_begin,
@@ -379,8 +398,8 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
   dim3 blockDim(block_dim_x, block_dim_y, 1),
         gridDim(grid_dim_x, 1, 1);
 
-  fprintf(stderr,"block_dim_x: %d, block_dim_y: %d, grid_dim_x: %d\n", block_dim_x,
-          block_dim_y, grid_dim_x);
+  //fprintf(stderr,"block_dim_x: %d, block_dim_y: %d, grid_dim_x: %d\n", block_dim_x,
+  // block_dim_y, grid_dim_x);
   AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_cuda_stub", ([&] {
         // scalar_t is defined by the macro AT_DISPATCH_FLOATING_TYPES, should
         // equal scalar_type.
@@ -388,8 +407,8 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
                                    (K + 2) * S * sizeof(scalar_t) +
                                    (K + 2) * S * sizeof(int32_t) +
                                    S * sizeof(int32_t));
-        fprintf(stderr, "N = %d, K = %d, S = %d, extern_memory_bytes = %d\n", N, K, S, extern_memory_bytes);
-        extern_memory_bytes += 1024;
+        //        fprintf(stderr, "N = %d, K = %d, S = %d, extern_memory_bytes = %d\n", N, K, S, extern_memory_bytes);
+        // extern_memory_bytes += 1024;
 
         iterative_sampling_kernel<scalar_t><<<gridDim, blockDim, extern_memory_bytes>>>(
             cumsum.packed_accessor32<scalar_t, 2>(),
@@ -397,6 +416,6 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
             indexes.packed_accessor32<int64_t, 3>());
         cudaDeviceSynchronize();  // TEMP
         gpuErrchk(cudaGetLastError())
-      }));
+            }));
   return indexes;
 }
