@@ -795,7 +795,7 @@ class SamplingBottleneckModule(nn.Module):
 
         random_rate = 0.0 if not self.training else self.random_rate
 
-        y = parameterized_dropout(probs, mask, discrete_actual_values,
+        y = parameterized_dropout(marginals, mask, discrete_actual_values,
                                   random_rate=random_rate,
                                   epsilon=self.epsilon)
 
@@ -1075,6 +1075,7 @@ def _test_get_derivative_scales():
     epsilon_tensor = 0.1 + torch.rand(200, 300, 2)
     for epsilon in [0.0, 0.1, 1.0, 2.0, epsilon_tensor]:
         s1, s2 = get_derivative_scales(probs, epsilon)
+        assert torch.all(s1>=0) and torch.all(s2>=0)
         one = (s1 * probs) + (s2 * (1-probs))
         assert(torch.allclose(one, torch.ones_like(one)))
 

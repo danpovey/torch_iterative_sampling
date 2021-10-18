@@ -15,7 +15,7 @@ from typing import List
 
 
 def test_iterative_sampling_train():
-    for seq_len in 16, 8, 4, 2, 1:
+    for seq_len in 2, 8, 4, 1, 16:
         print(f"Running test_iterative_sampling_train: seq_len={seq_len}")
         device = torch.device('cuda')
         dim = 256
@@ -26,7 +26,7 @@ def test_iterative_sampling_train():
                                      seq_len=seq_len,
                                      num_discretization_levels=num_discretization_levels,
                                      random_rate=1.0,
-                                     epsilon=0.1).to('cuda')
+                                     epsilon=0.01).to('cuda')
 
         m_rest = nn.Sequential(nn.Linear(dim, hidden_dim),
                                nn.ReLU(hidden_dim),
@@ -163,6 +163,15 @@ def test_iterative_sampling_train():
             optim.zero_grad()
             if i % 1000 == 0:
                 scheduler.step()
+
+        feats = torch.randn(*feats_shape, device=device)
+        feats.requires_grad = True
+        output, _, _, _, class_entropy, frame_entropy = m(feats)
+        print("Average sumsq of output is ", (output ** 2).mean())
+
+        output_grad = torch.randn_like(output)
+        (output * output_grad).sum().backward()
+        print("Average sumsq of feats.grad elements is ", (feats.grad ** 2).mean())
 
 
 
