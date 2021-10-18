@@ -14,7 +14,7 @@ from typing import List
 
 
 def test_iterative_sampling_train():
-    for seq_len in 8, 4, 2, 1:
+    for seq_len in 16, 8, 4, 2, 1:
         print(f"Running test_iterative_sampling_train: seq_len={seq_len}")
         device = torch.device('cuda')
         dim = 256

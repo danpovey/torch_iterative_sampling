@@ -654,7 +654,7 @@ class SamplingBottleneckModule(nn.Module):
     def __init__(self, dim: int , num_classes: int,
                  seq_len: int = 8,
                  num_discretization_levels: int = 128,
-                 random_rate: float = 0.5,
+                 random_rate: float = 0.0,
                  epsilon: float = 0.1) -> None:
         """
     Create sampling bottleneck module.  This uses an iterative sampling algorithm to
@@ -710,7 +710,7 @@ class SamplingBottleneckModule(nn.Module):
     def _reset_parameters(self):
         nn.init.constant_(self.to_values_softmax.weight, 0.)
 
-    def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Forward function.
         Args:

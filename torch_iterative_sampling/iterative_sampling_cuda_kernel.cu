@@ -39,7 +39,7 @@ __forceinline__ __device__ int find_class(
     cooperative_groups::thread_group &g, int32_t *shared_int,
     scalar_t *cumsum, int begin, int end, scalar_t r) {
   assert(end > begin);
-  int orig_begin=begin, orig_end=end;
+  int orig_begin = begin, orig_end = end;  // debug
 
   g.sync();
   int i = g.thread_rank(),  // Actually will equal threadIdx.x.
@@ -69,8 +69,14 @@ __forceinline__ __device__ int find_class(
     // we are only syncing within a tile, so the fact that different tiles
     // may go different numbers of times around this loop does not matter.
     end = min(end, begin + block_size);
+
+    if (!(begin >= orig_begin && begin < end && end <= orig_end)) {
+      printf("[failure!]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
+             orig_begin, orig_end, begin,
+             (float)cumsum[begin], (float)r, (float)cumsum[begin + 1]);
+      assert(0);
+    }
   }
-  assert(begin >= orig_begin && begin < orig_end);
 #if 0
   if (blockIdx.x == 0 && threadIdx.y == 0) {
     printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, returning begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
@@ -90,10 +96,14 @@ __forceinline__ __device__ int find_class(
 
 template <typename scalar_t>
 __forceinline__ __device__ void wrap_if_outside_unit_interval(scalar_t *r) {
-  if (*r > 1.0 || *r < 0.0) {
+  if (!(*r >= 0.0 && *r <= 1.0)) {
     // should be very rare.
-    printf("iterative_sampling_cuda_kernel.cpp: warning: blockIdx.x=%d, threadIdx.{x,y}=%d,%d, wrapping %f\n",
-           blockIdx.x, threadIdx.x, threadIdx.y, (float)(*r));
+    if (threadIdx.x == 0) {
+      printf("iterative_sampling_cuda_kernel.cpp: warning: blockIdx.x=%d, threadIdx.{x,y}=%d,%d, wrapping %f\n",
+             blockIdx.x, threadIdx.x, threadIdx.y, (float)(*r));
+    }
+    if (*r - *r != 0)  // e.g. nan, due to division by zero.
+      *r = 0.5;
     // mathematically, r should still be in the range [0,1]; we wrap
     // around like this just in case of roundoff errors.
     if (*r < 0.0)
@@ -232,9 +242,11 @@ void iterative_sampling_kernel(
         // to roundoff issues.
 
         // Will eventually delete this print statement.
-        printf("[warning:]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, class_range_begin=%d, class_range_end=%d, k=%d, i=%d, x=%g,r=%g,y=%g,r-x=%g,y-r=%g, (1-chosen_sum)-r=%g\n", blockIdx.x, threadIdx.x, threadIdx.y,
-               class_range_begin, class_range_end, k, i,
-               cur_cumsum[i], r, cur_cumsum[i+1], r-cur_cumsum[i], cur_cumsum[i+1]-r, (1-chosen_sum)-r);
+        if (threadIdx.x == 0) {
+          printf("[warning:]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, class_range_begin=%d, class_range_end=%d, k=%d, i=%d, x=%g,r=%g,y=%g,r-x=%g,y-r=%g, (1-chosen_sum)-r=%g\n", blockIdx.x, threadIdx.x, threadIdx.y,
+                 class_range_begin, class_range_end, k, i,
+                 cur_cumsum[i], r, cur_cumsum[i+1], r-cur_cumsum[i], cur_cumsum[i+1]-r, (1-chosen_sum)-r);
+        }
 
         // Find the first position i that has a nonempty set of possible classes.
         for (i = 0; i <= k; i++) {
@@ -246,7 +258,7 @@ void iterative_sampling_kernel(
           }
         }
       }
-      assert(i >= 0 && i <= k); // temp.
+      assert(i >= 0 && i <= k);
       assert(class_range_begin >= 0 && class_range_begin < class_range_end &&
              class_range_end <= N);
 
@@ -302,6 +314,13 @@ void iterative_sampling_kernel(
 
           if (this_k <= k + 1) {
             c_temp = cur_classes[this_k];
+            if (!(c_temp >= -1 && c_temp <= N)) {
+              printf("[failure!]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, k=%d, i=%d,class_range_begin=%d,class_range_end=%d,this_k=%d,c_temp=%d, r=%f, iter=%d\n",
+                     blockIdx.x, threadIdx.x, threadIdx.y,
+                     k, i, class_range_begin, class_range_end,
+                     this_k, c_temp, (float)r, iter);
+              assert(0);
+            }
             cumsum_temp = cur_cumsum[this_k];
           }
           g.sync();
