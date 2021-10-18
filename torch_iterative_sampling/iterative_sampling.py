@@ -65,6 +65,21 @@ def _iterative_sample_dispatcher(
 
 
 
+def ensure_nonzero(probs: torch.Tensor) -> torch.Tensor:
+    """
+    Return a version of `probs` that lacks zeros and ones.
+    Args:
+      probs: a Tensor of probabilities of shape (*, N), where N is the number of classes
+    Return:
+      Returns a modified version of probs without exact zeros or ones.
+    """
+    N = probs.shape[-1]
+    assert probs.dtype in [torch.float32, torch.float64, torch.float16]
+    epsilon = (1.2e-07 if probs.dtype == torch.float32 else
+               (2.3e-16 if probs.dtype == torch.float64 else
+                9.8e-04)) # <-- assume float16, if supported.
+    return (probs * (1-N*epsilon)) + epsilon
+
 def iterative_sample(probs: torch.Tensor,
                      num_seqs: int,
                      seq_len: int,
@@ -76,6 +91,8 @@ def iterative_sample(probs: torch.Tensor,
           probs:  A tensor of probabilities of discrete classes, of shape (*, N)
                   where N is the number of classes.
                   Is expected to sum to one (over the N indexes), and be nonnegative.
+                  We advise to pass it through ensure_nonzero(probs) before
+                  this function.
        num_seqs:  The number of parallel sequences to sample; must be > 0.
        seq_len:   The length of the sequences of sample; must be strictly between
                   9 and N.
@@ -90,13 +107,8 @@ def iterative_sample(probs: torch.Tensor,
     rest_shape = probs.shape[:-1]
     probs = probs.reshape(-1, N)
 
-    assert probs.dtype in [torch.float32, torch.float64, torch.float16]
-    epsilon = (1.2e-07 if probs.dtype == torch.float32 else
-               (2.3e-16 if probs.dtype == torch.float64 else
-                9.8e-04)) # <-- assume float16, if supported.
-    probs = (probs * (1-N*epsilon)) + epsilon
-
     cumsum = exclusive_cumsum(probs, dim=-1)
+
     B = probs.shape[0]
     rand = torch.rand(B, num_seqs, dtype=probs.dtype, device=probs.device)
     indexes = _iterative_sample_dispatcher(cumsum, rand, seq_len)
@@ -675,6 +687,7 @@ class SamplingBottleneckModule(nn.Module):
         self.num_discretization_levels = num_discretization_levels
         self.random_rate = random_rate
         self.epsilon = epsilon
+        assert epsilon > 0
 
         self.input_scale = nn.Parameter(torch.tensor([3.0]))
 
@@ -761,6 +774,8 @@ class SamplingBottleneckModule(nn.Module):
         # since we want to bias towards transmitting the larger values.
         values = torch.softmax(values, dim=-1)
 
+        probs = ensure_nonzero(probs)
+
         # compute marginal probabilities of selecting any given class at any point
         # in the sequence of K distinct samples.
         marginals = compute_marginals(probs, self.seq_len)
@@ -798,7 +813,6 @@ class SamplingBottleneckModule(nn.Module):
         y = parameterized_dropout(marginals, mask, discrete_actual_values,
                                   random_rate=random_rate,
                                   epsilon=self.epsilon)
-
         y = self.to_output(y)
         y = self.layer_norm(y)
 
@@ -824,7 +838,7 @@ def compute_marginals(probs: Tensor, K: int) -> Tensor:
        elements will be in the interval [0,1].
     """
     alpha = compute_normalizer(probs, K)
-    return 1 - ((1 - probs) ** alpha.unsqueeze(-1))
+    return 1 - (1 - probs) ** alpha.unsqueeze(-1)
 
 class _ComputeNormalizer(torch.autograd.Function):
     @staticmethod

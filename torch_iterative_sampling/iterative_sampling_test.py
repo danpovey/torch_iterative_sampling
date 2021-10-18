@@ -145,11 +145,13 @@ def test_iterative_sampling_train():
             feats = torch.randn(*feats_shape, device=device)
 
             output, _, _, _, class_entropy, frame_entropy = m(feats)
+
             #output = m_rest(output)
 
             # try to reconstruct the feats, after this information bottleneck.
             loss = ((feats - output) ** 2).sum() / feats.numel()
-            if i % 500 == 0:
+
+            if i % 500 == 0 or loss.abs() > 3.0:
                 loss_val = loss.to('cpu').item()
                 print(f"seq_len={seq_len}, minibatch={i}, loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f}, ref_loss_shannon={ref_loss_shannon:.3f} "
                       f"class_entropy={class_entropy.to('cpu').item():.3f}, "
@@ -163,6 +165,7 @@ def test_iterative_sampling_train():
             optim.zero_grad()
             if i % 1000 == 0:
                 scheduler.step()
+
 
         feats = torch.randn(*feats_shape, device=device)
         feats.requires_grad = True

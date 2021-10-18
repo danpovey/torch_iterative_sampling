@@ -73,7 +73,8 @@ __forceinline__ __device__ int find_class(
     if (!(begin >= orig_begin && begin < end && end <= orig_end)) {
       printf("[failure!]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
              orig_begin, orig_end, begin,
-             (float)cumsum[begin], (float)r, (float)cumsum[begin + 1]);
+             (float)(begin >= orig_begin && begin < orig_end ? cumsum[begin] : -101), (float)r,
+             (float)(begin + 1 >= orig_begin && begin + 1 < orig_end ? cumsum[begin + 1] : -102));
       assert(0);
     }
   }
@@ -217,6 +218,8 @@ void iterative_sampling_kernel(
     scalar_t chosen_sum = 0.0,
         r = rand[b][s];
 
+    assert(r >= 0 && r <= 1);
+
     auto indexes_a = indexes[b][s];
 
     for (int k = 0; k < K; ++k) {
@@ -269,6 +272,12 @@ void iterative_sampling_kernel(
       scalar_t class_range_begin_cumsum = cumsum_buf[class_range_begin];
       scalar_t r_orig1 = r;
       r = r - cur_cumsum[i] + class_range_begin_cumsum;
+
+      if (r - r != 0) {
+        printf("[error:cumsum=nan?]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, class_range_begin=%d, class_range_end=%d, k=%d, i=%d, class_range_begin_cumsum=%g, cur_cumsum[i]=%g, r=%g\n", blockIdx.x, threadIdx.x, threadIdx.y,
+               class_range_begin, class_range_end, k, i, class_range_begin_cumsum, cur_cumsum[i], r);
+        assert(0);
+      }
 
       int c = find_class(g, shared_int,
                          cumsum_buf,
@@ -343,7 +352,7 @@ void iterative_sampling_kernel(
       // classes.  On the next iteration, we will search within this
       // reduced interval.
       r = r * (1.0 - chosen_sum);
-
+      wrap_if_outside_unit_interval(&r);
 #if 0
       if (blockIdx.x == 0 && threadIdx.y == 0) {
         printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, r=%f, r_orig1=%f, r_orig=%f, chosen_sum=%f, this_class_prob=%f, this_class_cumsum=%f, class_range_begin_cumsum=%f, k=%d, i=%d, c=%d, class_range_begin=%d, class_range_end=%d\n", blockIdx.x, threadIdx.x, threadIdx.y,
@@ -428,6 +437,7 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
   //fprintf(stderr,"block_dim_x: %d, block_dim_y: %d, grid_dim_x: %d\n", block_dim_x,
   // block_dim_y, grid_dim_x);
   AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_cuda_stub", ([&] {
+        gpuErrchk(cudaGetLastError()); // TEMP
         // scalar_t is defined by the macro AT_DISPATCH_FLOATING_TYPES, should
         // equal scalar_type.
         int extern_memory_bytes = ((N + 1) * sizeof(scalar_t) +
