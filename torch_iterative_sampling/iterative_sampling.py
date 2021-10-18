@@ -114,29 +114,35 @@ def exclusive_cumsum(x: Tensor, dim: int) -> Tensor:
 
 class PredictorInputParams(nn.Module):
     def __init__(self, num_classes: int, predictor_dim: int,
+                 num_discretization_levels: int,
                  seq_len: int) -> None:
         """
         This module stores some embedding parameters that are part of how we predict the
-        probabilities of the classes and weights.
+        probabilities of the classes and weights.  Its forward
 
         num_classes:  Number of classes in the discrete distribution that we are modeling,
                 e.g. 512 (think of this as a hidden dimension).  Referred to elsewhere as N.
         predictor_dim:  Dimension of the input to the predictor that predicts log-probs
                of classes and weights.  This predictor will be a sum of various inputs.
                E.g. 512.
+        num_discretization_levels: the number of discretization
+               levels from the SamplingBottleneckModule, dictates
+               range of `value_indexes`
         seq_len:  The length K of the random sequences of classes.
         """
+        super(PredictorInputParams, self).__init__()
 
         # Initialize various embeddings.
-        # self.embed is the embedding used for both the encoder and decoder.
 
-        # All embeddings have a scale, this is intended to make them learn fast enough.
+        # All embeddings will be returned after multiplying by this scale, this
+        # is intended to make them learn fast enough.  We divide by this scale
+        # when initializing.
         self.embed_scale = predictor_dim ** 0.5
-
+        self.num_discretization_levels = num_discretization_levels
 
         def Embedding(num_embeddings, embedding_dim):
             return nn.Embedding(
-                num_embeddings=num-embeddings, embedding_dim=embedding_dim,
+                num_embeddings=num_embeddings, embedding_dim=embedding_dim,
                 _weight=torch.randn(num_embeddings, embedding_dim) * (1 / self.embed_scale)
             )
 
@@ -152,31 +158,24 @@ class PredictorInputParams(nn.Module):
         self.class_query_embed = Embedding(num_classes, predictor_dim)
 
         # position_embed is the embedding by which we indicate our current position in the sequence (k=0,1,..,K-1).
+        # shape: (K, N)
         self.position_embed = nn.Parameter(torch.randn(seq_len, predictor_dim) * (1 / self.embed_scale))
 
-        # This will get multiplied by 'alpha' and added to the embeddings.
-        self.alpha_embed = nn.Parameter(torch.randn(predictor_dim) * (1 / self.embed_scale))
 
-        # This will get multiplied by the sum of previously emitted values (input versions,
-        # not scaled-up versions).
-        self.tot_values_embed = nn.Parameter(torch.randn(predictor_dim) * (1 / self.embed_scale))
-
-
-
-    def forward(self, values: Tensor, indexes: Tensor, alpha: Tensor,
+    def forward(self, class_indexes: Tensor, value_indexes: Tensor,
                 base_predictor: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Args:
-         values:  values is the same-named input to iterative_sample(), of shape
-                (*, N)
-         indexes:  The same-named output of iterative_sample(), a LongTensor of
-              shape (*, S, K); its elements are in [0..N-1]
-         alpha:  The same-named output of iterative_sample(), a Tensor of
-                 shape (*, S)
-         base_predictor:  A Tensor of shape (*, predictor_dim) that encodes a
-                prediction of the distribution, e.g. derived from previous
-                frames' embeddings.   Will be combined with other embeddings
-                owned in this class.
+           class_indexes: the same-named output from
+              SamplingBottleneckModule.forward(), a LongTensor of
+              shape (*, num_seqs, seq_len).
+           value_indexes: the same-named output from
+              SamplingBottleneckModule.forward(), a LongTensor of
+              shape (*, num_seqs, seq_len).
+           base_predictor:  A Tensor of shape (*, predictor_dim) that encodes a
+              prediction of the distribution, e.g. derived from previous
+              frames' embeddings.   Will be combined with other embeddings
+              owned in this class.
 
         Returns (class_predictor, weight_predictor), where:
 
@@ -187,31 +186,36 @@ class PredictorInputParams(nn.Module):
                as the input to a feedforward network that predicts the (discretized)
                weight for the class that we just saw.
         """
-        class_present_embedding = self.class_present_embed(indexes)  # (*, S, K, predictor_dim)
+        # N == predictor_dim
+        class_present_embedding = self.class_present_embed(class_indexes)  # (*, S, K, N)
+        # class_present_embedding_cumsum includes the current class.  This is OK when
+        # predicting the value, but for predicting the class itself we'l lhave to subtract the
+        # current class.
+        # class_present_embedding_cumsum shape: (*, S, K, predictor_dim)
         class_present_embedding_cumsum = torch.cumsum(class_present_embedding, dim=-2)
 
-        # class_value_embedding has shape (*, S, K, predictor_dim)
-        selected_values = self._get_selected_values(values, indexes)  # (*, S, K)
-        class_value_embedding = self.class_value_embed(indexes) * selected_values.unsqueeze(-1)
-        class_value_embedding = exclusive_cumsum(class_value_embedding, dim=-2)
+        selected_values = value_indexes * (1.0 / (self.num_discretization_levels - 1))  # (*, S, K)
+
+        # class_value_embedding will be of shape (*, S, K, N).  Caution: this could be on
+        # the large size if S*K is large, memory might be an issue.
+
+        print("shape1 = ", self.class_value_embed(class_indexes).shape)
+        print("shape2 = ", selected_values.unsqueeze(-1).shape)
+        print("value_indexes shape = ", value_indexes.shape)
+        print("class_indexes shape = ", class_indexes.shape)
+        class_value_embedding = self.class_value_embed(class_indexes) * selected_values.unsqueeze(-1)
+        # So do exclusive-cumsum so that for each point k in the sequence, the model
+        # is aware of the values of all previously emitted classes and their values (but not the
+        # current value, which is not known yet).
+        class_value_embedding_cumsum = exclusive_cumsum(class_value_embedding, dim=-2)
+
+        # class_query_embedding has shape (*, S, K, N)
+        class_query_embedding = self.class_query_embed(class_indexes)
 
 
-        # class_query_embedding has shape (*, S, K, predictor_dim)
-        class_query_embedding = self.class_query_embed(index)
-
-        # alpha_embedding has shape (*, S, 1, predictor_dim)
-        alpha_embedding = self.alpha_embed * alpha.unsqueeze(-2)
-
-        # tot_values_embedding has shape (*, S, K, predictor_dim)
-        tot_values_embedding = exclusive_cumsum(selected_values, dim=-2).unsqueeze(-1) * self.tot_values_embed
-
-
-        common_embedding = (class_value_embedding +
+        common_embedding = (class_value_embedding_cumsum +
                             class_present_embedding_cumsum +
-                            self.position_embed +
-                            alpha_embedding +
-                            tot_values_embedding)
-
+                            self.position_embed)
 
         # reshape base_predictor to (*, 1, 1, predictor_dim)
         base_predictor = base_predictor.unsqueeze(-2).unsqueeze(-2)
@@ -221,38 +225,14 @@ class PredictorInputParams(nn.Module):
         # cheating).
         class_predictor = base_predictor + self.embed_scale * (common_embedding - class_present_embedding)
 
-        # We don't need to subtract the current class any more because by the time we predict the
-        # weight, the class is known.  However we do need to add class_query_embedding, because
-        # otherwise it wouldn't be able to tell which class was the one whose weight was being queried.
+        # For predicting the weight, we don't need to subtract the current class
+        # any more because by the time we predict the weight, the class is
+        # known.  However we do need to add class_query_embedding, because
+        # otherwise the model wouldn't easily be able to tell which class was
+        # the one whose weight was being queried.
         weight_predictor = base_predictor + self.embed_scale * (common_embedding + class_query_embedding)
 
         return (class_predictor, weight_predictor)
-
-
-    def _get_selected_values(values: Tensor, indexes: Tensor) -> Tensor:
-        """
-        Return the elements of `values` that are indicated by the `indexes`
-        tensor.  Args:
-         values:  values is the same-named input to iterative_sample(), of shape
-                (*, N)
-         indexes:  The same-named output of iterative_sample(), a LongTensor of
-              shape (*, S, K); its elements are in [0..N-1]
-        Returns selected_values, which is a Tensor of shape (*, S, K) containing
-              the elements of `values` indicated by `indexes`.
-        """
-        # Reshape indexes to (*, S * K)
-        indexes_shape = list(indexes.shape)
-        S = indexes_shape[-2]
-        K = indexes_shape[-1]
-        indexes_shape[-2] = S * K
-        indexes_shape = indexes_shape[:-1]
-        indexes_reshaped = indexes.reshape(indexes_shape)
-
-        # use torch.gather to get elements from `values`, of shape (*, S * K)
-        selected_values = torch.gather(values, indexes_reshaped, dim=-1)
-        # reshape to (*, S, K)
-        selected_values = selected_values.reshape(indexes.shape)
-        return selected_values
 
 
 
@@ -718,6 +698,7 @@ class SamplingBottleneckModule(nn.Module):
                equal to `dim` arg to constructor.
          num_seqs:  The number of parallel sequences (S).  Should probably be 1 unless
                you are planning to model these probabilities
+
         Returns (y, probs, class_indexes, value_indexes, class_entropy, frame_entropy), where:
 
            y: a Tensor of shape (*, F), like x, where F is the `dim` arg to this class's
@@ -751,12 +732,9 @@ class SamplingBottleneckModule(nn.Module):
                small (this might help optimization).
 
         """
-        # logprobs has shape (*, C); it is the input to the softmax that determines the
+        # logprobs has shape (*, N); it is the input to the softmax that determines the
         # probabilities of sampling different classes on each iteration of sampling.
         # (Not the same as the marginal probabilities).
-
-
-
         x = x * self.input_scale
         probs = self.to_both_softmax(x)
         values = probs + self.to_values_softmax(x)
@@ -771,7 +749,7 @@ class SamplingBottleneckModule(nn.Module):
             frame_perplexity = frame_entropy.exp().to('cpu').item()
             print(f"Class perplexity={class_perplexity}, frame perplexity={frame_perplexity}, vs. max possible {avg_probs.numel()}")
 
-        # values also has shape (*, C); it is expected to be similar to `probs`,
+        # values also has shape (*, N); it is expected to be similar to `probs`,
         # since we want to bias towards transmitting the larger values.
         values = torch.softmax(values, dim=-1)
 
@@ -783,8 +761,20 @@ class SamplingBottleneckModule(nn.Module):
         class_indexes = iterative_sample(probs, num_seqs=num_seqs,
                                          seq_len=self.seq_len)
 
-        discrete_values, value_indexes = discretize_values(values,
+
+        # values_expanded is values expanded from (*, N) to (*, S, N)
+        N = probs.shape[-1]
+        values_expanded = values.unsqueeze(-2).expand(*probs.shape[:-1], num_seqs, N)
+        chosen_values = torch.gather(values_expanded, dim=-1, index=class_indexes)
+
+        # discrete_values and value_indexes have shape (*, S, K)
+        discrete_values, value_indexes = discretize_values(chosen_values,
                                                            self.num_discretization_levels)
+
+        # discrete_actual_values has shape (*, N), it is just the input `values`
+        # discretized.
+        discrete_actual_values, _ = discretize_values(values,
+                                                      self.num_discretization_levels)
 
         if not self.training:
             # in eval mode, don't use the discretized values.
@@ -797,7 +787,7 @@ class SamplingBottleneckModule(nn.Module):
 
         random_rate = 0.0 if not self.training else self.random_rate
 
-        y = parameterized_dropout(probs, mask, discrete_values,
+        y = parameterized_dropout(probs, mask, discrete_actual_values,
                                   random_rate=random_rate,
                                   epsilon=self.epsilon)
 
@@ -1003,13 +993,27 @@ def _test_sampling_bottleneck():
     dim = 256
     num_classes = 512
     num_discretization_levels = 128
+    seq_len = 8
     m = SamplingBottleneckModule(dim, num_classes,
-                                 num_discretization_levels=num_discretization_levels)
+                                 num_discretization_levels=num_discretization_levels,
+                                 seq_len=seq_len)
+
+    predictor_dim = 128
+
+    p = PredictorInputParams(num_classes, predictor_dim,
+                             num_discretization_levels=num_discretization_levels,
+                             seq_len=seq_len)
+
     feats = torch.randn(30, 4, dim)
 
     y, probs, class_indexes, value_indexes, class_entropy, frame_entropy = m(feats)
 
     print(f"Shapes of: y={y.shape}, probs={probs.shape}, class_indexes={class_indexes.shape}, value_indexes={value_indexes.shape}")
+
+    base_predictor = torch.randn(30, 4, predictor_dim)
+    (class_predictor, weight_predictor) = p(class_indexes, value_indexes, base_predictor)
+    print(f"class_predictor shape={class_predictor.shape}, weight_predictor shape={weight_predictor.shape}")
+    print(f"class_predictor variance={(class_predictor**2).mean()} weight_predictor variance={(weight_predictor**2).mean()}")
 
     assert value_indexes.min() == 0 and value_indexes.max() < num_discretization_levels
 
@@ -1150,10 +1154,10 @@ def _test_parameterized_dropout():
                 _compare_seen_expected_products(values.grad, expected_values_grad, "values_grad", "expected_values_grad")
 
 if __name__ == '__main__':
+    _test_sampling_bottleneck()
     _test_parameterized_dropout()
     _test_get_derivative_scales()
     _test_iterative_sample()
-    _test_sampling_bottleneck()
     _test_discretize_values()
     _test_compute_marginals()
     _test_normalizer()
