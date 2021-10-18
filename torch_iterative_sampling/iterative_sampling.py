@@ -432,7 +432,15 @@ class _ParameterizedDropout(torch.autograd.Function):
         # `actual_mask` is what we multiplied the values by in the forward pass.
         actual_mask = (frame_mask * mask + torch.logical_not(frame_mask) * probs)
 
-        values_grad = ans_grad * actual_mask
+        mask_weight = values / (values + epsilon)   # <-- close to 1 if an element of values >> epsilon
+        probs_weight = 1 - mask_weight   # <-- close to 1 if an element of values << epsilon
+
+        # The formula is an attempt to reduce the variance of the derivatives.  The assumption
+        # is that if a 'value' is small, then the derivative of the output w.r.t. the
+        # (value * mask) will be about the same whether the mask is 0 or 1, so we can just use
+        # the element of 'probs', treating it as an expectation.
+        # whereas if value >> epsilon, we should use the actual mask, for accuracy.
+        values_grad = ans_grad * (mask_weight * actual_mask  + probs_weight * probs)
 
         # See get_derivative_scales() to understand the function of
         # epsilon_tensor, it's the epsilon arg to that function.
@@ -1149,9 +1157,8 @@ def _test_parameterized_dropout():
                 # if the failures bother you.
                 _compare_seen_expected_products(probs.grad, expected_probs_grad, "probs_grad", "expected_probs_grad",
                                                 threshold=threshold)
-                # Actually the expected-grad expression w.r.t. 'values' is valid regardless of these approximations,
-                # so no need to increase threshold here.
-                _compare_seen_expected_products(values.grad, expected_values_grad, "values_grad", "expected_values_grad")
+                _compare_seen_expected_products(values.grad, expected_values_grad, "values_grad", "expected_values_grad",
+                                                threshold=threshold)
 
 if __name__ == '__main__':
     _test_sampling_bottleneck()

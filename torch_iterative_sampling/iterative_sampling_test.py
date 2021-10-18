@@ -7,6 +7,7 @@ from typing import List
 
 
 # below is a small part of the output of this program:
+# seq_len=16, minibatch=19500, loss=0.818 vs. ref_loss=0.482, ref_loss_shannon=0.583 class_entropy=6.237, frame_entropy=4.605
 # seq_len=8, minibatch=19500, loss=0.878 vs. ref_loss=0.713, ref_loss_shannon=0.736 class_entropy=6.235, frame_entropy=3.903
 # seq_len=4, minibatch=19500, loss=0.918 vs. ref_loss=0.848, ref_loss_shannon=0.844 class_entropy=6.232, frame_entropy=3.162
 # seq_len=2, minibatch=19500, loss=0.948 vs. ref_loss=0.924, ref_loss_shannon=0.912 class_entropy=6.227, frame_entropy=2.371l
