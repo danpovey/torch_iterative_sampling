@@ -292,7 +292,6 @@ class BottleneckPredictor(nn.Module):
                 layers.append(nn.ReLU(inplace=True))
                 cur_dim = hidden_dim
             layers.append(nn.Linear(cur_dim, output_dim))
-            layers.append(nn.LogSoftmax(dim=-1))
             return nn.Sequential(*layers)
 
         self.class_predictor_module = create_predictor(num_classes)
@@ -318,11 +317,13 @@ class BottleneckPredictor(nn.Module):
               frames' embeddings via some kind of sequential model.
         Returns (class_logprobs, value_logprobs), where:
             class_logprobs: a Tensor of shape (*) [matching the inputs];
-              this gives the logprob of the class indexes, summed over
+              this gives the UNNORMALIZED logprob of the class indexes,
+              summed over
               the sequence (seq_len) and averaged over the parallel
               sequences (num_seqs).
             value_logprobs: a Tensor of shape (*) [matching the inputs];
-              this gives the logprob of the discretized weights, summed over
+              this gives the UNNORMALIZED logprob of the discretized weights,
+              summed over
               the sequence (seq_len) and averaged over the parallel
               sequences (num_seqs).
         """
@@ -333,16 +334,23 @@ class BottleneckPredictor(nn.Module):
                                                               base_predictor)
         # class_prediction: (*, num_seqs, seq_len, num_classses)
         # value_prediction: (*, num_seqs, seq_len, num_discretization_levels)
-        # both of these include a nn.LogSoftmax at the end (->normalized)
+        # both of these are unnormalized logprobs.
         class_prediction = self.class_predictor_module(class_predictor)
         value_prediction = self.value_predictor_module(class_predictor)
+        class_prediction = self.mask_prev_classes(class_prediction,
+                                                  class_indexes)
+
+        class_prediction = class_prediction.softmax(dim=-1)
+        value_prediction = value_prediction.softmax(dim=-1)
+
 
         # class_all_logprobs and value_all_logprobs are of shape
         # (*, num_seqs, seq_len)
         class_all_logprobs = torch.gather(class_prediction, dim=-1,
-                                      index=class_indexes.unsqueeze(-1)).squeeze(-1)
+                                          index=class_indexes.unsqueeze(-1)).squeeze(-1)
         value_all_logprobs = torch.gather(value_prediction, dim=-1,
-                                      index=value_indexes.unsqueeze(-1)).squeeze(-1)
+                                          index=value_indexes.unsqueeze(-1)).squeeze(-1)
+
         num_seqs = class_indexes.shape[-2]
 
         # class_tot_logprobs and value_tot_logprobs are of shape (*).
@@ -350,6 +358,31 @@ class BottleneckPredictor(nn.Module):
         value_logprobs = torch.sum(value_all_logprobs, dim=(-2,-1)) * (1 / num_seqs)
 
         return class_logprobs, value_logprobs
+
+
+
+    def mask_prev_classes(self, class_logprobs: Tensor, class_indexes: Tensor) -> Tensor:
+        """
+        Replaces the logprobs in `class_logprobs` that correspond to classes
+        that were previously seen in a sequence (and are therefore now disallowed),
+        with -infinity.  This means that we don't have to waste modeling power
+        learning the fact that classes cannot be seen more than once.
+
+          Args:
+             class_logprobs: a Tensor of shape (*, seq_len, num_seqs, num_classes),
+                   containing un-normalized logprobs of the classes.
+                   WARNING: used destructively (actually operates in-place)
+               class_indexes: a LongTensor of shape (*, seq_len, num_seqs), containing
+                   class indexes in {0..num_classes-1}.
+        Returns:
+            Returns a modified version of class_logprobs with elements corresponding
+            to previously seen classes in the sequence replaced with -infinity.
+        """
+        counts = torch.zeros_like(class_logprobs, dtype=torch.int16)
+        counts.scatter_(-1, class_indexes.unsqueeze(-1), 1)
+        mask = (exclusive_cumsum(counts, dim=-1) != 0)
+        class_logprobs.masked_fill_(mask, float("-infinity"))
+        return class_logprobs
 
 
 class _ParameterizedDropout(torch.autograd.Function):
