@@ -174,7 +174,8 @@ class PredictorInputParams(nn.Module):
         self.position_embed = nn.Parameter(torch.randn(seq_len, predictor_dim) * (1 / self.embed_scale))
 
 
-    def forward(self, class_indexes: Tensor, value_indexes: Tensor,
+    def forward(self, class_indexes: Tensor,
+                value_indexes: Tensor,
                 base_predictor: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -247,169 +248,108 @@ class PredictorInputParams(nn.Module):
         return (class_predictor, weight_predictor)
 
 
-
-class _ClassesTotalLogprob(torch.autograd.Function):
-    # see get_classes_total_logprob for more info on the interface
-    @staticmethod
-    def forward(ctx,
-                class_prediction: Tensor,
-                probs: Tensor,
-                scales: Tensor,
-                indexes: Tensor) -> Tensor:
+class BottleneckPredictor(nn.Module):
+    def __init__(self, num_classes: int,
+                 predictor_dim: int,
+                 num_discretization_levels: int,
+                 seq_len: int,
+                 hidden_dim: int,
+                 num_hidden_layers: int) -> None:
         """
-        Quick recap of sizes:
-          class_prediction: un-normalized logprobs of shape (*, S, K, N)
-          probs: (normalized) probabilities of shape (*, N)
-          scales: a tensor of shape (*, S, K) containing, at each point in the
-                sequence (k=0,1..), 1.0 / (1 - sum of the probs of previously
-                selected classes).  Values are >= 1.0.  Used to renormalize probs
-                after masking.
-          indexes: a LongTensor of shape (*, S, K) containing values in [0..N-1]
-                which are distinct along the K axis.
-        """
-        # Caution: we expect that class_prediction is the only input which
-        # would have requires_grad == True.
-        assert not probs.requires_grad and not scales.requires_grad
-        ctx.save_for_backward(class_prediction.detach(), probs,
-                              scales, indexes)
+        This module is used to predict the discrete symbols (classes and weights)
+        of the discrete bottleneck
+        in the SamplingBottleneckModule.  It handles only the prediction within
+        individual frames; any cross-frame aspect of the prediction (i.e. taking
+        care of the larger sequence across time) will be handled outside this module,
+        likely by something like a transformer.  The forward function of this module
+        accepts a predictor that would be the output that that transformer (or other
+        sequential model).
 
-        with torch.no_grad():
-            ans = _compute(class_prediction, probs, scales, indexes)
-            return ans
-
-    @staticmethod
-    def backward(ctx: Tensor, ans_grad: Tensor) -> Tuple[Tensor, None, None, None]:
-        """
-        Backward method which only returns a derivative for class_probs; obtaining
-        derivatives w.r.t. the other elements is rather nontrivial as we have to consider
-        the larger context, not just this one operation.
-        """
-        (class_prediction, probs, scales, indexes) = ctx.saved_tensors
-
-        class_prediction.requires_grad = True
-        ans_temp = _compute(class_prediction, probs, scales, indexes)
-        (ans_temp * ans_grad.detach()).sum().backward()
-        return class_prediction.grad, None, None, None
-
-    @staticmethod
-    def _compute(class_prediction: Tensor,
-                 probs: Tensor,
-                 scales: Tensor,
-                 indexes: Tensor) -> Tensor:
-        N = class_prediction.shape[-1]
-        # mask is of shape (*, S, K, N), with True in masked
-        # positions
-        mask = _get_mask(indexes, N)
-
-        S = class_prediction.shape[-3]
-        K = class_prediction.shape[-2]
-        N = class_prediction.shape[-1]
-        rest_shape = list(class_prediction.shape)[:-3]
-
-        # clone may not be necessary.
-        class_prediction = class_prediction.clone()
-        class_prediction.masked_fill_(mask, float('-infinity'))
-        class_logprobs = torch.log_softmax(class_prediction, dim=-1)
-
-        # make scales of shape (*, S, K, 1)
-        scales = scales.unsqueeze(-1)
-
-        # logically the masking and the scale should be on the probs, not the
-        # logprobs, but doing it this way is likely more memory efficient, since
-        # the logprobs already have more dimensions; and the result is the same
-        scaled_logprobs = (class_logprobs * scales)
-        scaled_logprobs.masked_fill_(mask, float('0'))
-
-        # make probs of shape (*, 1, 1, N)
-        probs = probs.unsqueeze(-2).unsqueeze(-2)
-        # divide by the number of sequences S because we want to average over
-        # the alternative sequences (different samples)
-        return torch.dot(scaled_logprobs.reshape(-1), probs.reshape(-1)) / S
-
-
-
-    @staticmethod
-    def _get_mask(indexes: Tensor, N: int) -> Tensor:
-        """
         Args:
-         indexes: a LongTensor with shape (*, S, K) containing class indexes in the range [0..N-1]
-               N: the number of classes
-         Returns: a Tensor with shape (*, S, K, N) and dtype=torch.bool containing True for masked
-               positions (where there is a previous class) and False for un-masked positions).
+            num_classes:  The number of classes used in the SamplingBottleneckModule,
+                          e.g. 512.
+            num_discretization_levesl:  The number of discretization levesl in
+                          the SamplingBottleneckModule, e.g. 256.
+            seq_len:      The seq_len given to the SamplingBottleneckModule, which
+                          is the number of symbols to sample from the distribution
+                          each time; e.g. 8 or 16.
+            hidden_dim:   The hidden dimension to use in the two feedforward networks owned
+                          by this class, e.g. 512 or 1024.
+            num_hidden_layers:  The number of hidden layers with ReLU activations to
+                          use in the two feedforward networks owned
+                          by this class, e.g. 1 or 2.
         """
-        rest_shape = list(indexes.shape)[:-2]
-        S = indexes.shape[-2]
-        K = indexes.shape[-1]
-        ans = torch.zeros(*rest_shape, S, K, N, dtype=torch.bool)
-        ans.scatter_(-1, indexes.unsqueeze(-1), True)
-        mask = (torch.cumsum(ans, dim=-2, dtype=torch.int8) - ans.to(dtype=torch.int8)).to(dtype=torch.bool)
+        super(BottleneckPredictor, self).__init__()
+        self.input_params = PredictorInputParams(num_classes, predictor_dim,
+                                                 num_discretization_levels, seq_len)
+        def create_predictor(output_dim):
+            layers = []
+            cur_dim = predictor_dim
+            for i in range(num_hidden_layers):
+                if i != 0:
+                    layers.append(nn.LayerNorm(cur_dim))
+                layers.append(nn.Linear(cur_dim, hidden_dim))
+                layers.append(nn.ReLU(inplace=True))
+                cur_dim = hidden_dim
+            layers.append(nn.Linear(cur_dim, output_dim))
+            layers.append(nn.LogSoftmax(dim=-1))
+            return nn.Sequential(*layers)
 
+        self.class_predictor_module = create_predictor(num_classes)
+        self.value_predictor_module = create_predictor(num_discretization_levels)
 
+    def forward(self,
+                class_indexes: Tensor,
+                value_indexes: Tensor,
+                base_predictor: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Computes the predicted total log-probs of the classes and values selected
+        by the SamplingBottleneckModule.
 
-def get_classes_total_logprob(class_prediction: Tensor,
-                              probs: Tensor,
-                              scales: Tensor,
-                              indexes: Tensor) -> Tensor:
-    """
-    Get the total logprob for prediction of the classes.  We try to do this in a
-    memory efficient way.  Note: it would be possible to just use:
-      get_weights_total_logprob(class_prediction, indexies)
-    but what this function implements is an expectation of the logprob of the class,
-    over the possible choices of class at each point in the randomly chosen sequence.
-    This will give a derivative with a lower variance than using the classes we actually
-    chose at each point.
+        Args:
+           class_indexes: the same-named output from
+              SamplingBottleneckModule.forward(), a LongTensor of
+              shape (*, num_seqs, seq_len).
+           value_indexes: the same-named output from
+              SamplingBottleneckModule.forward(), a LongTensor of
+              shape (*, num_seqs, seq_len).
+           base_predictor:  A Tensor of shape (*, predictor_dim) that encodes a
+              prediction of the distribution, e.g. derived from previous
+              frames' embeddings via some kind of sequential model.
+        Returns (class_logprobs, value_logprobs), where:
+            class_logprobs: a Tensor of shape (*) [matching the inputs];
+              this gives the logprob of the class indexes, summed over
+              the sequence (seq_len) and averaged over the parallel
+              sequences (num_seqs).
+            value_logprobs: a Tensor of shape (*) [matching the inputs];
+              this gives the logprob of the discretized weights, summed over
+              the sequence (seq_len) and averaged over the parallel
+              sequences (num_seqs).
+        """
+        # class_predictor: (*, num_seqs, seq_len, predictor_dim)
+        # value_predictor: (*, num_seqs, seq_len, predictor_dim)
+        class_predictor, value_predictor = self.input_params(class_indexes,
+                                                              value_indexes,
+                                                              base_predictor)
+        # class_prediction: (*, num_seqs, seq_len, num_classses)
+        # value_prediction: (*, num_seqs, seq_len, num_discretization_levels)
+        # both of these include a nn.LogSoftmax at the end (->normalized)
+        class_prediction = self.class_predictor_module(class_predictor)
+        value_prediction = self.value_predictor_module(class_predictor)
 
-      Args:
-        class_prediction: A Tensor of un-normalized logprobs of shape (*, S, K, N) i.e.
-             (*, num_seqs, seq_len, num_classes).
-         probs:  A Tensor containing the class probabilities (used for sampling),
-              of shape (*, N) where N is the number of classes.  These are the
-              same at each point in the sequence, except that we have to exclude previously
-              sampled classes and renormalize.
-        scales:  A Tensor of shape (*, S, K) containing the scale that we'll have to
-              scale up `probs` to make it sum to 1 after excluding previously chosen
-              classes
-       indexes: A LongTensor of shape (*, S, K) containing selected class indexes in
-              the range [0..N-1].  Because we compute the total logprob via an
-              expectation and not according to the actually selected class indexes,
-              these indexes are only used to define which prior classes to
-              exclude when normalizing `class_prediction`, and zeroing elements of
-              `probs`.
+        # class_all_logprobs and value_all_logprobs are of shape
+        # (*, num_seqs, seq_len)
+        class_all_logprobs = torch.gather(class_prediction, dim=-1,
+                                      index=class_indexes.unsqueeze(-1)).squeeze(-1)
+        value_all_logprobs = torch.gather(value_prediction, dim=-1,
+                                      index=value_indexes.unsqueeze(-1)).squeeze(-1)
+        num_seqs = class_indexes.shape[-2]
 
-    Returns: a scalar Tensor containing the logprob averaged over the S axis and
-             summed over other dimensions.  This can be interpreted as the logprob
-             of samples, but modified to use expectations instead of single
-             samples wherever it is practical to do so, to minimize variance.
-    """
-    return _ClassesTotalLogprob.apply(class_prediction, probs,
-                                      scales, indexes)
+        # class_tot_logprobs and value_tot_logprobs are of shape (*).
+        class_logprobs = torch.sum(class_all_logprobs, dim=(-2,-1)) * (1 / num_seqs)
+        value_logprobs = torch.sum(value_all_logprobs, dim=(-2,-1)) * (1 / num_seqs)
 
-
-def get_weights_total_logprob(weight_prediction: Tensor,
-                              samp_values: Tensor) -> Tensor:
-    """
-    Args:  weight_prediction: a Tensor of un-normalized logprobs of shape (*, S, K, M), i.e.
-              (*, num_seqs, seq_len, num_discretization_levels)
-           samp_values:  The discretized weights at the output of iterative_sample(), which
-               is a LongTensor of shape (*, S, K) containing integers in [0..M-1].
-
-    Returns:  a scalar Tensor containing the logprob averaged over the S axis and
-           sumed over other dimensions.
-    """
-    samp_values = samp_values.unsqueeze(-1) #  (*, S, K, 1)
-
-    # Note: we could replace this operation with an expectation, adding more args to this
-    # function; and this would slightly reduce the variance of the derivatives, but since
-    # we always assign nonzero probability to at most two of the discrete weight values,
-    # the difference wouldn't really be significant.
-
-    # chosen_values is of shape (*, S, K, 1).
-    chosen_values = torch.gather(weight_prediction, dim=-1, index=samp_values)
-
-    S = weight_prediction.shape[-3]
-
-    return chosen_values.sum() / S
-
+        return class_logprobs, value_logprobs
 
 
 class _ParameterizedDropout(torch.autograd.Function):
@@ -1026,6 +966,12 @@ def _test_sampling_bottleneck():
                              num_discretization_levels=num_discretization_levels,
                              seq_len=seq_len)
 
+    hidden_dim = 256
+    num_hidden_layers = 2
+    b = BottleneckPredictor(num_classes, predictor_dim,
+                            num_discretization_levels, seq_len, hidden_dim,
+                            num_hidden_layers)
+
     feats = torch.randn(30, 4, dim)
 
     y, probs, class_indexes, value_indexes, class_entropy, frame_entropy = m(feats)
@@ -1040,6 +986,10 @@ def _test_sampling_bottleneck():
     assert value_indexes.min() == 0 and value_indexes.max() < num_discretization_levels
 
     print("y part = ", y[0])
+
+    (class_logprobs, value_logprobs) = b(class_indexes, value_indexes, base_predictor)
+    assert class_logprobs.shape == (30, 4)
+    assert value_logprobs.shape == (30, 4)
 
 
 def _compare_seen_expected_products(a: Tensor, b: Tensor, a_name: str = "seen", b_name: str = "expected",
