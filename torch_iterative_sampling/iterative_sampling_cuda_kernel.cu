@@ -245,19 +245,29 @@ void iterative_sampling_kernel(
         // to roundoff issues.
 
         // Will eventually delete this print statement.
-        if (threadIdx.x == 0) {
+        // The 'blockidx.x % 10 == 0' part is to reduce the frequency of this message.
+        if (threadIdx.x == 0 && blockIdx.x % 10 == 0) {
           printf("[warning:]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, class_range_begin=%d, class_range_end=%d, k=%d, i=%d, x=%g,r=%g,y=%g,r-x=%g,y-r=%g, (1-chosen_sum)-r=%g\n", blockIdx.x, threadIdx.x, threadIdx.y,
                  class_range_begin, class_range_end, k, i,
                  cur_cumsum[i], r, cur_cumsum[i+1], r-cur_cumsum[i], cur_cumsum[i+1]-r, (1-chosen_sum)-r);
         }
 
         // Find the first position i that has a nonempty set of possible classes.
-        for (i = 0; i <= k; i++) {
-          if (cur_classes[i] + 1 < cur_classes[i + 1]) {
-            r = 0.5 * (cur_cumsum[i] + cur_cumsum[i+1]);
-            class_range_begin = cur_classes[i] + 1;
-            class_range_end = cur_classes[i + 1];
-            break;
+        for (int j = 0; j < k; j++) {
+          // in this loop, new_i will cover all values of i other than the one
+          // chosen above (which we know does not work), in a circle starting
+          // from (i + 1) % (k + 1).  We select the first nonempty interval
+          // after the empty interval we just chose.
+          int new_i = (i + 1 + j) % (k + 1);
+          class_range_begin = cur_classes[new_i] + 1;
+          class_range_end = cur_classes[new_i + 1];
+          if (class_range_begin < class_range_end) {
+            i = new_i;
+            // reset r using the original value of r, scaled and shifted to the
+            // interval from cur_cumsum[i] to cur_cumsum[i + 1].
+            scalar_t orig_r = rand[b][s];
+            r = cur_cumsum[i] + orig_r * (cur_cumsum[i + 1] - cur_cumsum[i]);
+            break;  // Sets i to 'new_i'
           }
         }
       }

@@ -190,19 +190,19 @@ class PredictorInputParams(nn.Module):
               frames' embeddings.   Will be combined with other embeddings
               owned in this class.
 
-        Returns (class_predictor, weight_predictor), where:
+        Returns (class_predictor, value_predictor), where:
 
            class_predictor: of shape (*, S, predictor_dim), this is to be used
                as the input to a feedforward network that predicts the next
                class in the sequence.
-           weight_predictor: of shape (*, S, predictor_dim), this is to be used
+           value_predictor: of shape (*, S, predictor_dim), this is to be used
                as the input to a feedforward network that predicts the (discretized)
                weight for the class that we just saw.
         """
         # N == predictor_dim
         class_present_embedding = self.class_present_embed(class_indexes)  # (*, S, K, N)
         # class_present_embedding_cumsum includes the current class.  This is OK when
-        # predicting the value, but for predicting the class itself we'l lhave to subtract the
+        # predicting the value, but for predicting the class itself we'll have to subtract the
         # current class.
         # class_present_embedding_cumsum shape: (*, S, K, predictor_dim)
         class_present_embedding_cumsum = torch.cumsum(class_present_embedding, dim=-2)
@@ -212,10 +212,6 @@ class PredictorInputParams(nn.Module):
         # class_value_embedding will be of shape (*, S, K, N).  Caution: this could be on
         # the large size if S*K is large, memory might be an issue.
 
-        print("shape1 = ", self.class_value_embed(class_indexes).shape)
-        print("shape2 = ", selected_values.unsqueeze(-1).shape)
-        print("value_indexes shape = ", value_indexes.shape)
-        print("class_indexes shape = ", class_indexes.shape)
         class_value_embedding = self.class_value_embed(class_indexes) * selected_values.unsqueeze(-1)
         # So do exclusive-cumsum so that for each point k in the sequence, the model
         # is aware of the values of all previously emitted classes and their values (but not the
@@ -235,7 +231,7 @@ class PredictorInputParams(nn.Module):
 
         # we have to subtract class_present_embedding in order to exclude the
         # current class from class_present_embedding_cumsum (otherwise it's
-        # cheating).
+        # cheating, as the thing we're predicting would be known).
         class_predictor = base_predictor + self.embed_scale * (common_embedding - class_present_embedding)
 
         # For predicting the weight, we don't need to subtract the current class
@@ -243,10 +239,9 @@ class PredictorInputParams(nn.Module):
         # known.  However we do need to add class_query_embedding, because
         # otherwise the model wouldn't easily be able to tell which class was
         # the one whose weight was being queried.
-        weight_predictor = base_predictor + self.embed_scale * (common_embedding + class_query_embedding)
+        value_predictor = base_predictor + self.embed_scale * (common_embedding + class_query_embedding)
 
-        return (class_predictor, weight_predictor)
-
+        return class_predictor, value_predictor
 
 class BottleneckPredictor(nn.Module):
     def __init__(self, num_classes: int,
@@ -330,19 +325,19 @@ class BottleneckPredictor(nn.Module):
         # class_predictor: (*, num_seqs, seq_len, predictor_dim)
         # value_predictor: (*, num_seqs, seq_len, predictor_dim)
         class_predictor, value_predictor = self.input_params(class_indexes,
-                                                              value_indexes,
-                                                              base_predictor)
+                                                             value_indexes,
+                                                             base_predictor)
         # class_prediction: (*, num_seqs, seq_len, num_classses)
         # value_prediction: (*, num_seqs, seq_len, num_discretization_levels)
         # both of these are unnormalized logprobs.
         class_prediction = self.class_predictor_module(class_predictor)
-        value_prediction = self.value_predictor_module(class_predictor)
+        value_prediction = self.value_predictor_module(value_predictor)
+
         class_prediction = self.mask_prev_classes(class_prediction,
                                                   class_indexes)
 
-        class_prediction = class_prediction.softmax(dim=-1)
-        value_prediction = value_prediction.softmax(dim=-1)
-
+        class_prediction = class_prediction.log_softmax(dim=-1)
+        value_prediction = value_prediction.log_softmax(dim=-1)
 
         # class_all_logprobs and value_all_logprobs are of shape
         # (*, num_seqs, seq_len)
@@ -353,12 +348,18 @@ class BottleneckPredictor(nn.Module):
 
         num_seqs = class_indexes.shape[-2]
 
-        # class_tot_logprobs and value_tot_logprobs are of shape (*).
+        # class_logprobs and value_logprobs are of shape (*).
         class_logprobs = torch.sum(class_all_logprobs, dim=(-2,-1)) * (1 / num_seqs)
         value_logprobs = torch.sum(value_all_logprobs, dim=(-2,-1)) * (1 / num_seqs)
 
-        return class_logprobs, value_logprobs
+        if random.random() < 0.0001:
+            class_seq = torch.mean(class_all_logprobs,
+                                   dim=tuple(range(class_all_logprobs.ndim - 1)))
+            value_seq = torch.mean(value_all_logprobs,
+                                   dim=tuple(range(class_all_logprobs.ndim - 1)))
+            print(f"Class/value logprobs, as seqs, are: {class_seq}/{value_seq}")
 
+        return class_logprobs, value_logprobs
 
 
     def mask_prev_classes(self, class_logprobs: Tensor, class_indexes: Tensor) -> Tensor:
@@ -380,7 +381,7 @@ class BottleneckPredictor(nn.Module):
         """
         counts = torch.zeros_like(class_logprobs, dtype=torch.int16)
         counts.scatter_(-1, class_indexes.unsqueeze(-1), 1)
-        mask = (exclusive_cumsum(counts, dim=-1) != 0)
+        mask = (exclusive_cumsum(counts, dim=-2) != 0)
         class_logprobs.masked_fill_(mask, float("-infinity"))
         return class_logprobs
 
@@ -1012,9 +1013,9 @@ def _test_sampling_bottleneck():
     print(f"Shapes of: y={y.shape}, probs={probs.shape}, class_indexes={class_indexes.shape}, value_indexes={value_indexes.shape}")
 
     base_predictor = torch.randn(30, 4, predictor_dim)
-    (class_predictor, weight_predictor) = p(class_indexes, value_indexes, base_predictor)
-    print(f"class_predictor shape={class_predictor.shape}, weight_predictor shape={weight_predictor.shape}")
-    print(f"class_predictor variance={(class_predictor**2).mean()} weight_predictor variance={(weight_predictor**2).mean()}")
+    (class_predictor, value_predictor) = p(class_indexes, value_indexes, base_predictor)
+    print(f"class_predictor shape={class_predictor.shape}, value_predictor shape={value_predictor.shape}")
+    print(f"class_predictor variance={(class_predictor**2).mean()} value_predictor variance={(value_predictor**2).mean()}")
 
     assert value_indexes.min() == 0 and value_indexes.max() < num_discretization_levels
 

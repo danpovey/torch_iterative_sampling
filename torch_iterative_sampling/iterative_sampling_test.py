@@ -2,7 +2,7 @@ import math
 import random
 import torch
 from torch import nn
-from torch_iterative_sampling import SamplingBottleneckModule
+from torch_iterative_sampling import SamplingBottleneckModule, BottleneckPredictor
 from typing import List
 
 
@@ -15,7 +15,7 @@ from typing import List
 
 
 def test_iterative_sampling_train():
-    for seq_len in 2, 8, 4, 1, 16:
+    for seq_len in 16, 8, 4, 2, 1:
         print(f"Running test_iterative_sampling_train: seq_len={seq_len}")
         device = torch.device('cuda')
         dim = 256
@@ -28,12 +28,14 @@ def test_iterative_sampling_train():
                                      random_rate=1.0,
                                      epsilon=0.01).to('cuda')
 
-        m_rest = nn.Sequential(nn.Linear(dim, hidden_dim),
-                               nn.ReLU(hidden_dim),
-                               nn.LayerNorm(hidden_dim),
-                               nn.Linear(hidden_dim, dim)).to('cuda')
+        predictor_dim = 256
+        p = BottleneckPredictor(num_classes, predictor_dim,
+                                num_discretization_levels,
+                                seq_len, hidden_dim,
+                                num_hidden_layers=1).to('cuda')
 
-        m_tot = nn.ModuleList((m, m_rest))
+
+        m_tot = nn.ModuleList((m, p))
 
         m_tot.train()
         optim = torch.optim.Adam(m_tot.parameters(), lr=0.005, betas=(0.9, 0.99))
@@ -130,7 +132,7 @@ def test_iterative_sampling_train():
         # .. here, the rate is the rate per dimension..
         #  so, loss = 0.5 ** (2 * bits_per_dim)
         #   loss = 0.5 ** (2 * (log(P)/log(2))/dim)
-        ref_loss_shannon = 0.5 ** (2 * (math.log(P) / math.log(2))/dim)
+        ref_loss_shannon = 0.5 ** (2 * (math.log(P) / math.log(2)) / dim)
 
         # You might notice that with P large enough, the above expression could potentially be
         # negative, which makes no sense.  The flaw in the argument here arises once P gets
@@ -144,18 +146,36 @@ def test_iterative_sampling_train():
 
             feats = torch.randn(*feats_shape, device=device)
 
-            output, _, _, _, class_entropy, frame_entropy = m(feats)
+            num_seqs = 2
+            output, _probs, class_indexes, value_indexes, class_entropy, frame_entropy = m(feats, num_seqs=num_seqs)
 
+            # the base_predictor is zero because all frames are independent in
+            # this test, there is nothing can meaningfully use to predict them.
+            #base_predictor = torch.zeros(*feats.shape[:-1], predictor_dim, device=device)
+            base_predictor = feats.detach()
+
+            # class_logprobs, value_logprobs have shape equal to feats.shape[:-1]
+            class_logprobs, value_logprobs = p(class_indexes, value_indexes, base_predictor)
+            assert class_logprobs.shape == feats.shape[:-1]
             #output = m_rest(output)
 
             # try to reconstruct the feats, after this information bottleneck.
             loss = ((feats - output) ** 2).sum() / feats.numel()
 
+            class_avg_logprob = class_logprobs.mean()
+            value_avg_logprob = value_logprobs.mean()
+
+            ref_loss_shannon_real = 0.5 ** (2 * (-class_avg_logprob / math.log(2)) / dim)
+
             if i % 500 == 0 or loss.abs() > 3.0:
                 loss_val = loss.to('cpu').item()
-                print(f"seq_len={seq_len}, minibatch={i}, loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f}, ref_loss_shannon={ref_loss_shannon:.3f} "
+                print(f"seq_len={seq_len}, minibatch={i}, reconstruction_loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f}, ref_loss_shannon={ref_loss_shannon:.3f} "
                       f"class_entropy={class_entropy.to('cpu').item():.3f}, "
                       f"frame_entropy={frame_entropy.to('cpu').item():.3f}")
+                print(f"class_avg_logprob={class_avg_logprob.item()}, value_avg_logprob={value_avg_logprob.item()}, ref_loss_shannon_real={ref_loss_shannon_real}")
+
+
+            loss += -(class_avg_logprob + value_avg_logprob)
 
             # stop maximizing frame_entropy when it is greater than seq_len.
             frame_entropy = torch.clamp(frame_entropy, max=(math.log(seq_len*2)))
