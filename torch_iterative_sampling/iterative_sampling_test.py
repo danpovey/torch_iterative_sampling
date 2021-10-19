@@ -165,15 +165,12 @@ def test_iterative_sampling_train():
             class_avg_logprob = class_logprobs.mean()
             value_avg_logprob = value_logprobs.mean()
 
-            ref_loss_shannon_real = 0.5 ** (2 * (-class_avg_logprob / math.log(2)) / dim)
-
             if i % 500 == 0 or loss.abs() > 3.0:
                 loss_val = loss.to('cpu').item()
                 print(f"seq_len={seq_len}, minibatch={i}, reconstruction_loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f}, ref_loss_shannon={ref_loss_shannon:.3f} "
                       f"class_entropy={class_entropy.to('cpu').item():.3f}, "
                       f"frame_entropy={frame_entropy.to('cpu').item():.3f}")
-                print(f"class_avg_logprob={class_avg_logprob.item()}, value_avg_logprob={value_avg_logprob.item()}, ref_loss_shannon_real={ref_loss_shannon_real}")
-
+                print(f"class_avg_logprob={class_avg_logprob.item()}, value_avg_logprob={value_avg_logprob.item()}")
 
             loss += -(class_avg_logprob + value_avg_logprob)
 
