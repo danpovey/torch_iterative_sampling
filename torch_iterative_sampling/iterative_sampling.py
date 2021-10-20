@@ -113,7 +113,6 @@ def iterative_sample(probs: torch.Tensor,
     rand = torch.rand(B, num_seqs, dtype=probs.dtype, device=probs.device)
     indexes = _iterative_sample_dispatcher(cumsum, rand, seq_len)
     indexes = indexes.view(*rest_shape, num_seqs, seq_len)
-
     return indexes
 
 
@@ -293,6 +292,7 @@ class BottleneckPredictor(nn.Module):
         self.value_predictor_module = create_predictor(num_discretization_levels)
 
     def forward(self,
+                probs: Optional[Tensor],
                 class_indexes: Tensor,
                 value_indexes: Tensor,
                 base_predictor: Tensor) -> Tuple[Tensor, Tensor]:
@@ -301,6 +301,16 @@ class BottleneckPredictor(nn.Module):
         by the SamplingBottleneckModule.
 
         Args:
+           probs: the same-named output from SamplingBottleneckModule.forward(),
+             a Tensor of shape (*, num_classes).  You can provide None if you want
+             class_indexes to be used instead of `probs`, but using `probs`
+             should give a lower-variance estimate of the derivative.  We use
+             this without grad (we detach it), for a couple reasons.
+              - only a difference of log-likes would make sense to train the
+                bottleneck and its input;
+              - It wouldn't be "all the derivative" anyway, the real
+                mechanics of backprop to get the correct derivatives w.r.t. `probs`
+                are much more complicated than just enabling grad here.
            class_indexes: the same-named output from
               SamplingBottleneckModule.forward(), a LongTensor of
               shape (*, num_seqs, seq_len).
@@ -322,6 +332,8 @@ class BottleneckPredictor(nn.Module):
               the sequence (seq_len) and averaged over the parallel
               sequences (num_seqs).
         """
+        if probs is not None:
+            probs = probs.detach()
         # class_predictor: (*, num_seqs, seq_len, predictor_dim)
         # value_predictor: (*, num_seqs, seq_len, predictor_dim)
         class_predictor, value_predictor = self.input_params(class_indexes,
@@ -333,16 +345,31 @@ class BottleneckPredictor(nn.Module):
         class_prediction = self.class_predictor_module(class_predictor)
         value_prediction = self.value_predictor_module(value_predictor)
 
-        class_prediction = self.mask_prev_classes(class_prediction,
-                                                  class_indexes)
+        class_prediction, mask = self.mask_prev_classes(class_prediction,
+                                                        class_indexes)
 
         class_prediction = class_prediction.log_softmax(dim=-1)
         value_prediction = value_prediction.log_softmax(dim=-1)
 
         # class_all_logprobs and value_all_logprobs are of shape
         # (*, num_seqs, seq_len)
-        class_all_logprobs = torch.gather(class_prediction, dim=-1,
-                                          index=class_indexes.unsqueeze(-1)).squeeze(-1)
+        # Even if probs is supplied, in training mode once in every 20 or so minibatches we use
+        # the sampled classes instead of `probs`.  This seems to allow the training to
+        # get started faster than it otherwise would.
+        if probs is None or (self.training and random.random() < 0.05):
+            class_all_logprobs = torch.gather(class_prediction, dim=-1,
+                                              index=class_indexes.unsqueeze(-1)).squeeze(-1)
+        else:
+            probs_expanded = probs.unsqueeze(-2).unsqueeze(-2).expand(mask.shape).contiguous()
+            # mask out probs of previously seen classes to zero; these are no longer possible,
+            # so distribution at each point should exclude these prior classes.
+            probs_expanded.masked_fill_(mask, 0.0)
+            class_prediction = class_prediction.clone()
+            class_prediction.masked_fill_(mask, 0.0)
+            # Re-normalize probs to sum to one after the last dim.
+            probs_expanded = probs_expanded / probs_expanded.sum(dim=-1).unsqueeze(-1)
+            class_all_logprobs = (probs_expanded * class_prediction).sum(dim=-1)
+
         value_all_logprobs = torch.gather(value_prediction, dim=-1,
                                           index=value_indexes.unsqueeze(-1)).squeeze(-1)
 
@@ -375,15 +402,54 @@ class BottleneckPredictor(nn.Module):
                    WARNING: used destructively (actually operates in-place)
                class_indexes: a LongTensor of shape (*, seq_len, num_seqs), containing
                    class indexes in {0..num_classes-1}.
-        Returns:
-            Returns a modified version of class_logprobs with elements corresponding
-            to previously seen classes in the sequence replaced with -infinity.
+        Returns: (class_logprobs, mask)
+            class_logprobs:  An in-place modified version of class_logprobs with
+               elements corresponding to previously seen classes in the sequence
+               replaced with -infinity.
+            mask: a BoolTensor with the same shape as `class_logprobs`, i.e.
+               (*, seq_len, num_seqs, num_classes),with True in the places
+               where we put -infinity.
         """
         counts = torch.zeros_like(class_logprobs, dtype=torch.int16)
         counts.scatter_(-1, class_indexes.unsqueeze(-1), 1)
         mask = (exclusive_cumsum(counts, dim=-2) != 0)
-        class_logprobs.masked_fill_(mask, float("-infinity"))
-        return class_logprobs
+        # use -1e+20 instead of -infinity for the mask, because otherwise when
+        # we multiply by zero later we'll get nan's.
+        class_logprobs.masked_fill_(mask, -1e+20)
+        return class_logprobs, mask
+
+    def get_prob_scales(self, probs: Tensor, class_indexes: Tensor) -> Tensor:
+        """
+        Returns some scaling factors >= 1 that compensate for the fact that we will
+        be masking out elements in `probs` that correspond to previously emitted
+        classes in the sequence: the scales will be those that would cause `probs`
+        to sum to one after such masking.
+
+        Args:
+          probs: A Tensor of shape (*, num_classes), which sums to one along
+                dim=-1, containing class probabilities, as returned from
+                SamplingBottleneckModule.
+          class_indexes:  a LongTensor of shape (*, num_seqs, seq_len) as returned
+                from a SamplingBottleneckModule, containing elements in
+                {0..num_classes-1}.
+        Return:  Returns a Tensor of shape (*, num_seqs, seq_len), containing
+                 scaling factors >= 1.
+        """
+        num_seqs = class_indexes.shape[-2]
+        num_classes = probs.shape[-1]
+        probs_temp = probs.unsqueeze(-2).expand(probs.shape[:-1], num_seqs, num_classes)
+        # probs_temp now of shape (*, num_seqs, num_classes).
+        selected_probs = torch.gather(probs_temp, dim=-1, index=class_indexes)
+        # selected_probs is now of shape (*, num_seqs, seq_len)
+        selected_probs_cumsum = exclusive_cumsum(selected_probs, dim=-1)
+        # selected_probs_cumsum is of shape (*, num_seqs, seq_len), containing
+        # the exclusive cumulative sum of selected_probs
+        # epsilon is the floating point epsilon.. we'll be dividing by inv_scale, so
+        # must be very careful about roundoff
+        epsilon = (1.2e-07 if probs.dtype == torch.float32 else
+                   (2.3e-16 if probs.dtype == torch.float64 else
+                    9.8e-04)) # <-- assume float16, if supported.
+        inv_scale = (1 - selected_probs_cumsum).clamp(min=epsilon)
 
 
 class _ParameterizedDropout(torch.autograd.Function):
@@ -616,8 +682,12 @@ def discretize_values(values: Tensor,
          indexes: a LongTensor containing the discrete indexes corresponding
            to `y`, in the range [0..num_discretization_levels-1].
     """
-    # the 0.99999 is to ensure we don't get exactly one.
-    indexes = (values * (num_discretization_levels - 1) + 0.99999*torch.rand_like(values)).to(dtype=torch.long)
+    # the 0.999 is to ensure we don't get exactly one.  Caution: this won't work
+    # in half precision, so we use an assert for now (otherwise we'd later get
+    # an error in a scatter kernel)
+    assert values.dtype != torch.float16
+    indexes = (values * (num_discretization_levels - 1) + 0.999*torch.rand_like(values)).to(dtype=torch.long)
+    assert indexes.max() < num_discretization_levels # TEMP
     ans = indexes * (1.0 / (num_discretization_levels - 1))
     y = _WithGradOf.apply(ans, values)
     return y, indexes
@@ -1021,7 +1091,10 @@ def _test_sampling_bottleneck():
 
     print("y part = ", y[0])
 
-    (class_logprobs, value_logprobs) = b(class_indexes, value_indexes, base_predictor)
+    (class_logprobs, value_logprobs) = b(None, class_indexes, value_indexes, base_predictor)
+    assert class_logprobs.shape == (30, 4)
+    assert value_logprobs.shape == (30, 4)
+    (class_logprobs, value_logprobs) = b(probs, class_indexes, value_indexes, base_predictor)
     assert class_logprobs.shape == (30, 4)
     assert value_logprobs.shape == (30, 4)
 
@@ -1147,8 +1220,8 @@ def _test_parameterized_dropout():
 
                 # if all three of quadratic_term, epsilon and random_rate are nonzero,
                 # there is a risk of inaccuracy in expected vs. observed derivatives.
-                threshold=0.01 + (0.075 * quadratic_term * epsilon * random_rate)
-                if threshold > 0.015:
+                threshold=0.015 + (0.075 * quadratic_term * epsilon * random_rate)
+                if threshold > 0.02:
                     print(f"Threshold={threshold}, since quadratic_term={quadratic_term} and epsilon={epsilon} and random_rate={random_rate}")
 
                 # Note: this test won't always succeed, and the threshold is heuristic, not based on

@@ -22,17 +22,33 @@ def test_iterative_sampling_train():
         hidden_dim = 512
         num_classes = 512
         num_discretization_levels = 512
+        # epsilon=0.0001 is the point after which we don't see clear improvement in loss function (reconstruction_loss)
+        # after we reduce by another factor of 10.
+        # the difference in backpropagated derivative magnitude is not as large as you might expect.
+        # E.g. feats.grad elements sumsq printed below, of 0.44 with 0.001 or 0.49 with 0.0001 and 0.52 with 0.00001,
+        # for seq_len=16; or XX vs 0.35 vs 0.40 vs 0.45 for seq_len=8.  So very small epsilon does increase the
+
+        # We choose epsilon to get as good as possible reconstruction loss while also minimizing
+        # the magnitude of the backpropagated gradient.  Here, the clear winder seems to be epsilon=0.001.
+        #
+        #
+        #    epsilon:                         0.01 0.001 0.0001 0.0001
+        # len=16 reconstruction_loss:         0.77 0.762 0.761 0.761
+        # len=8 reconstruction_loss           0.866 0.848 0.846 0.846
+        # len=16 feats.grad sumsq             0.48  0.44   0.49    0.52
+        # len=8 feats.grad sumsq              0.38  0.35  0.40   0.45
         m = SamplingBottleneckModule(dim, num_classes,
                                      seq_len=seq_len,
                                      num_discretization_levels=num_discretization_levels,
                                      random_rate=1.0,
-                                     epsilon=0.01).to('cuda')
+                                     epsilon=0.001).to('cuda')
 
         predictor_dim = 256
         p = BottleneckPredictor(num_classes, predictor_dim,
                                 num_discretization_levels,
                                 seq_len, hidden_dim,
                                 num_hidden_layers=1).to('cuda')
+        test_predictor = False  # can set to False for speed
 
 
         m_tot = nn.ModuleList((m, p))
@@ -50,80 +66,7 @@ def test_iterative_sampling_train():
                                    # exceeds a certain value we no longer
                                    # include it in the loss.
 
-        # We figure out a reference loss, ref_loss, that reflects what the loss
-        # would be if we were efficiently using the information passed through
-        # the channel.  The information consists of the set of class indexes
-        # and associated weights.  Since we think the info in the weights will
-        # be inefficiently  used, for now we just consider the class indexes.
-        # The number of possible combinations of class indexes is:
-
-        #    P = num_classes ** seq_len / math.factorial(seq_len)   (1)
-
-        # Suppose (we're ignoring the values/weights), that the number of
-        # distinct outputs the network can have is equal to P from eqn. (1).
-        # We can approximately figure out what the loss function would be,
-        # based on an analysis of randomized VQ, initialized via one iteration
-        # of k-means clustering.
-        # Let the dimension of the space be D (this correspond to "dim" above).
-        #
-        #   On iteration 0 we assign to each class p=1..P-1, a vector v_p^0,
-        #  which will have all elements being 1 or -1, chosen randomly.
-        #  We then generate a large number of points a_i, with i=0..I-1,
-        # from a zero-mean, unit-variance
-        # Gaussian in dimension D.  (It's important to choose this distribution,
-        # as it's the distribution of our `feats`).  We assign these points to
-        # the cluster centers by choosing the v_p^0 (over p) that has the largest
-        # dot product with the point; this gives the shortest distance to any v_p^0
-        # since it minimizes  (a_i - v_p^0)**2 = a_i.a_i - 2 a_i.v_p^0 + v_p^0.v_p^0,
-        # the other 2 terms being constant for a given a_i.  These dot products
-        # have distribution N(0, D), i.e. the variance is D.  They are *close*
-        # to independently distributed, closer as D gets larger, we'll treat them
-        # as independent.
-        #
-        # According to
-        # https://math.stackexchange.com/questions/89030/expectation-of-the-maximum-of-gaussian-random-variables
-        # (see also https://en.wikipedia.org/wiki/Fisher%E2%80%93Tippett%E2%80%93Gnedenko_theorem#Gumbel_distribution)
-        ##
-        #the mean of the maximum of a size n normal sample, for large n is well approximated by:
-        #
-        # sqrt(log(n*n / (2*pi*log(n*n/(2*pi)))))  * (1 + gamma/log(n) + o(1/log(n)))   (2)
-        # where gamma = Euler-Mascheroni constant = 0.5772156649
-        #  .. and ignoring the o(1/log(n)) part, as "small", we treat this as
-        #  sqrt(log(n*n / (2*pi*log(n*n/(2*pi)))))  * (1 + gamma/log(n))
-        #
-        # So we can use the above expression times sqrt(D) [the stddev] as the mean value of
-        # the dot products, i.e.:
-        #  mean dot_prod, i.e.
-        #
-        #   E[a_i.v_p^0] \simeq sqrt(D) *  sqrt(log(P*P / (2*pi*log(P*P/(2*pi)))))  * (1 + gamma/log(P))
-        #
-        # We can use the above expression to lower-bound the expected distance of the mean of the
-        # points assigned to any particular cluster p, from the origin.  We can do this because
-        # we know (approximately) the expected value in the direction of v_p.  [there will also be
-        # some component orthogonal to v_p in generall; this will probably be considerably less though.]
-        # The unit vector in the direction of v_p equals v_p / sqrt(D) [since v_p.v_p==D],
-        # so we can lower-bound the expected average distance from the origin to the cluster
-        # centers on iteration 1 of k-means, as:
-        #
-        #   sqrt(log(P*P / (2*pi*log(P*P/(2*pi)))))  * (1 + gamma/log(P)).
-        #
-        # If we use a suboptimal assignments of points to these new cluster centers, by
-        # just taking the assignment from iteration 0, we'll be able to show that the remaining
-        # variance, i.e. E[point-cluster_center]^2, will equal:
-        #
-        #  remaining_var = [ D -  log(P*P / (2*pi*log(P*P/(2*pi))))  * (1 + gamma/log(P))**2 ],
-        #
-        # and normalizing this by dividing by the original total variance D, to match our
-        # loss function, we have
-        #
-        # expected_loss = [ D -  log(P*P / (2*pi*log(P*P/(2*pi))))  * (1 + gamma/log(P))**2 ] / D
-        #
-        # (where D == dim)
-
-        gamma = 0.5772156649 # Euler-Mascheroni constant
         P = num_classes ** seq_len / math.factorial(seq_len)
-        ref_loss = (dim - (math.log(P*P / (2*math.pi*math.log(P*P/(2*math.pi))))  * (1 + gamma/math.log(P)))) / dim
-
 
         # Shannon's rate-distortion equation says rate = 1/2 log_2(sigma_x^2 / D),
         # where sigma_x^2 is the input variance and D is the distortion.  Our
@@ -132,7 +75,7 @@ def test_iterative_sampling_train():
         # .. here, the rate is the rate per dimension..
         #  so, loss = 0.5 ** (2 * bits_per_dim)
         #   loss = 0.5 ** (2 * (log(P)/log(2))/dim)
-        ref_loss_shannon = 0.5 ** (2 * (math.log(P) / math.log(2)) / dim)
+        ref_loss = 0.5 ** (2 * (math.log(P) / math.log(2)) / dim)
 
         # You might notice that with P large enough, the above expression could potentially be
         # negative, which makes no sense.  The flaw in the argument here arises once P gets
@@ -147,32 +90,34 @@ def test_iterative_sampling_train():
             feats = torch.randn(*feats_shape, device=device)
 
             num_seqs = 2
-            output, _probs, class_indexes, value_indexes, class_entropy, frame_entropy = m(feats, num_seqs=num_seqs)
+            output, probs, class_indexes, value_indexes, class_entropy, frame_entropy = m(feats, num_seqs=num_seqs)
 
             # the base_predictor is zero because all frames are independent in
             # this test, there is nothing can meaningfully use to predict them.
             #base_predictor = torch.zeros(*feats.shape[:-1], predictor_dim, device=device)
             base_predictor = feats.detach()
 
-            # class_logprobs, value_logprobs have shape equal to feats.shape[:-1]
-            class_logprobs, value_logprobs = p(class_indexes, value_indexes, base_predictor)
-            assert class_logprobs.shape == feats.shape[:-1]
-            #output = m_rest(output)
+            if test_predictor:
+                # class_logprobs, value_logprobs have shape equal to feats.shape[:-1]
+                class_logprobs, value_logprobs = p(probs, class_indexes, value_indexes, base_predictor)
+                assert class_logprobs.shape == feats.shape[:-1]
+                class_avg_logprob = class_logprobs.mean()
+                value_avg_logprob = value_logprobs.mean()
 
             # try to reconstruct the feats, after this information bottleneck.
             loss = ((feats - output) ** 2).sum() / feats.numel()
 
-            class_avg_logprob = class_logprobs.mean()
-            value_avg_logprob = value_logprobs.mean()
 
             if i % 500 == 0 or loss.abs() > 3.0:
                 loss_val = loss.to('cpu').item()
-                print(f"seq_len={seq_len}, minibatch={i}, reconstruction_loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f}, ref_loss_shannon={ref_loss_shannon:.3f} "
+                print(f"seq_len={seq_len}, minibatch={i}, reconstruction_loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f} "
                       f"class_entropy={class_entropy.to('cpu').item():.3f}, "
                       f"frame_entropy={frame_entropy.to('cpu').item():.3f}")
-                print(f"class_avg_logprob={class_avg_logprob.item()}, value_avg_logprob={value_avg_logprob.item()}")
+                if test_predictor:
+                    print(f"class_avg_logprob={class_avg_logprob.item()}, value_avg_logprob={value_avg_logprob.item()}")
 
-            loss += -(class_avg_logprob + value_avg_logprob)
+            if test_predictor:
+                loss += -(class_avg_logprob + value_avg_logprob)
 
             # stop maximizing frame_entropy when it is greater than seq_len.
             frame_entropy = torch.clamp(frame_entropy, max=(math.log(seq_len*2)))
