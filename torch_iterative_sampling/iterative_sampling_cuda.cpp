@@ -4,14 +4,23 @@
 /*
   iterative_sample function, CUDA version.
 
-    cumsum: (exclusive) cumulative probabilities of input classes, of shape (B, N),
+    cumsum: (exclusive) cumulative integerized probabilities of input classes,
+        of shape (B, N),
         where B is the batch size and N is the number of classes, so element
-        cumsum[b][k] is the sum of probs[b][i] for 0 <= i < k.
-        Implicitly the final element (not present) would be 1.0.
-    rand:  random numbers uniformly distributed on [0,1], of shape (B,S), where
-         S is the number of separate sequences of samples we are choosing from
-         each distribution in `cumsum`.
-       K: length of the random sequence to draw; must satisfy 0 < K < N.
+        cumsum[b][k] is the sum of probs[b][i] for 0 <= i < k.  We require that
+        the probs be in type int32_t, and they should be converted to this by
+        multiplying by (1<<31) and then converting to int32_t.  Wrapping to
+        negative does not matter as we'll be using unsigned types in the
+        kernel.  We require that the values in `cumsum` all be distinct,
+        i.e. implicitly that all the integerized `probs` are nonzero; you can
+        apply a floor of 1 to ensure this.  This avoids problems where fewer
+        than K classes have nonzero prob.
+
+    rand:  random int32_t numbers uniformly distributed on {0..1<<31 - 1},
+        of shape (B,S), where S is the number of separate sequences of samples
+        we are choosing from each distribution in `cumsum`.
+
+      K: length of the random sequence to draw; must satisfy 0 < K < N.
 
   Returns:  Tensor of shape (B, S, K) and type torch::kInt64, containing,
             for each B, a squence of K distinct sampled integers (class

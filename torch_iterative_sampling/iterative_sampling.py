@@ -106,12 +106,17 @@ def iterative_sample(probs: torch.Tensor,
     N = probs.shape[-1]
     rest_shape = probs.shape[:-1]
     probs = probs.reshape(-1, N)
-
-    cumsum = exclusive_cumsum(probs, dim=-1)
-
     B = probs.shape[0]
-    rand = torch.rand(B, num_seqs, dtype=probs.dtype, device=probs.device)
-    indexes = _iterative_sample_dispatcher(cumsum, rand, seq_len)
+
+    probs_int32 = (probs * (2**31)).to(torch.int32)
+    # this `clamp` may not always be necessary, actually, if the calling code has
+    # applied some kind of floor.
+    probs_int32.clamp_(min=1)
+    rand_int32 = torch.randint(0, (2**31)-1, (B, num_seqs), dtype=torch.int32,
+                               device=probs.device)
+    # torch.cumsum does not seem to suppost int32, so we convert using 'to'.
+    cumsum_int32 = torch.cumsum(probs_int32, dim=-1).to(dtype=torch.int32)
+    indexes = _iterative_sample_dispatcher(cumsum_int32, rand_int32, seq_len)
     indexes = indexes.view(*rest_shape, num_seqs, seq_len)
     return indexes
 
@@ -687,7 +692,6 @@ def discretize_values(values: Tensor,
     # an error in a scatter kernel)
     assert values.dtype != torch.float16
     indexes = (values * (num_discretization_levels - 1) + 0.999*torch.rand_like(values)).to(dtype=torch.long)
-    assert indexes.max() < num_discretization_levels # TEMP
     ans = indexes * (1.0 / (num_discretization_levels - 1))
     y = _WithGradOf.apply(ans, values)
     return y, indexes
@@ -1233,10 +1237,10 @@ def _test_parameterized_dropout():
                                                 threshold=threshold)
 
 if __name__ == '__main__':
+    _test_iterative_sample()
     _test_sampling_bottleneck()
     _test_parameterized_dropout()
     _test_get_derivative_scales()
-    _test_iterative_sample()
     _test_discretize_values()
     _test_compute_marginals()
     _test_normalizer()

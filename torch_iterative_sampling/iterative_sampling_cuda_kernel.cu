@@ -8,6 +8,51 @@ extern __shared__ char extern_buf[];
 // `extern_buf` is general-purpose shared memory.
 
 
+/*
+  Zoom into an interval.  What we are trying to emulate here is something like this:
+
+  float cur_begin = 0.4, cur_end = 0.6,
+         r = 0.423143, end = 0.7;
+  r = (r - cur_begin) * end / (cur_end - cur_begin);
+  .. that is, in the real-number version, we are taking some r with
+  cur_begin <= r <= cur_end, and shifting and scaling it so that 0 <= r <= end.
+  Look at this as "zooming into an interval", as in arithmetic coding.  This is
+  all done in integer math, though.  Integer math is more convenient because
+  we don't have to worry about roundoff here.
+
+         r:       Random number with cur_begin <= r < cur_end.
+    orig_r:       A number that we use as an auxiliary source of randomness, if
+                  needed (e.g. if we have to zoom in "very far").
+    cur_begin:    Beginning of interval that `r` is in.  We require
+                     0 < cur_begin < (int)((1<<31) + 1.1)
+    cur_end:      One-past-the-last of interval that `r` is in.  We require
+                     cur_begin < cur_end < (int)((1<<31) + 1.1),
+       end:      One past the last element of the interval that we are
+                 shifting r to (first element is 0).
+
+    Return:   Returns a number that, conceptually, is uniformly distributed on the
+              interval [0..end-1], assuming r was originally uniformly distributed
+              on the interval [cur_begin..cur_end-1].
+ */
+__forceinline__ __device__ uint32_t zoom(uint32_t r, uint32_t orig_r,
+                                         uint32_t cur_begin, uint32_t cur_end,
+                                         uint32_t end) {
+  // prod will not overflow because none of these numbers are significantly larger
+  // than 1 << 31.
+  //
+  // Adding ((orig_r + cur_begin) % end) is intended to provide randomness in
+  // the lower bits, to avoid going to exactly zero when cur_begin - cur_end ==
+  // 1, which could happen (extremely rarely)
+  uint64_t prod = (uint64_t)(r - cur_begin) * (uint64_t)end  +  ((orig_r + cur_begin) % end);
+  // We know that prod < (cur_end - cur_begin) * end, because
+  // (uint64_t)(r - cur_begin) * (uint64_t)end <= (cur_end - 1 - cur_begin) * end,
+  //                        and (orig_r % end) < 1 * end.
+
+  // We know that ans < end, because prod < (cur_end - cur_begin) * end.
+  uint32_t ans = prod / (cur_end - cur_begin);
+  return ans;
+}
+
 
 /*
   This device function, intended to be called with the same args among all threads
@@ -34,10 +79,9 @@ extern __shared__ char extern_buf[];
        This is undefined if r < cumsum[begin].
 
 */
-template <typename scalar_t>
 __forceinline__ __device__ int find_class(
     cooperative_groups::thread_group &g, int32_t *shared_int,
-    scalar_t *cumsum, int begin, int end, scalar_t r) {
+    uint32_t *cumsum, int begin, int end, uint32_t r) {
   assert(end > begin);
   int orig_begin = begin, orig_end = end;  // debug
 
@@ -71,47 +115,29 @@ __forceinline__ __device__ int find_class(
     end = min(end, begin + block_size);
 
     if (!(begin >= orig_begin && begin < end && end <= orig_end)) {
-      printf("[failure!]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
+      printf("[failure!]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, begin=%d, x,r,y=%d,%d,%d\n", blockIdx.x, threadIdx.x, threadIdx.y,
              orig_begin, orig_end, begin,
-             (float)(begin >= orig_begin && begin < orig_end ? cumsum[begin] : -101), (float)r,
-             (float)(begin + 1 >= orig_begin && begin + 1 < orig_end ? cumsum[begin + 1] : -102));
+             (begin >= orig_begin && begin < orig_end ? cumsum[begin] : 10000), r,
+             (begin + 1 >= orig_begin && begin + 1 < orig_end ? cumsum[begin + 1] : 100000));
       assert(0);
     }
   }
 #if 0
   if (blockIdx.x == 0 && threadIdx.y == 0) {
-    printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, returning begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
+    printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, orig begin,end=%d,%d, returning begin=%d, x,r,y=%d,%d,%d\n", blockIdx.x, threadIdx.x, threadIdx.y,
            orig_begin, orig_end, begin,
-           (float)cumsum[begin], (float)r, (float)cumsum[begin + 1]);
+           cumsum[begin], r, cumsum[begin + 1]);
   }
 #endif
   if (!(r >= cumsum[begin] && (begin + 1 == orig_end || r < cumsum[begin + 1]))) {
-    float y = (begin + 1 < orig_end ? cumsum[begin + 1] : -100);
-    printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, search error:  begin,end=%d,%d, returning begin=%d, x,r,y=%f,%f,%f\n", blockIdx.x, threadIdx.x, threadIdx.y,
-           orig_begin, orig_end, begin, (float)cumsum[begin], (float)r, y);
+    uint32_t y = (begin + 1 < orig_end ? cumsum[begin + 1] : 300000);
+    printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, search error:  begin,end=%d,%d, returning begin=%d, x,r,y=%d,%d,%d\n", blockIdx.x, threadIdx.x, threadIdx.y,
+           orig_begin, orig_end, begin, cumsum[begin], r, y);
   }
 
   return begin;
 }
 
-
-template <typename scalar_t>
-__forceinline__ __device__ void wrap_if_outside_unit_interval(scalar_t *r) {
-  if (!(*r >= 0.0 && *r <= 1.0)) {
-    // should be very rare.
-    if (threadIdx.x == 0) {
-      printf("iterative_sampling_cuda_kernel.cpp: warning: blockIdx.x=%d, threadIdx.{x,y}=%d,%d, wrapping %f\n",
-             blockIdx.x, threadIdx.x, threadIdx.y, (float)(*r));
-    }
-    if (*r - *r != 0)  // e.g. nan, due to division by zero.
-      *r = 0.5;
-    // mathematically, r should still be in the range [0,1]; we wrap
-    // around like this just in case of roundoff errors.
-    if (*r < 0.0)
-      *r = -*r;
-    *r = (*r - (int)*r);
-  }
-}
 
 
 /*
@@ -132,31 +158,32 @@ __forceinline__ __device__ void wrap_if_outside_unit_interval(scalar_t *r) {
   batch index b.
 
 
-  Template args:
-      scalar_t: the floating-point type, e.g. float, double; maybe half
-
   Args:
-      cumsum:  Accessor to the (exclusive) cumulative sum of probabilities,
-            of shape (B, N), i.e. (batch_size, num_classes)
-      rand:  Accessor to a tensor of random numbers, of shape (B, S),
-         i.e. (batch_size, num_sequences)
+      cumsum:  Accessor to the inclusive cumulative sum of probabilities,
+         of shape (B, N), i.e. (batch_size, num_classes).  The probabilities
+         should be integerized to the range {0..1<<31} before being cumsum'd.
+         Note: some of them may be negative due to wrapping, but when we read
+         we'll converta to uint32 where there won't be wrapping.
+
+      rand:  Accessor to a tensor of random integers, in range {0..1<<31 - 1}
+          The shape if (B, S), i.e. (batch_size, num_sequences)
+
       indexes (an output): Accessor to a LongTensor of chosen indexes, of
           shape (B, S, K), i.e. (batch_size, num_sequences, seq_len)
 
   When this kernel is invoked, the user must specify the amount of shared memory
   to be allocated, via `extern_buf`.  The size of extern_buf, in bytes, must be:
 
-     (N + 1) * sizeof(scalar_t)           <-- for cumsum_buf
-     (K + 2) * S * sizeof(scalar_t)  <-- for cur_cumsum
-   + (K + 2) * S * sizeof(int32_t)   <-- for cur_classes
-   + S * sizeof(int32_t)             <-- for shared_int
+     (N + 1) * sizeof(uint32_t)       <-- for cumsum_buf
+     (K + 2) * S * sizeof(uint32_t)   <-- for cur_cumsum
+   + (K + 2) * S * sizeof(uint32_t)   <-- for cur_classes
+   + S * sizeof(uint32_t)             <-- for shared_int
 
 */
-template <typename scalar_t>
 __global__
 void iterative_sampling_kernel(
-    torch::PackedTensorAccessor32<scalar_t, 2> cumsum,   // B, N
-    torch::PackedTensorAccessor32<scalar_t, 2> rand,     // B, S
+    torch::PackedTensorAccessor32<int32_t, 2> cumsum,   // B, N
+    torch::PackedTensorAccessor32<int32_t, 2> rand,     // B, S
     torch::PackedTensorAccessor32<int64_t, 3> indexes) { // B, S, K
   const int B = cumsum.size(0),
       N = cumsum.size(1),
@@ -173,24 +200,24 @@ void iterative_sampling_kernel(
   int s = threadIdx.y;
   assert(s < S);
 
-  // This buffer stores one row of `cumsum`, indexed 0..N; it points to
-  // __shared__ memory.
-  scalar_t *cumsum_buf = (scalar_t*)extern_buf;
+  // This buffer stores 0 and then one row of `cumsum`, converted to uint32_t.
+  // it is indexed 0..N; it points to __shared__ memory.
+  uint32_t *cumsum_buf = (uint32_t*)extern_buf;
 
   // each block handling a different sequence s has a different 'cur_cumsum'
   // buffer, of size K + 2.  This is a pointer to __shared__ memory.
   // We store one more element in this buffer, vs. CPU code, that is never
   // actually needed but makes the code more similar to the 'cur_classes'
   // buffer and avoids if-statements.
-  scalar_t *cur_cumsum = (cumsum_buf + N + 1) + (K + 2) * s;
+  uint32_t *cur_cumsum = (cumsum_buf + N + 1) + (K + 2) * s;
 
   // each block handling a different sequence s has a different 'cur_classes'
   // buffer, of size (K + 2).  This is a pointer to __shared__ memory.
-  int32_t *cur_classes = (int32_t*)(cumsum_buf + N + 1 + ((K + 2) * S)) + (K + 2) * s;
+  int32_t *cur_classes = (int32_t*)((cumsum_buf + N + 1 + ((K + 2) * S)) + (K + 2) * s);
 
   // `shared_int` is a pointer to a single __shared__ integer that is shared
   // within each tile of blockDim.x threads.
-  int32_t *shared_int =  (int32_t*)(cumsum_buf + N + 1 + ((K + 2) * S)) + (K + 2) * S + s;
+  int32_t *shared_int =  (int32_t*)((cumsum_buf + N + 1 + ((K + 2) * S)) + (K + 2) * S + s);
 
   for (int b = blockIdx.x; b < B; b += gridDim.x) {
     // iterative_sample_cpu() in iterative_sampling_cpu.cpp may be helpful for
@@ -202,34 +229,39 @@ void iterative_sampling_kernel(
     // load cumsum_buf
     for (int n = threadIdx.x + threadIdx.y * blockDim.x; n < N;
          n += blockDim.x * blockDim.y)
-      cumsum_buf[n] = cumsum[b][n];
+      cumsum_buf[n + 1] = static_cast<uint32_t>(cumsum[b][n]);
     if (threadIdx.x == 0)
-      cumsum_buf[N] = 1.0;  // avoids an if-statement in the loop.
+      cumsum_buf[0] = 0;
 
     __syncthreads();
 
 
     if (threadIdx.x < 2) {
-      cur_cumsum[threadIdx.x] = (threadIdx.x == 0 ? 0.0 : 1.0);
+      cur_cumsum[threadIdx.x] = (threadIdx.x == 0 ? 0 : cumsum_buf[N]);
       cur_classes[threadIdx.x] = (threadIdx.x == 0 ? -1 : N);
     }
     g.sync();
 
-    scalar_t chosen_sum = 0.0,
-        r = rand[b][s];
+    uint32_t r = rand[b][s],  // 0 <= rand < (1 << 31)
+        r_orig = r,
+        remaining_prob = cumsum_buf[N];
+    // at iteration k, remaining_prob contains the sum of the probabilities
+    // of classes that have not so far been chosen.
 
-    assert(r >= 0 && r <= 1);
+
+    r = zoom(r, r, (uint32_t)0, ((uint32_t)1) << 31, remaining_prob);
 
     auto indexes_a = indexes[b][s];
 
     for (int k = 0; k < K; ++k) {
-      // Note: at this point, r is in the interval [0,1-chosen_sum]
+      assert(r < remaining_prob);
+
       int i = find_class(g, shared_int, cur_cumsum, 0, k + 1, r);
       assert(i >= 0 && i <= k);
 
       // i will now be (in all threadsin the tile), some value 0 <= i <= k, satisfying
       // cur_cumsum[i] <= r < cur_cumsum[i+1], where,
-      // implicitly, cur_cumsum[k+1] == 1-chosen_sum, although
+      // implicitly, cur_cumsum[k+1] == remaining_prob, although
       // actually we never access that element and it is not present.
 
       // class_range_begin, class_range_end, are the (first,
@@ -239,55 +271,16 @@ void iterative_sampling_kernel(
       int class_range_begin = cur_classes[i] + 1,
           class_range_end = cur_classes[i + 1];
 
-      if (!((class_range_begin >= 0 && class_range_begin < class_range_end &&
-             class_range_end <= N))) {
-        // It will be extremely rare to reach this point; it can happen due
-        // to roundoff issues.
+      assert((class_range_begin >= 0 && class_range_begin < class_range_end &&
+              class_range_end <= N));
 
-        // Will eventually delete this print statement.
-        // The 'blockidx.x % 100 == 0' part is to reduce the frequency of this message.
-        if (threadIdx.x == 0 && blockIdx.x % 100 == 0) {
-          printf("[warning:]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, class_range_begin=%d, class_range_end=%d, k=%d, i=%d, x=%g,r=%g,y=%g,r-x=%g,y-r=%g, (1-chosen_sum)-r=%g\n", blockIdx.x, threadIdx.x, threadIdx.y,
-                 class_range_begin, class_range_end, k, i,
-                 cur_cumsum[i], r, cur_cumsum[i+1], r-cur_cumsum[i], cur_cumsum[i+1]-r, (1-chosen_sum)-r);
-        }
-
-        // Find the first position i that has a nonempty set of possible classes.
-        for (int j = 0; j < k; j++) {
-          // in this loop, new_i will cover all values of i other than the one
-          // chosen above (which we know does not work), in a circle starting
-          // from (i + 1) % (k + 1).  We select the first nonempty interval
-          // after the empty interval we just chose.
-          int new_i = (i + 1 + j) % (k + 1);
-          class_range_begin = cur_classes[new_i] + 1;
-          class_range_end = cur_classes[new_i + 1];
-          if (class_range_begin < class_range_end) {
-            i = new_i;
-            // reset r using the original value of r, scaled and shifted to the
-            // interval from cur_cumsum[i] to cur_cumsum[i + 1].
-            scalar_t orig_r = rand[b][s];
-            r = cur_cumsum[i] + orig_r * (cur_cumsum[i + 1] - cur_cumsum[i]);
-            break;  // Sets i to 'new_i'
-          }
-        }
-      }
-      assert(i >= 0 && i <= k);
-      assert(class_range_begin >= 0 && class_range_begin < class_range_end &&
-             class_range_end <= N);
 
       // shift r by "adding back" the probability mass due to the subset
       // of previously chosen classes that were numbered less than
       // class_range_begin.  Now r can be compared to elements of
       // `cumsum`.
-      scalar_t class_range_begin_cumsum = cumsum_buf[class_range_begin];
-      scalar_t r_orig1 = r;
+      uint32_t class_range_begin_cumsum = cumsum_buf[class_range_begin];
       r = r - cur_cumsum[i] + class_range_begin_cumsum;
-
-      if (r - r != 0) {
-        printf("[error:cumsum=nan?]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, class_range_begin=%d, class_range_end=%d, k=%d, i=%d, class_range_begin_cumsum=%g, cur_cumsum[i]=%g, r=%g\n", blockIdx.x, threadIdx.x, threadIdx.y,
-               class_range_begin, class_range_end, k, i, class_range_begin_cumsum, cur_cumsum[i], r);
-        assert(0);
-      }
 
       int c = find_class(g, shared_int,
                          cumsum_buf,
@@ -303,14 +296,13 @@ void iterative_sampling_kernel(
         indexes_a[k] = c;
       }
 
-      scalar_t this_class_cumsum = cumsum_buf[c],
-          this_class_prob = cumsum_buf[c + 1] - this_class_cumsum;
-      scalar_t r_orig = r;  //TEMP
-      r = (r - this_class_cumsum) / this_class_prob;
-      // mathematically, r should be in [0,1]; but make sure of this in case,
-      // due to roundoff, it is just outside that interval.
-      wrap_if_outside_unit_interval(&r);
-      // We can now treat r as a "new" random value on [0,1].
+      uint32_t this_class_cumsum = cumsum_buf[c],
+          this_class_next_cumsum = cumsum_buf[c + 1],
+          this_class_prob = this_class_next_cumsum - this_class_cumsum;
+
+      remaining_prob -= this_class_prob;
+
+      r = zoom(r, r_orig, this_class_cumsum, this_class_next_cumsum, remaining_prob);
 
       {
         // This block updates cur_classes and cur_cumsum.  Normally the loop
@@ -329,17 +321,11 @@ void iterative_sampling_kernel(
           // Caution: unlike most other variables in this code, c_temp and
           // cumsum_temp have different values in different threads in the tile g.
           int32_t c_temp;
-          scalar_t cumsum_temp;
+          uint32_t cumsum_temp;
 
           if (this_k <= k + 1) {
             c_temp = cur_classes[this_k];
-            if (!(c_temp >= -1 && c_temp <= N)) {
-              printf("[failure!]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, k=%d, i=%d,class_range_begin=%d,class_range_end=%d,this_k=%d,c_temp=%d, r=%f, iter=%d\n",
-                     blockIdx.x, threadIdx.x, threadIdx.y,
-                     k, i, class_range_begin, class_range_end,
-                     this_k, c_temp, (float)r, iter);
-              assert(0);
-            }
+            assert(c_temp >= -1 && c_temp <= N);
             cumsum_temp = cur_cumsum[this_k];
           }
           g.sync();
@@ -354,22 +340,6 @@ void iterative_sampling_kernel(
           }
         }
       }
-
-      chosen_sum += this_class_prob;
-      // Reduce the random value r so that it is in the range
-      // [0..1-chosen_sum], which is the size of the reduced interval
-      // after subtracting the probability mass due to previously chosen
-      // classes.  On the next iteration, we will search within this
-      // reduced interval.
-      r = r * (1.0 - chosen_sum);
-      wrap_if_outside_unit_interval(&r);
-#if 0
-      if (blockIdx.x == 0 && threadIdx.y == 0) {
-        printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, r=%f, r_orig1=%f, r_orig=%f, chosen_sum=%f, this_class_prob=%f, this_class_cumsum=%f, class_range_begin_cumsum=%f, k=%d, i=%d, c=%d, class_range_begin=%d, class_range_end=%d\n", blockIdx.x, threadIdx.x, threadIdx.y,
-               r, r_orig1, r_orig, chosen_sum, this_class_prob, this_class_cumsum, class_range_begin_cumsum, k, i, c, class_range_begin, class_range_end);
-      }
-#endif
-
     }
   }
 }
@@ -389,14 +359,23 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 /*
   iterative_sample function, CUDA version.
 
-    cumsum: (exclusive) cumulative probabilities of input classes, of shape (B, N),
+    cumsum: (exclusive) cumulative integerized probabilities of input classes,
+        of shape (B, N),
         where B is the batch size and N is the number of classes, so element
-        cumsum[b][k] is the sum of probs[b][i] for 0 <= i < k.
-        Implicitly the final element (not present) would be 1.0.
-    rand:  random numbers uniformly distributed on [0,1], of shape (B,S), where
-         S is the number of separate sequences of samples we are choosing from
-         each distribution in `cumsum`.
-       K: length of the random sequence to draw; must satisfy 0 < K < N.
+        cumsum[b][k] is the sum of probs[b][i] for 0 <= i < k.  We require that
+        the probs be in type int32_t, and they should be converted to this by
+        multiplying by (1<<31) and then converting to int32_t.  Wrapping to
+        negative does not matter as we'll be using unsigned types in the
+        kernel.  We require that the values in `cumsum` all be distinct,
+        i.e. implicitly that all the integerized `probs` are nonzero; you can
+        apply a floor of 1 to ensure this.  This avoids problems where fewer
+        than K classes have nonzero prob.
+
+    rand:  random int32_t numbers uniformly distributed on {0..1<<31 - 1},
+        of shape (B,S), where S is the number of separate sequences of samples
+        we are choosing from each distribution in `cumsum`.
+
+      K: length of the random sequence to draw; must satisfy 0 < K < N.
 
   Returns:  Tensor of shape (B, S, K) and type torch::kInt64, containing,
             for each B, a squence of K distinct sampled integers (class
@@ -409,6 +388,9 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
                                     int K) {
   TORCH_CHECK(cumsum.dim() == 2, "cumsum must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
+  auto int32_type = torch::kInt32;
+  TORCH_CHECK(cumsum.scalar_type() == int32_type);
+  TORCH_CHECK(rand.scalar_type() == int32_type);
 
   int B = cumsum.size(0),  // batch size
       N = cumsum.size(1),  // num classes
@@ -433,10 +415,7 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
   TORCH_CHECK(cumsum.device().is_cuda() && rand.device().is_cuda(),
               "inputs must be CUDA tensors");
 
-
-  auto scalar_type = cumsum.scalar_type();  // presumably float or double
-
-  auto opts = torch::TensorOptions().dtype(scalar_type).device(cumsum.device()),
+  auto opts = torch::TensorOptions().dtype(int32_type).device(cumsum.device()),
       long_opts = torch::TensorOptions().dtype(torch::kInt64).device(cumsum.device());
 
   torch::Tensor indexes = torch::empty({B, S, K}, long_opts);
@@ -444,25 +423,17 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
   dim3 blockDim(block_dim_x, block_dim_y, 1),
         gridDim(grid_dim_x, 1, 1);
 
-  //fprintf(stderr,"block_dim_x: %d, block_dim_y: %d, grid_dim_x: %d\n", block_dim_x,
-  // block_dim_y, grid_dim_x);
-  AT_DISPATCH_FLOATING_TYPES(scalar_type, "iterative_sampling_cuda_stub", ([&] {
-        gpuErrchk(cudaGetLastError()); // TEMP
-        // scalar_t is defined by the macro AT_DISPATCH_FLOATING_TYPES, should
-        // equal scalar_type.
-        int extern_memory_bytes = ((N + 1) * sizeof(scalar_t) +
-                                   (K + 2) * S * sizeof(scalar_t) +
-                                   (K + 2) * S * sizeof(int32_t) +
-                                   S * sizeof(int32_t));
-        //        fprintf(stderr, "N = %d, K = %d, S = %d, extern_memory_bytes = %d\n", N, K, S, extern_memory_bytes);
-        // extern_memory_bytes += 1024;
+  int extern_memory_bytes = ((N + 1) * sizeof(int32_t) +
+                             (K + 2) * S * sizeof(int32_t) +
+                             (K + 2) * S * sizeof(int32_t) +
+                             S * sizeof(int32_t));
 
-        iterative_sampling_kernel<scalar_t><<<gridDim, blockDim, extern_memory_bytes>>>(
-            cumsum.packed_accessor32<scalar_t, 2>(),
-            rand.packed_accessor32<scalar_t, 2>(),
-            indexes.packed_accessor32<int64_t, 3>());
-        cudaDeviceSynchronize();  // TEMP
-        gpuErrchk(cudaGetLastError())
-            }));
+  iterative_sampling_kernel<<<gridDim, blockDim, extern_memory_bytes>>>(
+      cumsum.packed_accessor32<int32_t, 2>(),
+      rand.packed_accessor32<int32_t, 2>(),
+      indexes.packed_accessor32<int64_t, 3>());
+  cudaDeviceSynchronize();  // TEMP
+  gpuErrchk(cudaGetLastError())
+
   return indexes;
 }

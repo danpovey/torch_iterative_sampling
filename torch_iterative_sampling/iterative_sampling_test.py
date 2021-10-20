@@ -158,6 +158,7 @@ def test_iterative_sampling_train():
 
 if __name__ == "__main__":
     torch.set_printoptions(edgeitems=30)
+    torch.set_num_interop_threads(1)
     # Caution!  This is very slow, can take half an hour.
     # Some of the statistical tests require a lot of samples
     test_iterative_sampling_train()
