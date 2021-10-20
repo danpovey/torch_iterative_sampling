@@ -80,7 +80,8 @@ __forceinline__ __device__ uint32_t zoom(uint32_t r, uint32_t orig_r,
 
 */
 __forceinline__ __device__ int find_class(
-    cooperative_groups::thread_group &g, int32_t *shared_int,
+    cooperative_groups::thread_block_tile<32> &g,
+    int32_t *shared_int,
     uint32_t *cumsum, int begin, int end, uint32_t r) {
   assert(end > begin);
   int orig_begin = begin, orig_end = end;  // debug
@@ -149,10 +150,11 @@ __forceinline__ __device__ int find_class(
   Of course we have to process the 'k' index (the position in the sequence)
   sequentially.
 
-  The thread-block will be of shape  (blockDim.x, blockDim.y)
-  where blockDim.x, a power of two (e.g. 16 or 32), is the size of the
-  group of threads assigned to handle one sequence 0 <= s < S,
-  and blockDim.y equals S.
+  The thread-block will be (blockDim.x, blockDim.y, blockDim.z) = (32, X, 1) where X is 2, 4 or 8.
+  32 is the size of the  group of threads assigned to handle one sequence 0 <= s < S,
+  and blockDim.y will handle different sequences 's' in parallel.   We make
+  BLOCK_DIM_Y a template arg so we can use BlockScan.
+
 
   The grid size will be (gridDim.x <= B), and we'll iterate over the
   batch index b.
@@ -175,11 +177,13 @@ __forceinline__ __device__ int find_class(
   to be allocated, via `extern_buf`.  The size of extern_buf, in bytes, must be:
 
      (N + 1) * sizeof(uint32_t)       <-- for cumsum_buf
-     (K + 2) * S * sizeof(uint32_t)   <-- for cur_cumsum
-   + (K + 2) * S * sizeof(uint32_t)   <-- for cur_classes
-   + S * sizeof(uint32_t)             <-- for shared_int
+     (K + 2) * block_dim_y * sizeof(uint32_t)   <-- for cur_cumsum
+   + (K + 2) * block_dim_y * sizeof(uint32_t)   <-- for cur_classes
+   + block_dim_y * sizeof(uint32_t)             <-- for shared_int
 
 */
+#define BLOCK_DIM_X 32
+template <int BLOCK_DIM_Y>
 __global__
 void iterative_sampling_kernel(
     torch::PackedTensorAccessor32<int32_t, 2> cumsum,   // B, N
@@ -190,15 +194,12 @@ void iterative_sampling_kernel(
       S = indexes.size(1),
       K = indexes.size(2);
 
-  assert(S == blockDim.y);
-
   namespace cg = cooperative_groups;
-  cg::thread_group g = cg::tiled_partition(cg::this_thread_block(),
-                                           blockDim.x);
+
+  cg::thread_block_tile<32> g = cg::tiled_partition<32>(cg::this_thread_block());
 
   // each block of "blockDim.x" threads handles one 's' index (one sequence)
   int s = threadIdx.y;
-  assert(s < S);
 
   // This buffer stores 0 and then one row of `cumsum`, converted to uint32_t.
   // it is indexed 0..N; it points to __shared__ memory.
@@ -213,11 +214,11 @@ void iterative_sampling_kernel(
 
   // each block handling a different sequence s has a different 'cur_classes'
   // buffer, of size (K + 2).  This is a pointer to __shared__ memory.
-  int32_t *cur_classes = (int32_t*)((cumsum_buf + N + 1 + ((K + 2) * S)) + (K + 2) * s);
+  int32_t *cur_classes = (int32_t*)((cumsum_buf + N + 1 + ((K + 2) * BLOCK_DIM_Y)) + (K + 2) * s);
 
   // `shared_int` is a pointer to a single __shared__ integer that is shared
   // within each tile of blockDim.x threads.
-  int32_t *shared_int =  (int32_t*)((cumsum_buf + N + 1 + ((K + 2) * S)) + (K + 2) * S + s);
+  int32_t *shared_int =  (int32_t*)((cumsum_buf + N + 1 + ((K + 2) * BLOCK_DIM_Y)) + (K + 2) * BLOCK_DIM_Y + s);
 
   for (int b = blockIdx.x; b < B; b += gridDim.x) {
     // iterative_sample_cpu() in iterative_sampling_cpu.cpp may be helpful for
@@ -227,116 +228,118 @@ void iterative_sampling_kernel(
     __syncthreads();
 
     // load cumsum_buf
-    for (int n = threadIdx.x + threadIdx.y * blockDim.x; n < N;
-         n += blockDim.x * blockDim.y)
+    for (int n = threadIdx.x + threadIdx.y * BLOCK_DIM_X; n < N;
+         n += BLOCK_DIM_X * BLOCK_DIM_Y)
       cumsum_buf[n + 1] = static_cast<uint32_t>(cumsum[b][n]);
     if (threadIdx.x == 0)
       cumsum_buf[0] = 0;
 
     __syncthreads();
 
-
-    if (threadIdx.x < 2) {
-      cur_cumsum[threadIdx.x] = (threadIdx.x == 0 ? 0 : cumsum_buf[N]);
-      cur_classes[threadIdx.x] = (threadIdx.x == 0 ? -1 : N);
-    }
-    g.sync();
-
-    uint32_t r = rand[b][s],  // 0 <= rand < (1 << 31)
-        r_orig = r,
-        remaining_prob = cumsum_buf[N];
-    // at iteration k, remaining_prob contains the sum of the probabilities
-    // of classes that have not so far been chosen.
-
-
-    r = zoom(r, r, (uint32_t)0, ((uint32_t)1) << 31, remaining_prob);
-
-    auto indexes_a = indexes[b][s];
-
-    for (int k = 0; k < K; ++k) {
-      assert(r < remaining_prob);
-
-      int i = find_class(g, shared_int, cur_cumsum, 0, k + 1, r);
-      assert(i >= 0 && i <= k);
-
-      // i will now be (in all threadsin the tile), some value 0 <= i <= k, satisfying
-      // cur_cumsum[i] <= r < cur_cumsum[i+1], where,
-      // implicitly, cur_cumsum[k+1] == remaining_prob, although
-      // actually we never access that element and it is not present.
-
-      // class_range_begin, class_range_end, are the (first,
-      // one-past-the-last) class indexes of the range of classes know
-      // the k'th randomly chosen class is in.  See the comment above
-      // about the k+1 intervals.
-      int class_range_begin = cur_classes[i] + 1,
-          class_range_end = cur_classes[i + 1];
-
-      assert((class_range_begin >= 0 && class_range_begin < class_range_end &&
-              class_range_end <= N));
-
-
-      // shift r by "adding back" the probability mass due to the subset
-      // of previously chosen classes that were numbered less than
-      // class_range_begin.  Now r can be compared to elements of
-      // `cumsum`.
-      uint32_t class_range_begin_cumsum = cumsum_buf[class_range_begin];
-      r = r - cur_cumsum[i] + class_range_begin_cumsum;
-
-      int c = find_class(g, shared_int,
-                         cumsum_buf,
-                         class_range_begin,
-                         class_range_end, r);
-
-      assert(c >= class_range_begin && c < class_range_end);
-
-      // c is the class chosen, satisfying cumsum_buf[c] <= r <
-      // cumsum_buf[c+1], where implicitly cumsum_buf[N] == 1.0.
-      // It will be distinct from all previously chosen classes.
-      if (threadIdx.x == 0) {
-        indexes_a[k] = c;
+    for (int s = threadIdx.y; s < S; s += BLOCK_DIM_Y) {
+      g.sync();
+      if (threadIdx.x < 2) {
+        cur_cumsum[threadIdx.x] = (threadIdx.x == 0 ? 0 : cumsum_buf[N]);
+        cur_classes[threadIdx.x] = (threadIdx.x == 0 ? -1 : N);
       }
+      g.sync();
 
-      uint32_t this_class_cumsum = cumsum_buf[c],
-          this_class_next_cumsum = cumsum_buf[c + 1],
-          this_class_prob = this_class_next_cumsum - this_class_cumsum;
+      uint32_t r = rand[b][s],  // 0 <= rand < (1 << 31)
+          r_orig = r,
+          remaining_prob = cumsum_buf[N];
+      // at iteration k, remaining_prob contains the sum of the probabilities
+      // of classes that have not so far been chosen.
 
-      remaining_prob -= this_class_prob;
 
-      r = zoom(r, r_orig, this_class_cumsum, this_class_next_cumsum, remaining_prob);
+      r = zoom(r, r, (uint32_t)0, ((uint32_t)1) << 31, remaining_prob);
 
-      {
-        // This block updates cur_classes and cur_cumsum.  Normally the loop
-        // below will execute just once; it is a loop because we want to handle
-        // the (unusual) case where K > blockDim.x.
-        int num_threads_needed = k + 2 - i,
-            num_iters = (num_threads_needed + blockDim.x - 1) / blockDim.x;
+      auto indexes_a = indexes[b][s];
 
-        for (int iter = num_iters - 1; iter >= 0; --iter) {
-          // `this_k` covers at least [i..i+num_threads_needed-1] == [i..k+1],
-          // although we may also encounter this_k > k+1.  If it loops more than
-          // once, it will go from the higher values of `this_k` to the lower
-          // ones.
-          int this_k = i + (iter * blockDim.x) + threadIdx.x;
+      for (int k = 0; k < K; ++k) {
+        assert(r < remaining_prob);
 
-          // Caution: unlike most other variables in this code, c_temp and
-          // cumsum_temp have different values in different threads in the tile g.
-          int32_t c_temp;
-          uint32_t cumsum_temp;
+        int i = find_class(g, shared_int, cur_cumsum, 0, k + 1, r);
+        assert(i >= 0 && i <= k);
 
-          if (this_k <= k + 1) {
-            c_temp = cur_classes[this_k];
-            assert(c_temp >= -1 && c_temp <= N);
-            cumsum_temp = cur_cumsum[this_k];
-          }
-          g.sync();
-          if (this_k > i) {
+        // i will now be (in all threadsin the tile), some value 0 <= i <= k, satisfying
+        // cur_cumsum[i] <= r < cur_cumsum[i+1], where,
+        // implicitly, cur_cumsum[k+1] == remaining_prob, although
+        // actually we never access that element and it is not present.
+
+        // class_range_begin, class_range_end, are the (first,
+        // one-past-the-last) class indexes of the range of classes know
+        // the k'th randomly chosen class is in.  See the comment above
+        // about the k+1 intervals.
+        int class_range_begin = cur_classes[i] + 1,
+            class_range_end = cur_classes[i + 1];
+
+        assert((class_range_begin >= 0 && class_range_begin < class_range_end &&
+                class_range_end <= N));
+
+
+        // shift r by "adding back" the probability mass due to the subset
+        // of previously chosen classes that were numbered less than
+        // class_range_begin.  Now r can be compared to elements of
+        // `cumsum`.
+        uint32_t class_range_begin_cumsum = cumsum_buf[class_range_begin];
+        r = r - cur_cumsum[i] + class_range_begin_cumsum;
+
+        int c = find_class(g, shared_int,
+                           cumsum_buf,
+                           class_range_begin,
+                           class_range_end, r);
+
+        assert(c >= class_range_begin && c < class_range_end);
+
+        // c is the class chosen, satisfying cumsum_buf[c] <= r <
+        // cumsum_buf[c+1], where implicitly cumsum_buf[N] == 1.0.
+        // It will be distinct from all previously chosen classes.
+        if (threadIdx.x == 0) {
+          indexes_a[k] = c;
+        }
+
+        uint32_t this_class_cumsum = cumsum_buf[c],
+            this_class_next_cumsum = cumsum_buf[c + 1],
+            this_class_prob = this_class_next_cumsum - this_class_cumsum;
+
+        remaining_prob -= this_class_prob;
+
+        r = zoom(r, r_orig, this_class_cumsum, this_class_next_cumsum, remaining_prob);
+
+        {
+          // This block updates cur_classes and cur_cumsum.  Normally the loop
+          // below will execute just once; it is a loop because we want to handle
+          // the (unusual) case where K > BLOCK_DIM_X.
+          int num_threads_needed = k + 2 - i,
+              num_iters = (num_threads_needed + BLOCK_DIM_X - 1) / BLOCK_DIM_X;
+
+          for (int iter = num_iters - 1; iter >= 0; --iter) {
+            // `this_k` covers at least [i..i+num_threads_needed-1] == [i..k+1],
+            // although we may also encounter this_k > k+1.  If it loops more than
+            // once, it will go from the higher values of `this_k` to the lower
+            // ones.
+            int this_k = i + (iter * BLOCK_DIM_X) + threadIdx.x;
+
+            // Caution: unlike most other variables in this code, c_temp and
+            // cumsum_temp have different values in different threads in the tile g.
+            int32_t c_temp;
+            uint32_t cumsum_temp;
+
             if (this_k <= k + 1) {
-              cur_classes[this_k + 1] = c_temp;
-              cur_cumsum[this_k + 1] = cumsum_temp - this_class_prob;
+              c_temp = cur_classes[this_k];
+              assert(c_temp >= -1 && c_temp <= N);
+              cumsum_temp = cur_cumsum[this_k];
             }
-          } else {  // this_k == i
-            cur_classes[this_k + 1] = c;
-            cur_cumsum[this_k + 1] = cumsum_temp + (this_class_cumsum - class_range_begin_cumsum);
+            g.sync();
+            if (this_k > i) {
+              if (this_k <= k + 1) {
+                cur_classes[this_k + 1] = c_temp;
+                cur_cumsum[this_k + 1] = cumsum_temp - this_class_prob;
+              }
+            } else {  // this_k == i
+              cur_classes[this_k + 1] = c;
+              cur_cumsum[this_k + 1] = cumsum_temp + (this_class_cumsum - class_range_begin_cumsum);
+            }
           }
         }
       }
@@ -398,7 +401,6 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
 
 
   int32_t grid_dim_x = std::min<int>(B, 256),
-      block_dim_y = S,
       block_dim_x = 32;
 
   // actually block_dim_x must be 32 because for now cooperative_groups
@@ -420,18 +422,33 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
 
   torch::Tensor indexes = torch::empty({B, S, K}, long_opts);
 
+
+  int block_dim_y = (S <= 2 ? 2 : (S <= 4 ? 4 : 8));
+
   dim3 blockDim(block_dim_x, block_dim_y, 1),
         gridDim(grid_dim_x, 1, 1);
 
   int extern_memory_bytes = ((N + 1) * sizeof(int32_t) +
-                             (K + 2) * S * sizeof(int32_t) +
-                             (K + 2) * S * sizeof(int32_t) +
-                             S * sizeof(int32_t));
+                             (K + 2) * block_dim_y * sizeof(int32_t) +
+                             (K + 2) * block_dim_y * sizeof(int32_t) +
+                             block_dim_y * sizeof(int32_t));
 
-  iterative_sampling_kernel<<<gridDim, blockDim, extern_memory_bytes>>>(
-      cumsum.packed_accessor32<int32_t, 2>(),
-      rand.packed_accessor32<int32_t, 2>(),
-      indexes.packed_accessor32<int64_t, 3>());
+  if (block_dim_y == 2) {
+    iterative_sampling_kernel<2><<<gridDim, blockDim, extern_memory_bytes>>>(
+        cumsum.packed_accessor32<int32_t, 2>(),
+        rand.packed_accessor32<int32_t, 2>(),
+        indexes.packed_accessor32<int64_t, 3>());
+  } else if (block_dim_y == 4) {
+    iterative_sampling_kernel<4><<<gridDim, blockDim, extern_memory_bytes>>>(
+        cumsum.packed_accessor32<int32_t, 2>(),
+        rand.packed_accessor32<int32_t, 2>(),
+        indexes.packed_accessor32<int64_t, 3>());
+  } else {
+    iterative_sampling_kernel<8><<<gridDim, blockDim, extern_memory_bytes>>>(
+        cumsum.packed_accessor32<int32_t, 2>(),
+        rand.packed_accessor32<int32_t, 2>(),
+        indexes.packed_accessor32<int64_t, 3>());
+  }
   cudaDeviceSynchronize();  // TEMP
   gpuErrchk(cudaGetLastError())
 

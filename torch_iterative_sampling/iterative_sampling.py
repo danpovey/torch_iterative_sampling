@@ -117,6 +117,8 @@ def iterative_sample(probs: torch.Tensor,
     # torch.cumsum does not seem to suppost int32, so we convert using 'to'.
     cumsum_int32 = torch.cumsum(probs_int32, dim=-1).to(dtype=torch.int32)
     indexes = _iterative_sample_dispatcher(cumsum_int32, rand_int32, seq_len)
+    if indexes.max() > N:
+        print("indexes = ", indexes)
     indexes = indexes.view(*rest_shape, num_seqs, seq_len)
     return indexes
 
