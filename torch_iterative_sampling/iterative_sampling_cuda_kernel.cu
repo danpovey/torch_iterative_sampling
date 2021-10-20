@@ -245,8 +245,8 @@ void iterative_sampling_kernel(
         // to roundoff issues.
 
         // Will eventually delete this print statement.
-        // The 'blockidx.x % 10 == 0' part is to reduce the frequency of this message.
-        if (threadIdx.x == 0 && blockIdx.x % 10 == 0) {
+        // The 'blockidx.x % 100 == 0' part is to reduce the frequency of this message.
+        if (threadIdx.x == 0 && blockIdx.x % 100 == 0) {
           printf("[warning:]blockIdx.x=%d, threadIdx.{x,y}=%d,%d, class_range_begin=%d, class_range_end=%d, k=%d, i=%d, x=%g,r=%g,y=%g,r-x=%g,y-r=%g, (1-chosen_sum)-r=%g\n", blockIdx.x, threadIdx.x, threadIdx.y,
                  class_range_begin, class_range_end, k, i,
                  cur_cumsum[i], r, cur_cumsum[i+1], r-cur_cumsum[i], cur_cumsum[i+1]-r, (1-chosen_sum)-r);

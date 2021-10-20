@@ -32,11 +32,24 @@ def test_iterative_sampling_train():
         # the magnitude of the backpropagated gradient.  Here, the clear winder seems to be epsilon=0.001.
         #
         #
+        # below were got with a larger entropy limit of log(seq_len * 2), which ended
+        # up being an active constraint.  [Disregard these for current tuning, see below!]
         #    epsilon:                         0.01 0.001 0.0001 0.0001
         # len=16 reconstruction_loss:         0.77 0.762 0.761 0.761
         # len=8 reconstruction_loss           0.866 0.848 0.846 0.846
         # len=16 feats.grad sumsq             0.48  0.44   0.49    0.52
         # len=8 feats.grad sumsq              0.38  0.35  0.40   0.45
+        #
+        # Below were got with the current entropy limit,
+        #  epsilon:                             0.001   0.0001
+        # len=16 reconstruction_loss:           0.715  0.711
+        # len=8 reconstruction_loss             0.826  0.824
+        # len=16 feats.grad sumsq               0.727  0.9417
+        # len=8 feats.grad sumsq                0.535  0.6693
+        # len=16 final frame entropy            1.706  1.501
+        # len=8 final frame entropy             1.523  1.404
+
+
         m = SamplingBottleneckModule(dim, num_classes,
                                      seq_len=seq_len,
                                      num_discretization_levels=num_discretization_levels,
@@ -107,12 +120,14 @@ def test_iterative_sampling_train():
             # try to reconstruct the feats, after this information bottleneck.
             loss = ((feats - output) ** 2).sum() / feats.numel()
 
+            # Our limit on the frame entropy is one that's below what the model will choose in practice.
+            frame_entropy_limit = 0.5 * math.log(min(seq_len, 8)*2)
 
             if i % 500 == 0 or loss.abs() > 3.0:
                 loss_val = loss.to('cpu').item()
                 print(f"seq_len={seq_len}, minibatch={i}, reconstruction_loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f} "
                       f"class_entropy={class_entropy.to('cpu').item():.3f}, "
-                      f"frame_entropy={frame_entropy.to('cpu').item():.3f}")
+                      f"frame_entropy={frame_entropy.to('cpu').item():.3f} (limit: {frame_entropy_limit:.3f})")
                 if test_predictor:
                     print(f"class_avg_logprob={class_avg_logprob.item()}, value_avg_logprob={value_avg_logprob.item()}")
 
@@ -120,7 +135,7 @@ def test_iterative_sampling_train():
                 loss += -(class_avg_logprob + value_avg_logprob)
 
             # stop maximizing frame_entropy when it is greater than seq_len.
-            frame_entropy = torch.clamp(frame_entropy, max=(math.log(seq_len*2)))
+            frame_entropy = torch.clamp(frame_entropy, max=frame_entropy_limit)
 
             (loss  - class_entropy_scale * class_entropy - frame_entropy_scale * frame_entropy).backward()
             optim.step()
