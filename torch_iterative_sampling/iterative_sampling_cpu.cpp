@@ -4,8 +4,6 @@
 
 
 
-
-
 /*
   Return the index i into cumsum, with begin <= i < end,
   such that cumsum[i] <= r < cumsum[i + 1].
@@ -26,32 +24,9 @@ template <typename IterType> int find_class(
 }
 
 
-/*
-  Return the index i into cumsum, with begin <= i < end,
-  such that cumsum[i-1] <= r < cumsum[i].
-  We assume that cumsum[begin-1] <= r < cumsum[end-1], and we do not
-  access cumsum[begin-1] or cumsum[end-1].
-
-  This is like find_class(), but with a -1 offset on the indexes into cumsum.
-*/
-template <typename IterType> int find_class_offset(
-    IterType cumsum, int begin, int end, uint32_t r) {
-  assert(end > begin);
-  while (end > begin + 1) {
-    int mid = begin + (end - begin) / 2;
-    if (((uint32_t)cumsum[mid - 1]) <= r)
-      begin = mid;
-    else
-      end = mid;
-  }
-  return begin;
-}
-
-
-
 
 /*
-m  Zoom into an interval.  What we are trying to emulate here is something like this:
+  Zoom into an interval.  What we are trying to emulate here is something like this:
 
   float cur_begin = 0.4, cur_end = 0.6,
          r = 0.423143, end = 0.7;
@@ -118,39 +93,45 @@ inline uint32_t zoom(uint32_t r, uint32_t orig_r,
             to the differences between `cumsum` elements, but always excluding
             previously drawn classes within the current sequence.
 */
-torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,  // [B][N]
+torch::Tensor iterative_sample_cpu(torch::Tensor probs, // [B][N]
                                    torch::Tensor rand,   // [B][S]
                                    int K) {
-  TORCH_CHECK(cumsum.dim() == 2, "cumsum must be 2-dimensional");
+  TORCH_CHECK(probs.dim() == 2, "probs must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
-  auto int32_type = torch::kInt32;
-  TORCH_CHECK(cumsum.scalar_type() == int32_type);
+  auto int32_type = torch::kInt32,
+      float_type = torch::kFloat32;
+  TORCH_CHECK(probs.scalar_type() == float_type);
   TORCH_CHECK(rand.scalar_type() == int32_type);
 
-  int B = cumsum.size(0),  // batch size
-      N = cumsum.size(1),  // num classes
+  int B = probs.size(0),  // batch size
+      N = probs.size(1),  // num classes
       S = rand.size(1);    // num sequences
 
   TORCH_CHECK(K > 0 && K < N);  // K is sequence length
   TORCH_CHECK(rand.size(0) == B);
 
-  TORCH_CHECK(cumsum.device().is_cpu() && rand.device().is_cpu(),
+  TORCH_CHECK(probs.device().is_cpu() && rand.device().is_cpu(),
               "inputs must be CPU tensors");
 
-  auto long_opts = torch::TensorOptions().dtype(torch::kInt64).device(cumsum.device());
+  auto long_opts = torch::TensorOptions().dtype(torch::kInt64).device(probs.device());
 
   // TODO: make empty
   torch::Tensor indexes = torch::zeros({B, S, K}, long_opts);
 
 
-  auto cumsum_a = cumsum.packed_accessor32<int32_t, 2>(),
-      rand_a = rand.packed_accessor32<int32_t, 2>();
+  auto probs_a = probs.packed_accessor32<float, 2>();
+  auto rand_a = rand.packed_accessor32<int32_t, 2>();
   auto indexes_a = indexes.packed_accessor32<int64_t, 3>();
 
   // At iteration k, cur_classes[0] contains -1; cur_classes[1,2,..k]
   // contains the previously chosen k classes (all distinct), in sorted
   // order from least to greatest; and cur_classes[k+1] contains N.
   std::vector<int32_t> cur_classes(K + 2);
+
+  // cumsum_row contains exclusive cumumulative sum of probabilities,
+  // multiplied by (1<<31) and turned to integer, with one extra element
+  // containing the total.
+  std::vector<uint32_t> cumsum_row(N + 1);
 
   // At iteration k, cur_cumsum[c] for 0 <= c <= k contains cumulative
   // probabilities after subtracting the probability mass due to the
@@ -173,7 +154,19 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,  // [B][N]
   std::vector<uint32_t> cur_cumsum(K + 1);
 
   for (int b = 0; b < B; ++b) {
-    auto this_cumsum_a = cumsum_a[b];
+    auto this_probs_a = probs_a[b];
+
+    uint32_t tot = 0;
+    for (int n = 0; n < N; n++) {
+      cumsum_row[n] = tot;
+      // The + 1 is to ensure it's nonzero.  This is quite a bit smaller than
+      // the floating point epsilon, so we're not concerned about the bias from doing
+      // "+" instead of "max".
+      uint32_t this_prob = (uint32_t) ((((uint32_t)1) << 31) * this_probs_a[n]) + 1;
+      tot += this_prob;
+    }
+    cumsum_row[N] = tot;
+
 
     for (int s = 0; s < S; ++s) {
       auto this_indexes_a = indexes_a[b][s];
@@ -183,7 +176,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,  // [B][N]
 
       // at iteration k, remaining_prob contains the sum of the probabilities
       // of classes that have not so far been chosen.
-       uint32_t remaining_prob = this_cumsum_a[N - 1];
+       uint32_t remaining_prob = cumsum_row[N - 1];
 
       // r is a new random value on {0..1<<31-1}.   We only use one random input for
       // each random sequence; we accomplish this by "zooming in" to each interval
@@ -217,22 +210,20 @@ torch::Tensor iterative_sample_cpu(torch::Tensor cumsum,  // [B][N]
         // of previously chosen classes that were numbered less than
         // class_range_begin.  Now r can be compared to elements of
         // `cumsum`.
-        uint32_t class_range_begin_cumsum = (class_range_begin == 0 ? 0 :
-                                             this_cumsum_a[class_range_begin - 1]);
+        uint32_t class_range_begin_cumsum = cumsum_row[class_range_begin];
         r = r - cur_cumsum[i] + class_range_begin_cumsum;
 
-        int c = find_class_offset(this_cumsum_a,
-                                  class_range_begin,
-                                  class_range_end, r);
+        int c = find_class(cumsum_row,
+                           class_range_begin,
+                           class_range_end, r);
         assert(c >= class_range_begin && c < class_range_end);
 
-        // c is the class chosen, satisfying this_cumsum_a[c-1] <= r <
-        // this_cumsum_a[c], treating this_cumsum_a[-1] as 0.
-        // It will be distinct from all previously chosen classes.
+        // c is the class chosen, satisfying cumsum_row[c] <= r < cumsum_row[c +
+        // 1].  It will be distinct from all previously chosen classes.
         this_indexes_a[k] = c;
 
-        uint32_t this_class_cumsum = (c == 0 ? 0 : this_cumsum_a[c - 1]),
-            next_class_cumsum = this_cumsum_a[c],
+        uint32_t this_class_cumsum = (c == 0 ? 0 : cumsum_row[c]),
+            next_class_cumsum = cumsum_row[c + 1],
             this_class_prob = next_class_cumsum - this_class_cumsum;
 
         assert(r >= this_class_cumsum && r < next_class_cumsum);

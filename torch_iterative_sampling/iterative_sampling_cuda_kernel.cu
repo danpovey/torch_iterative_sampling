@@ -1,6 +1,17 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>  // for getCurrentCUDAStream()
-#include "cub/cub.cuh"
+
+// We have included cub as a submodule as ../cub, and added the flag "-Icub" via
+// setup.py.  This is fixed to the tag v1.8.0, since the current master gave us
+// a compilation error; the choice of v1.8.0 was very random, just "an older
+// version", hopefully old enough to be easy to compile but not so old as to be
+// significantly worse.  In general it is not OK to use cub in a torch
+// submodule, as it can lead to linking problems; however, I am hoping that
+// since we only use block-level functionality (BlockScan), and not
+// device-level, it will be used purely as a template library without causing
+// any C-language global or namespace variables to be instantiated (I think
+// those are what cause the compatibility problems with Torch).
+#include <cub/cub.cuh>
 #include <cooperative_groups.h>
 #include <cmath>  // for INFINITY
 #include <stdio.h>
@@ -163,11 +174,8 @@ __forceinline__ __device__ int find_class(
 
 
   Args:
-      cumsum:  Accessor to the inclusive cumulative sum of probabilities,
-         of shape (B, N), i.e. (batch_size, num_classes).  The probabilities
-         should be integerized to the range {0..1<<31} before being cumsum'd.
-         Note: some of them may be negative due to wrapping, but when we read
-         we'll converta to uint32 where there won't be wrapping.
+      probs:  Accessor to the probabilities,
+         of shape (B, N), i.e. (batch_size, num_classes).
 
       rand:  Accessor to a tensor of random integers, in range {0..1<<31 - 1}
           The shape if (B, S), i.e. (batch_size, num_sequences)
@@ -188,14 +196,14 @@ __forceinline__ __device__ int find_class(
 template <int BLOCK_DIM_Y>
 __global__
 void iterative_sampling_kernel(
-    torch::PackedTensorAccessor32<int32_t, 2> cumsum,   // B, N
+    torch::PackedTensorAccessor32<float, 2> probs,   // B, N
     torch::PackedTensorAccessor32<int32_t, 2> rand,     // B, S
     torch::PackedTensorAccessor32<int64_t, 3> indexes) { // B, S, K
   using BlockScan = cub::BlockScan<uint32_t, 32, cub::BLOCK_SCAN_RAKING, BLOCK_DIM_Y>;
   __shared__ typename BlockScan::TempStorage temp_storage;
 
-  const int B = cumsum.size(0),
-      N = cumsum.size(1),
+  const int B = probs.size(0),
+      N = probs.size(1),
       S = indexes.size(1),
       K = indexes.size(2);
 
@@ -233,39 +241,50 @@ void iterative_sampling_kernel(
     __syncthreads();
     int thread_xy_idx = threadIdx.x + threadIdx.y * BLOCK_DIM_X;
 
-    // load cumsum_buf
-    for (int n = thread_xy_idx; n < N;
-         n += BLOCK_DIM_X * BLOCK_DIM_Y)
-      cumsum_buf[n + 1] = static_cast<uint32_t>(cumsum[b][n]);
-    if (threadIdx.x == 0)
-      cumsum_buf[0] = 0;
+    // load probs into cumsum_buf prior to doing exclusive-sum.
+    for (int n = thread_xy_idx; n < N; n += BLOCK_DIM_X * BLOCK_DIM_Y)
+      cumsum_buf[n] = static_cast<uint32_t>((((uint32_t)1)<<31) * probs[b][n]);
+
 
     __syncthreads();
 
-    // Take diffs between cumsum_buf so we can test the exclusive scan.
-    // We are doing an exclusive-scan of size N.  The buffer has size N + 1 but we'll
-    // add the +1 afterward in a separate statement.
 
-    int items_per_thread =  N + 1 + (BLOCK_DIM_X * BLOCK_DIM_Y - 1) / BLOCK_DIM_X * BLOCK_DIM_Y;
+    {
+      // This block does the exclusive-sum of cumsum_buf.
 
-    uint32_t
-        start_idx = min(thread_xy_idx * items_per_thread, N),
-        end_idx = min((thread_xy_idx + 1) * items_per_thread, N),
-        item = cumsum_buf[end_idx] - cumsum_buf[start_idx];
+      // Because N is probably a power of 2 and going over N for the exclusive sum might be
+      // significantly wasteful, we do the exclusive sum up to N only, and treat the N'th
+      // element specially at the end of this block.
+      int items_per_thread =  N + (BLOCK_DIM_X * BLOCK_DIM_Y - 1) / BLOCK_DIM_X * BLOCK_DIM_Y;
 
-    BlockScan(temp_storage).ExclusiveSum(item, item);
-    if (!(item == cumsum_buf[start_idx] - cumsum_buf[0])) {
-      printf("Differs: item=%d, x-y=%d-%d=%d",
-             item, cumsum_buf[start_idx], cumsum_buf[0],
-             cumsum_buf[start_idx] - cumsum_buf[0]);
+      // Each thread is responsible for `items_per_thread` successive items;
+      // first compute that partial sum.
+      uint32_t start_idx = thread_xy_idx * items_per_thread,
+          this_thread_tot = 0;
+      for (int i = 0; i < items_per_thread; i++) {
+        // j ranges over the same indexes as i but in a different order; this is
+        // intended to avoid bank conflict for shared memory.
+        int j = (i + thread_xy_idx) % items_per_thread,
+            this_idx = start_idx + j;
+        if (this_idx < N)
+          this_thread_tot += cumsum_buf[this_idx];
+      }
+
+      BlockScan(temp_storage).ExclusiveSum(this_thread_tot, this_thread_tot);
+
+      // OK, now 'this_thread_tot' contains the sum of the 'this_thread_tot'
+      // values from all lower-indexed threads (i.e. those with lower
+      // thread_xy_idx).
+      int i;
+      for (i = 0; i < items_per_thread && start_idx + i < N; i++) {
+        uint32_t this_prob = cumsum_buf[start_idx + i];
+        cumsum_buf[start_idx + i] = this_thread_tot;
+        this_thread_tot += this_prob;
+      }
+      if (start_idx + i == N)
+        cumsum_buf[N] = this_thread_tot;
+      __syncthreads();
     }
-
-
-    for (int n = threadIdx.x + threadIdx.y * BLOCK_DIM_X; n < N;
-         n += BLOCK_DIM_X * BLOCK_DIM_Y)
-      cumsum_buf[n + 1] = static_cast<uint32_t>(cumsum[b][n]);
-
-
 
     for (int s = threadIdx.y; s < S; s += BLOCK_DIM_Y) {
       g.sync();
@@ -393,17 +412,10 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 /*
   iterative_sample function, CUDA version.
 
-    cumsum: (exclusive) cumulative integerized probabilities of input classes,
-        of shape (B, N),
-        where B is the batch size and N is the number of classes, so element
-        cumsum[b][k] is the sum of probs[b][i] for 0 <= i < k.  We require that
-        the probs be in type int32_t, and they should be converted to this by
-        multiplying by (1<<31) and then converting to int32_t.  Wrapping to
-        negative does not matter as we'll be using unsigned types in the
-        kernel.  We require that the values in `cumsum` all be distinct,
-        i.e. implicitly that all the integerized `probs` are nonzero; you can
-        apply a floor of 1 to ensure this.  This avoids problems where fewer
-        than K classes have nonzero prob.
+  probs: probabilities of input classes, of shape (B, N);
+        where B is the batch size and N is the number of classes;
+        must be in interval [0,1] and sum to (approximately) one.  Must be
+        of float32 type, i.e. single precision float.
 
     rand:  random int32_t numbers uniformly distributed on {0..1<<31 - 1},
         of shape (B,S), where S is the number of separate sequences of samples
@@ -417,17 +429,18 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
             to the differences between `cumsum` elements, but always excluding
             previously drawn classes within the current sequence.
 */
-torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
+torch::Tensor iterative_sample_cuda(torch::Tensor probs,
                                     torch::Tensor rand,
                                     int K) {
-  TORCH_CHECK(cumsum.dim() == 2, "cumsum must be 2-dimensional");
+  TORCH_CHECK(probs.dim() == 2, "probs must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
-  auto int32_type = torch::kInt32;
-  TORCH_CHECK(cumsum.scalar_type() == int32_type);
+  auto int32_type = torch::kInt32,
+      float_type = torch::kFloat32;
+  TORCH_CHECK(probs.scalar_type() == float_type);
   TORCH_CHECK(rand.scalar_type() == int32_type);
 
-  int B = cumsum.size(0),  // batch size
-      N = cumsum.size(1),  // num classes
+  int B = probs.size(0),  // batch size
+      N = probs.size(1),  // num classes
       S = rand.size(1);    // num sequences
 
 
@@ -445,11 +458,11 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
   TORCH_CHECK(K > 0 && K < N);  // K is sequence length
   TORCH_CHECK(rand.size(0) == B);
 
-  TORCH_CHECK(cumsum.device().is_cuda() && rand.device().is_cuda(),
+  TORCH_CHECK(probs.device().is_cuda() && rand.device().is_cuda(),
               "inputs must be CUDA tensors");
 
-  auto opts = torch::TensorOptions().dtype(int32_type).device(cumsum.device()),
-      long_opts = torch::TensorOptions().dtype(torch::kInt64).device(cumsum.device());
+  auto opts = torch::TensorOptions().dtype(int32_type).device(probs.device()),
+      long_opts = torch::TensorOptions().dtype(torch::kInt64).device(probs.device());
 
   torch::Tensor indexes = torch::empty({B, S, K}, long_opts);
 
@@ -466,17 +479,17 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
 
   if (block_dim_y == 2) {
     iterative_sampling_kernel<2><<<gridDim, blockDim, extern_memory_bytes>>>(
-        cumsum.packed_accessor32<int32_t, 2>(),
+        probs.packed_accessor32<float, 2>(),
         rand.packed_accessor32<int32_t, 2>(),
         indexes.packed_accessor32<int64_t, 3>());
   } else if (block_dim_y == 4) {
     iterative_sampling_kernel<4><<<gridDim, blockDim, extern_memory_bytes>>>(
-        cumsum.packed_accessor32<int32_t, 2>(),
+        probs.packed_accessor32<float, 2>(),
         rand.packed_accessor32<int32_t, 2>(),
         indexes.packed_accessor32<int64_t, 3>());
   } else {
     iterative_sampling_kernel<8><<<gridDim, blockDim, extern_memory_bytes>>>(
-        cumsum.packed_accessor32<int32_t, 2>(),
+        probs.packed_accessor32<float, 2>(),
         rand.packed_accessor32<int32_t, 2>(),
         indexes.packed_accessor32<int64_t, 3>());
   }

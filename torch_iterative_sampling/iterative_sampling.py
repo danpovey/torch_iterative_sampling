@@ -103,20 +103,15 @@ def iterative_sample(probs: torch.Tensor,
                   `probs`, excluding from consideration classes already sampled
                   within that sequence.
     """
+    probs = probs.to(dtype=torch.float32)
     N = probs.shape[-1]
     rest_shape = probs.shape[:-1]
     probs = probs.reshape(-1, N)
     B = probs.shape[0]
 
-    probs_int32 = (probs * (2**31)).to(torch.int32)
-    # this `clamp` may not always be necessary, actually, if the calling code has
-    # applied some kind of floor.
-    probs_int32.clamp_(min=1)
     rand_int32 = torch.randint(0, (2**31)-1, (B, num_seqs), dtype=torch.int32,
                                device=probs.device)
-    # torch.cumsum does not seem to suppost int32, so we convert using 'to'.
-    cumsum_int32 = torch.cumsum(probs_int32, dim=-1).to(dtype=torch.int32)
-    indexes = _iterative_sample_dispatcher(cumsum_int32, rand_int32, seq_len)
+    indexes = _iterative_sample_dispatcher(probs, rand_int32, seq_len)
     indexes = indexes.view(*rest_shape, num_seqs, seq_len)
     return indexes
 
