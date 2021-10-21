@@ -1,8 +1,10 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>  // for getCurrentCUDAStream()
+#include "cub/cub.cuh"
 #include <cooperative_groups.h>
 #include <cmath>  // for INFINITY
 #include <stdio.h>
+
 
 extern __shared__ char extern_buf[];
 // `extern_buf` is general-purpose shared memory.
@@ -189,6 +191,9 @@ void iterative_sampling_kernel(
     torch::PackedTensorAccessor32<int32_t, 2> cumsum,   // B, N
     torch::PackedTensorAccessor32<int32_t, 2> rand,     // B, S
     torch::PackedTensorAccessor32<int64_t, 3> indexes) { // B, S, K
+  using BlockScan = cub::BlockScan<uint32_t, 32, cub::BLOCK_SCAN_RAKING, BLOCK_DIM_Y>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
+
   const int B = cumsum.size(0),
       N = cumsum.size(1),
       S = indexes.size(1),
@@ -226,15 +231,41 @@ void iterative_sampling_kernel(
     // to CUDA.
 
     __syncthreads();
+    int thread_xy_idx = threadIdx.x + threadIdx.y * BLOCK_DIM_X;
 
     // load cumsum_buf
-    for (int n = threadIdx.x + threadIdx.y * BLOCK_DIM_X; n < N;
+    for (int n = thread_xy_idx; n < N;
          n += BLOCK_DIM_X * BLOCK_DIM_Y)
       cumsum_buf[n + 1] = static_cast<uint32_t>(cumsum[b][n]);
     if (threadIdx.x == 0)
       cumsum_buf[0] = 0;
 
     __syncthreads();
+
+    // Take diffs between cumsum_buf so we can test the exclusive scan.
+    // We are doing an exclusive-scan of size N.  The buffer has size N + 1 but we'll
+    // add the +1 afterward in a separate statement.
+
+    int items_per_thread =  N + 1 + (BLOCK_DIM_X * BLOCK_DIM_Y - 1) / BLOCK_DIM_X * BLOCK_DIM_Y;
+
+    uint32_t
+        start_idx = min(thread_xy_idx * items_per_thread, N),
+        end_idx = min((thread_xy_idx + 1) * items_per_thread, N),
+        item = cumsum_buf[end_idx] - cumsum_buf[start_idx];
+
+    BlockScan(temp_storage).ExclusiveSum(item, item);
+    if (!(item == cumsum_buf[start_idx] - cumsum_buf[0])) {
+      printf("Differs: item=%d, x-y=%d-%d=%d",
+             item, cumsum_buf[start_idx], cumsum_buf[0],
+             cumsum_buf[start_idx] - cumsum_buf[0]);
+    }
+
+
+    for (int n = threadIdx.x + threadIdx.y * BLOCK_DIM_X; n < N;
+         n += BLOCK_DIM_X * BLOCK_DIM_Y)
+      cumsum_buf[n + 1] = static_cast<uint32_t>(cumsum[b][n]);
+
+
 
     for (int s = threadIdx.y; s < S; s += BLOCK_DIM_Y) {
       g.sync();

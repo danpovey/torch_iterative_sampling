@@ -38,6 +38,7 @@ def configure_extensions():
                     os.path.join('torch_iterative_sampling', 'iterative_sampling_cuda.cpp'),
                     os.path.join('torch_iterative_sampling', 'iterative_sampling_cuda_kernel.cu'),
                 ],
+                extra_compile_args={'cxx': [], 'nvcc': ['-Icub']}
             )
         )
     except Exception as e:
