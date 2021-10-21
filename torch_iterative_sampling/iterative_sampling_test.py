@@ -22,32 +22,32 @@ def test_iterative_sampling_train():
         hidden_dim = 512
         num_classes = 512
         num_discretization_levels = 256
-        # epsilon=0.0001 is the point after which we don't see clear improvement in loss function (reconstruction_loss)
-        # after we reduce by another factor of 10.
-        # the difference in backpropagated derivative magnitude is not as large as you might expect.
-        # E.g. feats.grad elements sumsq printed below, of 0.44 with 0.001 or 0.49 with 0.0001 and 0.52 with 0.00001,
-        # for seq_len=16; or XX vs 0.35 vs 0.40 vs 0.45 for seq_len=8.  So very small epsilon does increase the
 
-        # We choose epsilon to get as good as possible reconstruction loss while also minimizing
-        # the magnitude of the backpropagated gradient.  Here, the clear winder seems to be epsilon=0.001.
-        #
-        #
-        # below were got with a larger entropy limit of log(seq_len * 2), which ended
-        # up being an active constraint.  [Disregard these for current tuning, see below!]
-        #    epsilon:                         0.01 0.001 0.0001 0.0001
-        # len=16 reconstruction_loss:         0.77 0.762 0.761 0.761
-        # len=8 reconstruction_loss           0.866 0.848 0.846 0.846
-        # len=16 feats.grad sumsq             0.48  0.44   0.49    0.52
-        # len=8 feats.grad sumsq              0.38  0.35  0.40   0.45
-        #
-        # Below were got with the current entropy limit,
-        #  epsilon:                             0.001   0.0001
-        # len=16 reconstruction_loss:           0.715  0.711
-        # len=8 reconstruction_loss             0.826  0.824
-        # len=16 feats.grad sumsq               0.727  0.9417
-        # len=8 feats.grad sumsq                0.535  0.6693
-        # len=16 final frame entropy            1.706  1.501
-        # len=8 final frame entropy             1.523  1.404
+
+        # with epsilon=0.001, the current value, selected output:
+        # seq_len=16, minibatch=19500, reconstruction_loss=0.708/valid=0.636 vs. ref_loss=0.583 class_entropy=6.223, frame_entropy=1.729 (limit: 1.386)
+        # Average sumsq of feats.grad elements is  tensor(0.7301, device='cuda:0')
+        # seq_len=8, minibatch=19500, reconstruction_loss=0.820/valid=0.771 vs. ref_loss=0.736 class_entropy=6.221, frame_entropy=1.551 (limit: 1.386)
+        # Average sumsq of feats.grad elements is  tensor(0.5470, device='cuda:0')
+        # seq_len=4, minibatch=19500, reconstruction_loss=0.896/valid=0.865 vs. ref_loss=0.844 class_entropy=6.218, frame_entropy=1.323 (limit: 1.040)
+        # Average sumsq of feats.grad elements is  tensor(0.3942, device='cuda:0')
+        # seq_len=2, minibatch=19500, reconstruction_loss=0.940/valid=0.920 vs. ref_loss=0.912 class_entropy=6.215, frame_entropy=1.016 (limit: 0.693)
+        # Average sumsq of feats.grad elements is  tensor(0.3377, device='cuda:0')
+        # seq_len=1, minibatch=19500, reconstruction_loss=0.965/valid=0.959 vs. ref_loss=0.952 class_entropy=6.203, frame_entropy=0.352 (limit: 0.347)
+        # Average sumsq of feats.grad elements is  tensor(58.5082, device='cuda:0')  <-- this is odd, maybe random.
+
+        # with epsilon=0.0001:
+        # ... loss function is a little better, but grad magnitude is maybe 20% larger.  May not be worth it.
+        # seq_len=16, minibatch=19500, reconstruction_loss=0.705/valid=0.629 vs. ref_loss=0.583 class_entropy=6.219, frame_entropy=1.521 (limit: 1.386)
+        # Average sumsq of feats.grad elements is  tensor(0.9230, device='cuda:0')
+        # seq_len=8, minibatch=19500, reconstruction_loss=0.819/valid=0.762 vs. ref_loss=0.736 class_entropy=6.219, frame_entropy=1.434 (limit: 1.386)
+        # Average sumsq of feats.grad elements is  tensor(0.6528, device='cuda:0')
+        # seq_len=4, minibatch=19500, reconstruction_loss=0.894/valid=0.861 vs. ref_loss=0.844 class_entropy=6.212, frame_entropy=1.158 (limit: 1.040)
+        # Average sumsq of feats.grad elements is  tensor(0.5022, device='cuda:0')
+        # seq_len=2, minibatch=19500, reconstruction_loss=0.937/valid=0.916 vs. ref_loss=0.912 class_entropy=6.212, frame_entropy=0.966 (limit: 0.693)
+        # Average sumsq of feats.grad elements is  tensor(0.3827, device='cuda:0')
+        # seq_len=1, minibatch=19500, reconstruction_loss=0.963/valid=0.956 vs. ref_loss=0.952 class_entropy=6.195, frame_entropy=0.346 (limit: 0.347)
+        # Average sumsq of feats.grad elements is  tensor(15.7329, device='cuda:0')
 
 
         m = SamplingBottleneckModule(dim, num_classes,
@@ -61,7 +61,7 @@ def test_iterative_sampling_train():
                                 num_discretization_levels,
                                 seq_len, hidden_dim,
                                 num_hidden_layers=1).to('cuda')
-        test_predictor = True  # can set to False for speed
+        test_predictor = False  # can set to False for speed
 
         m_tot = nn.ModuleList((m, p))
 
@@ -154,18 +154,18 @@ def test_iterative_sampling_train():
         feats = torch.randn(*feats_shape, device=device)
         feats.requires_grad = True
         output, _, _, _, class_entropy, frame_entropy = m(feats)
-        print("Average sumsq of output is ", (output ** 2).mean())
+        print("Average sumsq of output is ", (output ** 2).mean().item())
 
         output_grad = torch.randn_like(output)
         (output * output_grad).sum().backward()
-        print("Average sumsq of feats.grad elements is ", (feats.grad ** 2).mean())
+        print("Average sumsq of feats.grad elements is ", (feats.grad ** 2).mean().item())
 
         to_probs_weight = m.to_probs_softmax.weight
         to_values_weight = m.to_values_softmax.weight
         alpha = (to_values_weight * to_probs_weight).sum() / (to_probs_weight * to_probs_weight).sum()
-        print("Coeff of to_probs_weight in to_values_weight = ", alpha)
+        print("Coeff of to_probs_weight in to_values_weight = ", alpha.item())
         ratio = (((to_values_weight - to_probs_weight*alpha)**2).sum() / (to_probs_weight**2).sum()).sqrt()
-        print("Magnitude of (residual of to_values_weight) /to_probs_weight = ", ratio)
+        print("Magnitude of (residual of to_values_weight) /to_probs_weight = ", ratio.item())
 
 
 
