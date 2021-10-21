@@ -21,7 +21,7 @@ def test_iterative_sampling_train():
         dim = 256
         hidden_dim = 512
         num_classes = 512
-        num_discretization_levels = 512
+        num_discretization_levels = 256
         # epsilon=0.0001 is the point after which we don't see clear improvement in loss function (reconstruction_loss)
         # after we reduce by another factor of 10.
         # the difference in backpropagated derivative magnitude is not as large as you might expect.
@@ -61,8 +61,7 @@ def test_iterative_sampling_train():
                                 num_discretization_levels,
                                 seq_len, hidden_dim,
                                 num_hidden_layers=1).to('cuda')
-        test_predictor = False  # can set to False for speed
-
+        test_predictor = True  # can set to False for speed
 
         m_tot = nn.ModuleList((m, p))
 
@@ -123,9 +122,17 @@ def test_iterative_sampling_train():
             # Our limit on the frame entropy is one that's below what the model will choose in practice.
             frame_entropy_limit = 0.5 * math.log(min(seq_len, 8)*2)
 
-            if i % 500 == 0 or loss.abs() > 3.0:
+            if i % 500 == 0:
                 loss_val = loss.to('cpu').item()
-                print(f"seq_len={seq_len}, minibatch={i}, reconstruction_loss={loss_val:.3f} vs. ref_loss={ref_loss:.3f} "
+
+                # Also compute validation loss by putting model in eval mode.  The data is not real vs. fake, it's
+                # all random; the difference is using expectations vs. random samples.
+                m.eval()
+                output_valid = m(feats, num_seqs=num_seqs)[0]
+                loss_valid = (((feats - output_valid) ** 2).sum() / feats.numel()).item()
+                m.train()
+
+                print(f"seq_len={seq_len}, minibatch={i}, reconstruction_loss={loss_val:.3f}/valid={loss_valid:.3f} vs. ref_loss={ref_loss:.3f} "
                       f"class_entropy={class_entropy.to('cpu').item():.3f}, "
                       f"frame_entropy={frame_entropy.to('cpu').item():.3f} (limit: {frame_entropy_limit:.3f})")
                 if test_predictor:
@@ -152,6 +159,13 @@ def test_iterative_sampling_train():
         output_grad = torch.randn_like(output)
         (output * output_grad).sum().backward()
         print("Average sumsq of feats.grad elements is ", (feats.grad ** 2).mean())
+
+        to_probs_weight = m.to_probs_softmax.weight
+        to_values_weight = m.to_values_softmax.weight
+        alpha = (to_values_weight * to_probs_weight).sum() / (to_probs_weight * to_probs_weight).sum()
+        print("Coeff of to_probs_weight in to_values_weight = ", alpha)
+        ratio = (((to_values_weight - to_probs_weight*alpha)**2).sum() / (to_probs_weight**2).sum()).sqrt()
+        print("Magnitude of (residual of to_values_weight) /to_probs_weight = ", ratio)
 
 
 

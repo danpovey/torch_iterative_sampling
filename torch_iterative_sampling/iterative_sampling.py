@@ -9,7 +9,6 @@ from torch.utils.cpp_extension import load
 
 VERBOSE = True
 
-
 def _resolve(name):
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), name)
 
@@ -207,6 +206,10 @@ class PredictorInputParams(nn.Module):
         class_present_embedding_cumsum = torch.cumsum(class_present_embedding, dim=-2)
 
         selected_values = value_indexes * (1.0 / (self.num_discretization_levels - 1))  # (*, S, K)
+        selected_values = selected_values ** 2
+
+        #if random.random() < 0.01:
+        # print("selected_values = ", selected_values)
 
         # class_value_embedding will be of shape (*, S, K, N).  Caution: this could be on
         # the large size if S*K is large, memory might be an issue.
@@ -667,8 +670,9 @@ def discretize_values(values: Tensor,
                       num_discretization_levels: int) -> Tuple[Tensor, Tensor]:
     """
     Pseudo-randomly discretize an input tensor, whose elements must be in the
-    interval [0,1], into a fixed number of levels, e.g. 128.  The pseudo-random
-    part has to do with rounding.
+    interval [0,1], into a fixed number of levels, e.g. 128.  Does this by
+    taking sqrt, multiplying by (num_discretization_levels-1), adding
+    random value in [0,1), and rounding to int.
 
     Args:
        values: a Tensor of arbitrary shape
@@ -686,9 +690,12 @@ def discretize_values(values: Tensor,
     # in half precision, so we use an assert for now (otherwise we'd later get
     # an error in a scatter kernel)
     assert values.dtype != torch.float16
+    orig_values = values
+    values = values.sqrt()
     indexes = (values * (num_discretization_levels - 1) + 0.999*torch.rand_like(values)).to(dtype=torch.long)
     ans = indexes * (1.0 / (num_discretization_levels - 1))
-    y = _WithGradOf.apply(ans, values)
+    ans = ans ** 2
+    y = _WithGradOf.apply(ans, orig_values)
     return y, indexes
 
 
@@ -737,12 +744,11 @@ class SamplingBottleneckModule(nn.Module):
         # We assume there is a layer-norm just prior to this module, so we don't
         # include layer norm on the input.
 
-        # to_both_softmax is a linear projection that will go to a softmax to
-        # the probs and values
-        self.to_both_softmax = nn.Linear(dim, num_classes, bias=False)
-        # the output of to_values_softmax gets added to the output of to_both_softmax,
-        # and it becomes the values (so the values are not just copies of the probs).
-        # This would be zero if probs == values, we initialize it to zero.
+        # to_probs_softmax is a linear projection that will go to a softmax to
+        # the probs
+        self.to_probs_softmax = nn.Linear(dim, num_classes, bias=False)
+        # to_values_softmax is a linear projection that will go to a softmax to
+        # the values.
         self.to_values_softmax = nn.Linear(dim, num_classes, bias=False)
 
 
@@ -800,8 +806,8 @@ class SamplingBottleneckModule(nn.Module):
         # probabilities of sampling different classes on each iteration of sampling.
         # (Not the same as the marginal probabilities).
         x = x * self.input_scale
-        probs = self.to_both_softmax(x)
-        values = probs + self.to_values_softmax(x)
+        probs = self.to_probs_softmax(x)
+        values = self.to_values_softmax(x)
 
         probs = torch.softmax(probs, dim=-1)
 
