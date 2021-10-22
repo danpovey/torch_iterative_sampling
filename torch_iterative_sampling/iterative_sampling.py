@@ -747,18 +747,12 @@ class SamplingBottleneckModule(nn.Module):
         # to_probs_softmax is a linear projection that will go to a softmax to
         # the probs
         self.to_probs_softmax = nn.Linear(dim, num_classes, bias=False)
-        # to_values_softmax is a linear projection that will go to a softmax to
-        # the values.
-        self.to_values_softmax = nn.Linear(dim, num_classes, bias=False)
-
+        # The output of to_prob_softmax is multiplied by 'to_values_scale' and
+        # is treated as 'values'.
+        self.to_values_scale = nn.Parameter(torch.Tensor([0.13]))
 
         self.to_output = nn.Linear(num_classes, dim, bias=False)
         self.layer_norm = nn.LayerNorm(dim)
-
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        nn.init.constant_(self.to_values_softmax.weight, 0.)
 
     def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
@@ -807,7 +801,7 @@ class SamplingBottleneckModule(nn.Module):
         # (Not the same as the marginal probabilities).
         x = x * self.input_scale
         probs = self.to_probs_softmax(x)
-        values = self.to_values_softmax(x)
+        values = probs * self.to_values_scale
 
         probs = torch.softmax(probs, dim=-1)
 
@@ -839,18 +833,20 @@ class SamplingBottleneckModule(nn.Module):
         values_expanded = values.unsqueeze(-2).expand(*probs.shape[:-1], num_seqs, N)
         chosen_values = torch.gather(values_expanded, dim=-1, index=class_indexes)
 
-        # discrete_values and value_indexes have shape (*, S, K)
-        discrete_values, value_indexes = discretize_values(chosen_values,
-                                                           self.num_discretization_levels)
+        # _ and value_indexes have shape (*, S, K)
+        _, value_indexes = discretize_values(chosen_values,
+                                             self.num_discretization_levels)
 
         # discrete_actual_values has shape (*, N), it is just the input `values`
         # discretized.
-        discrete_actual_values, _ = discretize_values(values,
-                                                      self.num_discretization_levels)
+        if self.training:
+            discrete_actual_values, _ = discretize_values(values,
+                                                          self.num_discretization_levels)
+        else:
+            # in eval mode, don't use the discretized values, use the real
+            # values, which is less noisy.
+            discrete_actual_values = values
 
-        if not self.training:
-            # in eval mode, don't use the discretized values.
-            discrete_values = values
 
         class_indexes_0 = class_indexes.select(dim=-2, index=0)
         mask = torch.zeros_like(values)

@@ -23,7 +23,6 @@ def test_iterative_sampling_train():
         num_classes = 512
         num_discretization_levels = 256
 
-
         # with epsilon=0.001, the current value, selected output:
         # seq_len=16, minibatch=19500, reconstruction_loss=0.708/valid=0.636 vs. ref_loss=0.583 class_entropy=6.223, frame_entropy=1.729 (limit: 1.386)
         # Average sumsq of feats.grad elements is  tensor(0.7301, device='cuda:0')
@@ -120,7 +119,7 @@ def test_iterative_sampling_train():
             loss = ((feats - output) ** 2).sum() / feats.numel()
 
             # Our limit on the frame entropy is one that's below what the model will choose in practice.
-            frame_entropy_limit = 0.5 * math.log(min(seq_len, 8)*2)
+            frame_entropy_limit = 0.5 * math.log(min(seq_len, 8)*1.2)
 
             if i % 500 == 0:
                 loss_val = loss.to('cpu').item()
@@ -159,13 +158,9 @@ def test_iterative_sampling_train():
         output_grad = torch.randn_like(output)
         (output * output_grad).sum().backward()
         print("Average sumsq of feats.grad elements is ", (feats.grad ** 2).mean().item())
-
-        to_probs_weight = m.to_probs_softmax.weight
-        to_values_weight = m.to_values_softmax.weight
-        alpha = (to_values_weight * to_probs_weight).sum() / (to_probs_weight * to_probs_weight).sum()
-        print("Coeff of to_probs_weight in to_values_weight = ", alpha.item())
-        ratio = (((to_values_weight - to_probs_weight*alpha)**2).sum() / (to_probs_weight**2).sum()).sqrt()
-        print("Magnitude of (residual of to_values_weight) /to_probs_weight = ", ratio.item())
+        # to_values_scale is, after training, always in the interval [0.129..0.132], except for seq_len=1
+        # when it is in [0.5..0.7]
+        print("to_values_scale is ", m.to_values_scale.item())
 
 
 
