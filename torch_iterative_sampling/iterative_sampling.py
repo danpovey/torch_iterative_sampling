@@ -690,12 +690,10 @@ def discretize_values(values: Tensor,
     # in half precision, so we use an assert for now (otherwise we'd later get
     # an error in a scatter kernel)
     assert values.dtype != torch.float16
-    orig_values = values
-    values = values.sqrt()
-    indexes = (values * (num_discretization_levels - 1) + 0.999*torch.rand_like(values)).to(dtype=torch.long)
+    indexes = (values.sqrt() * (num_discretization_levels - 1) + 0.999*torch.rand_like(values)).to(dtype=torch.long)
     ans = indexes * (1.0 / (num_discretization_levels - 1))
     ans = ans ** 2
-    y = _WithGradOf.apply(ans, orig_values)
+    y = _WithGradOf.apply(ans, values)
     return y, indexes
 
 
@@ -748,10 +746,10 @@ class SamplingBottleneckModule(nn.Module):
         # the probs
         self.to_probs_softmax = nn.Linear(dim, num_classes, bias=False)
         # The output of to_prob_softmax is multiplied by 'to_values_scale' and
-        # is treated as 'values'.
+        # is treated as 'values'.  Caution: this may not be stable with SGD optimizer,
+        # as one parameter does too much work.
         self.to_values_scale = nn.Parameter(torch.Tensor([0.13]))
 
-        self.to_output = nn.Linear(num_classes, dim, bias=False)
         self.layer_norm = nn.LayerNorm(dim)
 
     def forward(self, x: Tensor, num_seqs: int = 1) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -858,7 +856,9 @@ class SamplingBottleneckModule(nn.Module):
         y = parameterized_dropout(marginals, mask, discrete_actual_values,
                                   random_rate=random_rate,
                                   epsilon=self.epsilon)
-        y = self.to_output(y)
+
+        y = torch.matmul(y, self.to_probs_softmax.weight)
+
         y = self.layer_norm(y)
 
         return y, probs, class_indexes, value_indexes, class_entropy, frame_entropy

@@ -19,7 +19,15 @@ def test_iterative_sampling_train():
         print(f"Running test_iterative_sampling_train: seq_len={seq_len}")
         device = torch.device('cuda')
         dim = 256
+
         hidden_dim = 512
+
+        # Note on how reconstruction_loss varies with num_classes: with dim = 256, and seq_len=16,
+        # when num_classes is {128, 256, 512, 1024, 2048, 4096}, the reconstruction_loss is:
+        #     {0.815, 0.758, 0.710, 0.696, 0.678, 0.665}.
+        # ... so roughly, the loss decreases quite fast until the num_classes is about twice the
+        # dim, and then starts to decrease more slowly.  So our recommendation for num_classes
+        # will probably be 2*dim.
         num_classes = 512
         num_discretization_levels = 256
 
@@ -96,7 +104,7 @@ def test_iterative_sampling_train():
         # still fails because there are correlations arising from multiplication by the
         # known point a_i.
 
-        for i in range(20000):
+        for i in range(10000):
 
             feats = torch.randn(*feats_shape, device=device)
 
@@ -161,6 +169,7 @@ def test_iterative_sampling_train():
         # to_values_scale is, after training, always in the interval [0.129..0.132], except for seq_len=1
         # when it is in [0.5..0.7]
         print("to_values_scale is ", m.to_values_scale.item())
+
 
 
 
