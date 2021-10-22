@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 import os
+import pathlib
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
-
 
 with open('requirements.txt') as f:
     requirements = f.read().splitlines()
@@ -31,6 +31,8 @@ def configure_extensions():
         )
     ]
     try:
+        # this_dir is the directory where this setup.py is located.
+        this_dir = pathlib.Path(__file__).parent.resolve()
         out.append(
             CUDAExtension(
                 'torch_iterative_sampling_cuda',
@@ -38,7 +40,7 @@ def configure_extensions():
                     os.path.join('torch_iterative_sampling', 'iterative_sampling_cuda.cpp'),
                     os.path.join('torch_iterative_sampling', 'iterative_sampling_cuda_kernel.cu'),
                 ],
-                extra_compile_args={'cxx': [], 'nvcc': ['-Icub']}
+                extra_compile_args={'cxx': [], 'nvcc': [f'-I{this_dir}/cub']}
             )
         )
     except Exception as e:
