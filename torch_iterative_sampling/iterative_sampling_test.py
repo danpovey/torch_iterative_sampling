@@ -68,7 +68,9 @@ def test_iterative_sampling_train():
                                 num_discretization_levels,
                                 seq_len, hidden_dim,
                                 num_hidden_layers=1).to('cuda')
-        test_predictor = False  # can set to False for speed
+
+        test_predictor = True  # can set to False for speed
+        predictor_sees_input = False  # can try either here.. shows different things.
 
         m_tot = nn.ModuleList((m, p))
 
@@ -111,12 +113,15 @@ def test_iterative_sampling_train():
             num_seqs = 2
             output, probs, class_indexes, value_indexes, class_entropy, frame_entropy = m(feats, num_seqs=num_seqs)
 
-            # the base_predictor is zero because all frames are independent in
-            # this test, there is nothing can meaningfully use to predict them.
-            #base_predictor = torch.zeros(*feats.shape[:-1], predictor_dim, device=device)
-            base_predictor = feats.detach()
 
             if test_predictor:
+                if predictor_sees_input:
+                    base_predictor = feats.detach()
+                else:
+                    # the base_predictor is zero because all frames are independent in
+                    # this test, there is nothing can meaningfully use to predict them.
+                    base_predictor = torch.zeros(*feats.shape[:-1], predictor_dim, device=device)
+
                 # class_logprobs, value_logprobs have shape equal to feats.shape[:-1]
                 class_logprobs, value_logprobs = p(probs, class_indexes, value_indexes, base_predictor)
                 assert class_logprobs.shape == feats.shape[:-1]
