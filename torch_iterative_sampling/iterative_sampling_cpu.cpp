@@ -176,7 +176,7 @@ torch::Tensor iterative_sample_cpu(torch::Tensor probs, // [B][N]
 
       // at iteration k, remaining_prob contains the sum of the probabilities
       // of classes that have not so far been chosen.
-       uint32_t remaining_prob = cumsum_row[N - 1];
+      uint32_t remaining_prob = cumsum_row[N];
 
       // r is a new random value on {0..1<<31-1}.   We only use one random input for
       // each random sequence; we accomplish this by "zooming in" to each interval

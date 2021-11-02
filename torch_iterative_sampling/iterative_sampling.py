@@ -95,11 +95,10 @@ def iterative_sample(probs: torch.Tensor,
        num_seqs:  The number of parallel sequences to sample; must be > 0.
        seq_len:   The length of the sequences of sample; must be strictly between
                   9 and N.
-       Returns:
-                  Returns a LongTensor of shape (*, S, K), containing the sampled
-                  indexes, with elements in the range [0..N-1].  Each element
-                  of each sequence is sampled with probability proportional to
-                  `probs`, excluding from consideration classes already sampled
+       Returns:   a LongTensor of shape (*, num_seqs, seq_len), containing
+                  the sampled indexes, with elements in the range [0..N-1].  Each
+                  element of each sequence is sampled with probability proportional
+                  to `probs`, excluding from consideration classes already sampled
                   within that sequence.
     """
     probs = probs.to(dtype=torch.float32)
@@ -981,13 +980,11 @@ def compute_normalizer(x: Tensor, K: int) -> Tensor:
     alpha = torch.empty(alpha_shape, device=x.device, dtype=x.dtype).fill_(K)
 
 
-    print(f"x = {x}")
     for i in range(3):
         exp = torch.exp(-alpha.unsqueeze(-1) * x)
         err = exp.sum(dim=-1) + (K - N)
         minus_d = (exp * x).sum(dim=-1)
         alpha += err / minus_d
-        print(f"Iter {i}, alpha={alpha}, exp={exp}, err={err}, minus_d={minus_d}")
         # d2/d(alpha2) of LHS is:
         #  d1 = \sum_{i=0}^{N-1} x_i^2 exp(-alpha * x_i)
     return alpha

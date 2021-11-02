@@ -242,8 +242,12 @@ void iterative_sampling_kernel(
     int thread_xy_idx = threadIdx.x + threadIdx.y * BLOCK_DIM_X;
 
     // load probs into cumsum_buf prior to doing exclusive-sum.
-    for (int n = thread_xy_idx; n < N; n += BLOCK_DIM_X * BLOCK_DIM_Y)
-      cumsum_buf[n] = static_cast<uint32_t>((((uint32_t)1)<<31) * probs[b][n]);
+    for (int n = thread_xy_idx; n < N; n += BLOCK_DIM_X * BLOCK_DIM_Y) {
+      // The + 1 is to ensure it's nonzero.  This is quite a bit smaller than
+      // the floating point epsilon, so we're not concerned about the bias from
+      // doing "+" instead of "max".
+      cumsum_buf[n] = static_cast<uint32_t>((((uint32_t)1)<<31) * probs[b][n]) + 1;
+    }
 
 
     __syncthreads();
