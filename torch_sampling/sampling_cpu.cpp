@@ -72,7 +72,7 @@ inline uint32_t zoom(uint32_t r, uint32_t orig_r,
 
 
 /*
-  iterative_sample function.
+  sample function.
 
     cumsum: (inclusive) cumulative probabilities of input classes, of shape (B, N),
         where B is the batch size and N is the number of classes, so element
@@ -93,7 +93,7 @@ inline uint32_t zoom(uint32_t r, uint32_t orig_r,
             to the differences between `cumsum` elements, but always excluding
             previously drawn classes within the current sequence.
 */
-torch::Tensor iterative_sample_cpu(torch::Tensor probs, // [B][N]
+torch::Tensor sample_cpu(torch::Tensor probs, // [B][N]
                                    torch::Tensor rand,   // [B][S]
                                    int K) {
   TORCH_CHECK(probs.dim() == 2, "probs must be 2-dimensional");
@@ -258,5 +258,5 @@ torch::Tensor iterative_sample_cpu(torch::Tensor probs, // [B][N]
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("iterative_sample_cpu", &iterative_sample_cpu, "Iterative sampling function (CPU)");
+  m.def("sample_cpu", &sample_cpu, "Iterative sampling function (CPU)");
 }

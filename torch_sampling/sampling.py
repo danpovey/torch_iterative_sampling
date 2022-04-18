@@ -14,31 +14,31 @@ def _resolve(name):
 
 
 try:
-    import torch_iterative_sampling_cpu
+    import torch_sampling_cpu
 except ImportError:
     if VERBOSE:
-        print('Falling back to JIT compiling torch_iterative_sampling_cpu')
-    torch_iterative_sampling_cpu = load(
-        name='torch_iterative_sampling_cpu',
+        print('Falling back to JIT compiling torch_sampling_cpu')
+    torch_sampling_cpu = load(
+        name='torch_sampling_cpu',
         sources=[
-            _resolve('iterative_sampling_cpu.cpp'),
+            _resolve('sampling_cpu.cpp'),
         ],
         verbose=VERBOSE,
     )
 
 
 try:
-    import torch_iterative_sampling_cuda
+    import torch_sampling_cuda
 except ImportError:
     if VERBOSE:
-        print('Falling back to JIT compiling torch_iterative_sampling_cuda')
-    torch_iterative_sampling_cuda = None
+        print('Falling back to JIT compiling torch_sampling_cuda')
+    torch_sampling_cuda = None
     if torch.cuda.is_available():
-        torch_iterative_sampling_cuda = load(
-            name='torch_iterative_sampling_cuda',
+        torch_sampling_cuda = load(
+            name='torch_sampling_cuda',
             sources=[
-                _resolve('iterative_sampling_cuda.cpp'),
-                _resolve('iterative_sampling_cuda_kernel.cu'),
+                _resolve('sampling_cuda.cpp'),
+                _resolve('sampling_cuda_kernel.cu'),
             ],
             verbose=VERBOSE,
         )
@@ -46,7 +46,7 @@ except ImportError:
 
 
 
-def _iterative_sample_dispatcher(
+def _sample_dispatcher(
         cumsum: torch.Tensor,
         rand: torch.Tensor,
         seq_len: int) -> torch.Tensor:
@@ -54,12 +54,12 @@ def _iterative_sample_dispatcher(
     Dispatcher for iterative
     """
     if cumsum.is_cuda:
-        if torch_iterative_sampling_cuda is None:
+        if torch_sampling_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
-        return torch_iterative_sampling_cuda.iterative_sample_cuda(
+        return torch_sampling_cuda.sample_cuda(
             cumsum, rand, seq_len)
     else:
-        return torch_iterative_sampling_cpu.iterative_sample_cpu(
+        return torch_sampling_cpu.sample_cpu(
             cumsum, rand, seq_len)
 
 
@@ -79,7 +79,7 @@ def ensure_nonzero(probs: torch.Tensor) -> torch.Tensor:
                 9.8e-04)) # <-- assume float16, if supported.
     return (probs * (1-N*epsilon)) + epsilon
 
-def iterative_sample(probs: torch.Tensor,
+def sample(probs: torch.Tensor,
                      num_seqs: int,
                      seq_len: int,
 ) -> torch.Tensor:
@@ -109,7 +109,7 @@ def iterative_sample(probs: torch.Tensor,
 
     rand_int32 = torch.randint(0, (2**31)-1, (B, num_seqs), dtype=torch.int32,
                                device=probs.device)
-    indexes = _iterative_sample_dispatcher(probs, rand_int32, seq_len)
+    indexes = _sample_dispatcher(probs, rand_int32, seq_len)
     indexes = indexes.view(*rest_shape, num_seqs, seq_len)
     return indexes
 
@@ -821,7 +821,7 @@ class SamplingBottleneckModule(nn.Module):
         marginals = compute_marginals(probs, self.seq_len)
 
         # indexes shape is (*, S, K)
-        class_indexes = iterative_sample(probs, num_seqs=num_seqs,
+        class_indexes = sample(probs, num_seqs=num_seqs,
                                          seq_len=self.seq_len)
 
 
@@ -1053,7 +1053,7 @@ def _test_discretize_values():
 
 def _test_sampling_bottleneck():
     # just makes sure the forward function runs without crashing.
-    # There is more extensive testing of this, including training in iterative_sampling_test.py
+    # There is more extensive testing of this, including training in sampling_test.py
     dim = 256
     num_classes = 512
     num_discretization_levels = 128
@@ -1112,7 +1112,7 @@ def _compare_seen_expected_products(a: Tensor, b: Tensor, a_name: str = "seen", 
     assert abs(err) < threshold
 
 
-def _test_iterative_sample():
+def _test_sample():
     for device in 'cpu', 'cuda':
         print("device=", device)
         device = torch.device(device)
@@ -1124,7 +1124,7 @@ def _test_iterative_sample():
         num_seqs = random.randint(1, 8)
 
         seq_len = random.randint(5, 15)
-        indexes = iterative_sample(probs, num_seqs=num_seqs, seq_len=seq_len)
+        indexes = sample(probs, num_seqs=num_seqs, seq_len=seq_len)
         #print("indexes = ", indexes)
 
         indexes_0 = indexes[:,0,:]  # take 1st sequence.
@@ -1231,7 +1231,7 @@ def _test_parameterized_dropout():
                                                 threshold=threshold)
 
 if __name__ == '__main__':
-    _test_iterative_sample()
+    _test_sample()
     _test_sampling_bottleneck()
     _test_parameterized_dropout()
     _test_get_derivative_scales()

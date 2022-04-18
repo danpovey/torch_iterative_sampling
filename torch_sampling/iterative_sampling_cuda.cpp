@@ -2,7 +2,7 @@
 
 
 /*
-  iterative_sample function, CUDA version.
+  sample function, CUDA version.
 
     cumsum: (exclusive) cumulative integerized probabilities of input classes,
         of shape (B, N),
@@ -28,7 +28,7 @@
             to the differences between `cumsum` elements, but always excluding
             previously drawn classes within the current sequence.
 */
-torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
+torch::Tensor sample_cuda(torch::Tensor cumsum,
                                     torch::Tensor rand,
                                     int K);
 
@@ -36,5 +36,5 @@ torch::Tensor iterative_sample_cuda(torch::Tensor cumsum,
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("iterative_sample_cuda", &iterative_sample_cuda, "Iterative sampling function (CUDA)");
+  m.def("sample_cuda", &sample_cuda, "Iterative sampling function (CUDA)");
 }

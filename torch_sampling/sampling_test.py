@@ -2,7 +2,7 @@ import math
 import random
 import torch
 from torch import nn
-from torch_iterative_sampling import SamplingBottleneckModule, BottleneckPredictor
+from torch_sampling import SamplingBottleneckModule, BottleneckPredictor
 from typing import List
 
 
@@ -14,9 +14,9 @@ from typing import List
 # seq_len=1, minibatch=19500, loss=0.965 vs. ref_loss=0.965, ref_loss_shannon=0.952 class_entropy=6.205, frame_entropy=0.671
 
 
-def test_iterative_sampling_train():
+def test_sampling_train():
     for seq_len in 16, 8, 4, 2, 1:
-        print(f"Running test_iterative_sampling_train: seq_len={seq_len}")
+        print(f"Running test_sampling_train: seq_len={seq_len}")
         device = torch.device('cuda')
         dim = 256
 
@@ -184,5 +184,5 @@ if __name__ == "__main__":
     torch.set_num_interop_threads(1)
     # Caution!  This is very slow, can take half an hour.
     # Some of the statistical tests require a lot of samples
-    test_iterative_sampling_train()
+    test_sampling_train()
     print("Done")

@@ -155,7 +155,7 @@ __forceinline__ __device__ int find_class(
 
 
 /*
-  kernel for iterative_sampling.
+  kernel for sampling.
 
   One kernel handles one batch index (b) of 'cumsum', including all 's' indexes
   i.e. all sequences that correspond to that batch index.  As s gets larger
@@ -195,7 +195,7 @@ __forceinline__ __device__ int find_class(
 #define BLOCK_DIM_X 32
 template <int BLOCK_DIM_Y>
 __global__
-void iterative_sampling_kernel(
+void sampling_kernel(
     torch::PackedTensorAccessor32<float, 2> probs,   // B, N
     torch::PackedTensorAccessor32<int32_t, 2> rand,     // B, S
     torch::PackedTensorAccessor32<int64_t, 3> indexes) { // B, S, K
@@ -234,7 +234,7 @@ void iterative_sampling_kernel(
   int32_t *shared_int =  (int32_t*)((cumsum_buf + N + 1 + ((K + 2) * BLOCK_DIM_Y)) + (K + 2) * BLOCK_DIM_Y + s);
 
   for (int b = blockIdx.x; b < B; b += gridDim.x) {
-    // iterative_sample_cpu() in iterative_sampling_cpu.cpp may be helpful for
+    // sample_cpu() in sampling_cpu.cpp may be helpful for
     // understanding this code.  This is essentially a translation of that code
     // to CUDA.
 
@@ -414,7 +414,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 
 /*
-  iterative_sample function, CUDA version.
+  sample function, CUDA version.
 
   probs: probabilities of input classes, of shape (B, N);
         where B is the batch size and N is the number of classes;
@@ -433,7 +433,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
             to the differences between `cumsum` elements, but always excluding
             previously drawn classes within the current sequence.
 */
-torch::Tensor iterative_sample_cuda(torch::Tensor probs,
+torch::Tensor sample_cuda(torch::Tensor probs,
                                     torch::Tensor rand,
                                     int K) {
   TORCH_CHECK(probs.dim() == 2, "probs must be 2-dimensional");
@@ -482,17 +482,17 @@ torch::Tensor iterative_sample_cuda(torch::Tensor probs,
                              block_dim_y * sizeof(int32_t));
 
   if (block_dim_y == 2) {
-    iterative_sampling_kernel<2><<<gridDim, blockDim, extern_memory_bytes>>>(
+    sampling_kernel<2><<<gridDim, blockDim, extern_memory_bytes>>>(
         probs.packed_accessor32<float, 2>(),
         rand.packed_accessor32<int32_t, 2>(),
         indexes.packed_accessor32<int64_t, 3>());
   } else if (block_dim_y == 4) {
-    iterative_sampling_kernel<4><<<gridDim, blockDim, extern_memory_bytes>>>(
+    sampling_kernel<4><<<gridDim, blockDim, extern_memory_bytes>>>(
         probs.packed_accessor32<float, 2>(),
         rand.packed_accessor32<int32_t, 2>(),
         indexes.packed_accessor32<int64_t, 3>());
   } else {
-    iterative_sampling_kernel<8><<<gridDim, blockDim, extern_memory_bytes>>>(
+    sampling_kernel<8><<<gridDim, blockDim, extern_memory_bytes>>>(
         probs.packed_accessor32<float, 2>(),
         rand.packed_accessor32<int32_t, 2>(),
         indexes.packed_accessor32<int64_t, 3>());
