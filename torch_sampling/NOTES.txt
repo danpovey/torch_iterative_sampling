@@ -1,0 +1,315 @@
+
+Some notes on what we are implementing.
+This is a sampling operation intended for use in an efficient "memory-bank lookup" operation for neural nets.
+(the memory bank is part of the neural net's parameters).
+
+Here's an example of how we can fairly efficiently access a large memory bank.
+
+
+Defining some example numbers:
+ M (e.g. = 128): size of each softmax  [we require that this must be a power of 2, for
+                                        implementation reasons to do with RandomReorder(),
+                                        see below.]
+ N (e.g. = 2): number of softmaxes; should be >1 but quite small, because the
+               "memory bank" has M^N entries, each of size D.
+ K (e.g. = 4): first number of samples
+ L (e.g. = 4): second number of samples
+ D : feature dimension at output of memory lookup, e.g. 256.
+
+
+Memory-bank operation:
+  The minimal input -- the smallest unit of lookup-- would be a tensor of size (N, M), e.g.
+  (2, 128).  We interpret this as 2 logits of dimension 128; we put that through a softmax
+  and interpret the result as a distribution (one that happens to factorize) over
+  size 128 x 128.
+
+  The memory bank itself is of shape (128 * 128) x D, interpreted as (128 * 128) slots containing
+  D-dimensional vectors.  The output of the memory-bank operation is a weighted sum over the slots.
+  The reason we can make this efficient, is we compute this weighted sum using a sampling
+  operation.  Rather than just sampling with probability proportional to the softmax outputs,
+  we sample in a way that always give distinct outputs; and the outputs have weights attached,
+  it's set up in such a way that the expected output weights [taking into account the probability
+  of each slot appearing] are equal to the weights from the softmax.  We do "straight-through"
+  derivative computation, which would be valid if the loss-function were linear in the
+  memory-bank output; we can make an argument that this is valid for large enough number of
+  samples (i.e. as K and L become large).
+
+  # Below is the un-sampled, softmax-only form of the memory-bank operation
+  # (here specialized for N = 2).  We will later sample this.
+
+  input: logits                     #  shape (N, M) e.g. (2, 128)
+  input: memory_bank                # shape  (M**N, D) e.g. (16384, 256).
+  softmax = logits.softmax(dim=1)  # shape (N, M)
+  joint_softmax = softmax[0].reshape(128, 1) * softmax[1].reshape(1, 128).reshape(128*128)
+  ans = (memory_bank * joint_softmax.unisqueeze(1)).sum(0)  # shape (D,), e.g. (256,)
+  return ans
+
+
+  # Below is the "sampled" form of this operation:
+  inputs:
+
+  def access_memory(
+    probs,  # shape (N, M) e.g. (2, 128), of floats in [0..1], sum to one.
+    alpha,  # 0 < alpha < 1, e.g. alpha = 0.01
+    K,      # e.g. K = 4, number to subsample
+    memory,
+   ):
+    (i, weight) = JointSample(probs, alpha, K) # i,weight each of shape: (N, K), e.g. (2, 4)
+
+    (i2, weight2) = CombineWeights(i, weight, dim=0)  # i2, weight2 each of shape: (K**N), e.g. 16
+
+
+
+
+    (i2, y2) =
+
+    memory_bank # shape (M**N, D) e.g. (16384, 256).
+
+
+
+======================
+
+Joint-sampling operation:
+
+ The random function:
+
+   (i, y) = JointSample(p, eps, K)
+
+ accepts an input p vector
+ of M probabilities that sum to one, and samples from it a sparse vector
+ with exactly 0 < K < M nonzero elements, while preserving expectations:
+ i.e., E[JointSample(p)] == q, where q is the smoothed version of p.
+
+ This sparse vector is represented as the nonzero indexes i and the values y.
+
+ Assume that the input is a vector p_i, 0 <= i < M, such that
+    0 <= p_i <= 1
+ and
+   \sum_i p_i = 1.
+ The answer will be:
+    n_i, 0 <= i < K, are K distinct integers 0 <= n_0 < n_1 < n_2 < ... < n_{i-1} < M.
+    y_i, 0 <= y_i <= 1, are "weights" on the outputs that sum to one, i.e.
+          \sum_{i=0}^{K-1} y_i = 1.   Our only requirements on the y_i is that
+ our sampling operation preserve expectations.  Let Reconstruct(n, q) be the
+ operation that constructs a M-dimensional vector from n and q; then our only hard
+ requirement is that if
+     n, y = JointSample(p, eps, K)
+ then
+    E[Reconstruct(n, q)] == q
+ where q == (1-eps)p + ones_like(p)*eps/M, with the expectation taken over the internal
+ randomness of the JointSample operation.
+
+ In addition, we would like the JointSample() operation to produce output that is
+ low-variance in some sense.  For now we'll just describe our chosen method, which is based on
+ "systematic sampling"*, without much discussion of optimality.
+
+ * see: "On the theory of Systematic Sampling" by Madow & Madow, https://www.jstor.org/stable/2236209
+
+ 0 < eps << 1 is the amount of probability mass to allocate equally (regardless
+ of probability) when choosing the samples / doing the importance sampling; this
+ is provided to avoid edge cases where <K elements have nonzero prob.
+ We insist that eps >
+ 0 to simplify the code, so we have to handle fewer edge cases.  K is the number
+ of specified elements in the sparse answer.
+
+ OK, define:
+    q = (1-eps) p + eps/M.
+ .. q is the modified vector of probabilties that will dictate the sampling probabilities.
+ Next, define the "inclusion probabilities" r as follows:
+
+    r = min(1, \beta q)
+
+ where \beta is chosen such that sum(r) = K.  See ComputeInclusionProbabilities() for
+ how this is done.  Now, "r" are values 0 <= r_i <= 1 that sum to K, that represent
+ the probability of each symbol being included in the sample.
+
+ The sampling process will look like this overall:
+
+    t = random integer in {0,1,..(M/2)-1}
+    \hat{r} = Reorder(r, t)
+    i = ScheduledSample(\hat{r})  # i is a list of integers i_0, i_1, i_{K-1}, with 0 <= i_k < M.
+    j = InverseReorderIndexes(i, M, t)
+
+    y_k =  p_{i_k} / r_{i_k}  # y = y_k, 0 <= k < K.
+                              # This is importance sampling: divide by
+                              # the probability of sampling it.
+    return (i, y)             # interpret this as a sparse vector.  For correctness in terms
+                              # of the answer having the same expected value as p, we only require
+                              # that the sampling probabilities r are always nonzero if p is nonzero.
+
+ The Reorder() operation and the associated InverseReorderIndexes() operation are included
+ to add extra randomness-- because the ScheduledSample function, while it gives the correct
+ inclusion probabilities, cannot ouptput all possible combinations of input symbols.
+ However, Reorder() does not allow all possible permutations-- only a subset that happens to
+ be easy to implement.  So this whole procedure may lead to very slightly larger-than-necessary
+ correlations between inclusion-probabilities of different symbols.
+
+=========
+Backprop for function JointSample(p, eps, K)
+The function returns (i, y) which are both vectors of length K, of type int and real.
+
+For the backprop we need to cache the beta from the forward pass, the inputs p and eps,
+and i and y.  In backprop we can recompute:
+   q = (1-eps) p + eps/M.
+   r = min(1, \beta q)
+We are provided y_grad.  The backprop consists of:
+  p_grad = zeros_like(p)
+  p_grad[i] = y_grad * y / p[i],
+with the [i] interpreted as vector indexing in PyTorch; or, more mathematically, writing it
+element by element, it would be:
+  p_grad[i[k]] = y_grad[k] * y[k] / p[i[k]]
+for 0 <= k < K.  The justification for this is that the forward pass can be interpreted
+as follows:
+  Let
+     z =      a random vector whose expected value is [1, 1, 1, 1... ], whose precise
+              distribution depends on the input p.
+     Y = p z  [where y is the sparse vector with indexes i and specified elements y].
+Then the backprop for this is clearly just: p_grad = Y_grad z, which can be implemented
+as: p_grad = Y / p.  In expectation over z, this backprop rule is equivalent to just:
+p_grad = Y_grad, which is what we want.  Notice that this backprop rule is different
+from what we'd get if we just naively backpropped the individual instructions; in that
+case we'd zero gradient for those elements with inclusion probability 1, and larger
+gradients for the others.  This would not be correct in expectation, because we'd
+be failing to account for the changes in inclusion probability.
+
+==========
+
+
+
+
+
+=========
+ Function Reorder(x, t):
+    x is a vector of length M, with M a power of 2.
+    t is an integer in {0, 1, ..., M/2 - 1}.
+
+  Return a vector y of length M, such that y_i = x_{(i*(2t + 1)) % M}.
+
+  This relies on the fact that, because M is a power of 2, multiplying by an odd number
+  modulo M is a bijective function.
+==========
+ Function InverseReorderIndexes(j, M, t):
+    j is a list of integers of length K, with elements in {0, 1, ..., M-1}
+    t is an integer in {0, 1, ... M/2 - 1}.
+
+  The goal here is to compute the function inverse of:
+        j = (i*(2t + 1)) % M}.
+  We can compute this by doing:
+       s = ((2t + 1) ** (M/2 - 1)) % M
+  which, practically, speaking, we can implement as:
+       s = compute_inverse(M, 2t+1)
+  with compute_inverse as defined below.
+     i_k = (j_k * s) % M
+  return i
+
+ s can be computed as follows:
+
+def compute_inverse(M, u):
+    # returns the inverse of u modulo M, if u is coprime to M
+    m = 2
+    ss = u
+    s = u
+    while m < M:
+       ss = (ss * ss) % M
+       s = (s * ss) % M
+       m *= 2
+    return s
+
+ InverseReorderIndexes() relies on the fact that an inverse modulo M
+ of an integer j that is coprime to M, can be obtained as:
+     j ** (\phi(M) - 1) % M
+ where \phi(M) is Euler's totient function, which equals M/2 if M is a
+ power of 2.
+ InverseReorderIndexes() might be a little slow to compute, and in fact I propose to
+ use a caching mechanism to avoid this.
+===========
+Function ComputeInclusionProbabilities(p):
+
+ Given a vector of nonzero probabilities 0 <= p <= 1 of size M (that sum
+ to one), and an integer 1 < K < M, return r where:
+    r = min(1, \beta p)
+ and sum(r) = K.  (This implicitly defines \beta).
+
+   Here is how to compute beta:
+ - First, let q = sorted(p, reverse=True), i.e. sort the elements of p in
+   decreasing order.
+ - Next, compute the exclusive-sum of elements of p, as s, so that:
+     s_i = \sum_{j=0}^{i-1} p_i.
+
+ The number of elements n of p such that beta p_i >= 1 is going to satisfy
+ 0 <= n < K (it cannot be K or more because we know that elements of p are
+ all greater than zero, so if n == K, there is extra probability mass
+ from the other elements and sum(r) > K).
+
+ So for one n in [0,1,..K-1], we are going to be able to satisfy sum(r) = K,
+ with exactly n points having r_i == 1.  We can try them one by one.
+
+ Define \beta_n, with 0 <= n < K, as the \beta value if n points have
+ r_i == 1 and the remaining (M-n) points have r_i <= 1.
+
+ Then the constraint that sum(r) = K can be expressed as:
+    n + \beta_n (1 - s_i) = K,
+ so:
+    \beta_n = (K - n) / (1 - s_i).
+ If this n is an admissible value of n, we will have:
+     p_n \beta_n <= 1, and:
+     (n == 0 or p_{n-1} \beta_n >= 1)
+ This condition must be true for at least one n in {0,1,..K-1}, and it doesn't
+ matter which one we choose because \beta_n will be the same.  So in summary,
+ we set \beta = \beta_n for the n which the above two conditions hold, and
+ then simply return
+   r = min(1, \beta q)
+
+================================
+
+Function ScheduledSample(p, K)
+
+ - p is a nonnegative vector of size M, containing inclusion-probabilities 0 < p_i <= 1,
+   such that sum(p) \simeq K (to within, say, 0.001).
+
+   Because we'll be relying on exact arithmetic, we will convert these probabilities to
+   integers before computing the exclusive-sum.
+
+
+ - set T = (2**31 / K)
+ - Compute q_i = (uint32) (p_i * T).
+ - Compute c_i as the inclusive sum of q_i, so that c_i = \sum_{j=0}^i q_i.  c_{M-1} will
+   have a value quite close to 2**31.
+
+ - Let O = (c_{M-1} >= 2**31 ? T  : c_{M-1} % T).  This is close to
+   the "integerized" value of 1, i.e. close to T but possibly with a slight
+   correction to avoid overflow.
+
+   Pick a random number 0 <= r <= O-1.  The returned indexes will be the K indexes
+   i such that one of: {r, r+O, .., r+(K-1)O} is within {c_i, c_i + 1, ..., c_{i+1} - 1}.
+   For each i, we can do:
+     k1 = (c_i - r) / O
+     k2 = (c_{i+1} - r) / O
+     if k1 >= 0 && k1 != k2:
+        ans[t] = k1
+   and then "ans" will contain the K indexes required.  This code will work whether division
+   rounds down or toward zero.
+
+
+
+
+ - Let O = c_{M-1} / K (rounding down).    O is the integerized v
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+================
