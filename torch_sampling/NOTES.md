@@ -2,33 +2,30 @@
  # Some notes on knowledge-bank lookup
 
 This is a sampling operation intended for use in an efficient "knowledge-bank
-lookup" operation for neural nets.  The knowledg bank is part of the neural
+lookup" operation for neural nets.  The knowledge bank is part of the neural
 net's parameters; we avoid using the term "memory" because "memory" generally
 refers to previous items in a stream rather than model parameters.
 
-Here's an example of how we can fairly efficiently access a large knowledge bank.
 
 
+Defining some dimensions with example numbers:
 
- ## Defining some dimensions with example numbers:
-
- M (e.g. 128): size of each softmax input used to access
-           the knowledge bank (must be a power of 2, for implementation
-           reasons to do with RandomReorder() see below
- N (e.g. 2): number of softmaxes; should be >1 but quite small, e.g. 2, 3 or 4,
-           because the  "knowledge bank" has M^N entries, each of size D.
- K (e.g. 4): first number of samples
- L (e.g. 4): second number of samples
- D (e.g. 256): feature dimension at output of knowledge lookup
+ - M (e.g. 128): size of each softmax input used to access
+   the knowledge bank (must be a power of 2, for implementation
+   reasons to do with RandomReorder() see below
+ - N (e.g. 2): number of softmaxes; should be >1 but quite small, e.g. 2, 3 or 4,
+   because the  "knowledge bank" has M^N entries, each of size D.
+ - K (e.g. 4): first number of samples
+ - L (e.g. 4): second number of samples
+ - D (e.g. 256): feature dimension at output of knowledge lookup
 
 
   ## Knowledge-bank operation:
 
-  The input would be a tensor of size (*, N, M), e.g.  (*, 2, 128), where "*" might be the
-  sequence or batch dimension.  This is to be interpreted, for each lookup operation,
+  The input would be a tensor of size `(*, N, M)`, e.g. `(*, 2, 128)`, where `*` might be the
+  sequence or batch dimension or dimensions.  This is to be interpreted, for each lookup operation,
   as 2 normalized probabilities or log-probabilities of dimension 128.  For exposition
-  purposes, assume the input represents probabilities.
-
+  purposes, assume the input represents probabilities, not log-probs.
 
   We interpret this as 2 logits of dimension 128; we put that through a softmax
   and interpret the result as a distribution (one that happens to factorize) over
