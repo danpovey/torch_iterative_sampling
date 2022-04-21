@@ -293,7 +293,7 @@ Defining some dimensions with example numbers:
 </code>
 
 
-## ComputeBeta function [implementation version]:
+## ComputeBeta function [practical version]:
 
 <code>
   def compute_beta(P, K):
@@ -302,23 +302,22 @@ Defining some dimensions with example numbers:
     # We return an integer B representing (2**31 / beta), satisfying:
     #   K B <= sum(min(B, P)) < K (B+1)
 
-    R = sorted(P)  # sort in increasing order
+    R = sorted(P)  # sort in ascending order
     Q = inclusive_sum(R)  # Q[i] = sum_{j=0}^i R[i]
     for k in 0,1,...K-1, in any order:
       # B_k is the value of B if k indexes take the l.h.s. of the "min" expression in min(B, P)
-      B_k = (Q[M-1-i]  + K - k - 1) / (K - k)   # the "+ K - k - 1" is to ensure we round up
-      if R[M-1-k] >= B_k and P[I-2-k] <= B_k:
+      B_k = Q[M-1-k] // (K - k)   # round down
+      if (k==0 or R[M-k] >= B_k) and R[M-1-k] <= B_k:
          return B_k
 </code>
 
 
 
-## SoftSample function, implementation version [forward]
+## SoftSample function, practical version [forward]
 
 
  We will be doing the internal computation in finite precision arithmetic, because
  roundoff issues would otherwise be a problem for the algorithm.
-
 
  If input_is_log==True, we assume that the input is *normalized* log-probs,
  e.g. the output of log_softmax.  This option is there so that we can
@@ -333,7 +332,7 @@ Defining some dimensions with example numbers:
      # compute unsigned int32 integerized version of p, rounding
      # up (think of this as first adding epsilon=2**-31 to p)
      M = len(p)
-     P = floor(exp(p)*(2**31) + 1)
+     P = floor(p*(2**31) + 1)
      B = compute_beta(P, K)   # [practical version].  B == (2**31 / beta), beta as in (eqn:1)
      inv_beta = float(B) / float(2**31)   # this is 1/beta
      t = a random integer in {0,1,..,M/2-1}
@@ -382,7 +381,7 @@ Defining some dimensions with example numbers:
  So the total of `y` is s_k + (1 - s_k) = 1.
 
 
- ## SoftSample function, implementation version [backward/backprop]:
+ ## SoftSample function, practical version [backward/backprop]:
 
   The forward function was:
 <code>
