@@ -1,203 +1,214 @@
 
-Some notes on what we are implementing.  This is a sampling operation intended
-for use in an efficient "memory-bank lookup" operation for neural nets.  (the
-memory bank is part of the neural net's parameters).
+ # Some notes on knowledge-bank lookup
 
-Here's an example of how we can fairly efficiently access a large memory bank.
+This is a sampling operation intended for use in an efficient "knowledge-bank
+lookup" operation for neural nets.  The knowledg bank is part of the neural
+net's parameters; we avoid using the term "memory" because "memory" generally
+refers to previous items in a stream rather than model parameters.
 
-Defining some example numbers:
- M (e.g. = 128): size of each softmax  [we require that this must be a power of 2, for
-                                        implementation reasons to do with RandomReorder(),
-                                        see below.]
- N (e.g. = 2): number of softmaxes; should be >1 but quite small, because the
-               "memory bank" has M^N entries, each of size D.
- K (e.g. = 4): first number of samples
- L (e.g. = 4): second number of samples
- D : feature dimension at output of memory lookup, e.g. 256.
+Here's an example of how we can fairly efficiently access a large knowledge bank.
 
 
-Memory-bank operation:
-  The minimal input -- the smallest unit of lookup-- would be a tensor of size (N, M), e.g.
-  (2, 128).  We interpret this as 2 logits of dimension 128; we put that through a softmax
+
+ ## Defining some dimensions with example numbers:
+
+ M (e.g. 128): size of each softmax input used to access
+           the knowledge bank (must be a power of 2, for implementation
+           reasons to do with RandomReorder() see below
+ N (e.g. 2): number of softmaxes; should be >1 but quite small, e.g. 2, 3 or 4,
+           because the  "knowledge bank" has M^N entries, each of size D.
+ K (e.g. 4): first number of samples
+ L (e.g. 4): second number of samples
+ D (e.g. 256): feature dimension at output of knowledge lookup
+
+
+  ## Knowledge-bank operation:
+
+  The input would be a tensor of size (*, N, M), e.g.  (*, 2, 128), where "*" might be the
+  sequence or batch dimension.  This is to be interpreted, for each lookup operation,
+  as 2 normalized probabilities or log-probabilities of dimension 128.  For exposition
+  purposes, assume the input represents probabilities.
+
+
+  We interpret this as 2 logits of dimension 128; we put that through a softmax
   and interpret the result as a distribution (one that happens to factorize) over
   size 128 x 128.
 
-  The memory bank itself is of shape (128 * 128) x D, interpreted as (128 * 128) slots containing
-  D-dimensional vectors.  The output of the memory-bank operation is a weighted sum over the slots.
-  The reason we can make this efficient, is we compute this weighted sum using a sampling
-  operation.  Rather than just sampling with probability proportional to the softmax outputs,
-  we sample in a way that always give distinct outputs; and the outputs have weights attached,
-  it's set up in such a way that the expected output weights [taking into account the probability
-  of each slot appearing] are equal to the weights from the softmax.  We do "straight-through"
-  derivative computation, which would be valid if the loss-function were linear in the
-  memory-bank output; we can make an argument that this is valid for large enough number of
-  samples (i.e. as K and L become large).
+  The knowledge bank itself is of shape (M**N) x D, e.g. (128*128) x 256,
+  interpreted as (M**N) slots each containing a D-dimensional embedding.  The
+  output of the knowledge-bank operation is a weighted sum over the slots.  We
+  can make this efficient by using a weighted sampling operation to take the
+  sum over a very small subset of slots (L slots).
 
-  # Below is the un-sampled, softmax-only form of the memory-bank operation
-  # (here specialized for N = 2).  We will later sample this.
-
-  input: logits                     #  shape (N, M) e.g. (2, 128)
-  input: memory_bank                # shape  (M**N, D) e.g. (16384, 256).
-  softmax = logits.softmax(dim=1)  # shape (N, M)
-  joint_softmax = softmax[0].reshape(128, 1) * softmax[1].reshape(1, 128).reshape(128*128)
-  ans = (memory_bank * joint_softmax.unisqueeze(1)).sum(0)  # shape (D,), e.g. (256,)
-  return ans
+  In order to minimize the variance of the sampling operation, rather than just
+  taking L independent samples we sample in a way that always give distinct
+  outputs, and the outputs have weights attached.  This is done in such a way
+  that the expected output weights are equal to the weights from the softmax.
 
 
-  # Below is the "sampled" form of this operation:
-  inputs:
+  ### Un-sampled knowledge-bank lookup
 
-  def access_memory(
-    probs,  # shape (N, M) e.g. (2, 128), of floats in [0..1], sum to one.
-    K,      # e.g. K = 4, number to subsample
-    memory,
+  Below is the un-sampled, softmax-only form of the knowledge-bank operation
+  (here specialized for N = 2).  We will later sample this.
+
+<code>
+  def access_knowledge_unsampled(
+    probs,  # Tensor of shape (*, N, M) e.g. (99, 2, 128), of floats in [0..1]; probs.sum(-1)==1.0
+    knowledge, # Shape: (M**N, D)
+  ):
+    joint_probs = probs[0].reshape(128, 1) * probs[1].reshape(1, 128).reshape(128*128)
+    ans = (knowledge_bank * joint_probs.unsqueeze(1)).sum(-2)  # shape (*, D,), e.g. (99, 256,)
+    return ans
+</code>
+
+ ## Sampled knowledge-bank lookup
+
+<code>
+  def access_knowledge_sampled(
+    probs,  # Tensor of shape (*, N, M) e.g. (99, 2, 128), of floats in [0..1]; probs.sum(-1)==1.0
+    K,      # e.g. K = 4, first num-samples
+    L,      # e.g. L = 4, second num-samples
+    knowledge, # Shape: (M**N, D)
    ):
-    (i, weight) = SoftSample(probs, K)  # i,weight each of shape: (N, K), e.g. (2, 4)
+    M = probs.shape[-1]
+    (i, weight) = SoftSample(probs, K)  # i,weight each of shape: (*, N, K), e.g. (99, 2, 4)
+    (i2, weight2) = CombineWeights(i, weight, M)  # i2, weight2 each of shape: (*, K**N), e.g. (99, 16),
+                                                  # i2 has elements in [0..M**N - 1]
+    (i3, weight3) = SoftSample(weight2, L)  # i3, weight3 each of shape: (*, L), e.g. (99, 4),
+                                            # i3 has elements in [0.. K**N - 1]
+    (i4, weight4) = (i2[i3]  , weight3)     # i4, weight4 each of shape: (*, L), e.g. (99, 4)
+                                            # i4 has elements in [0.. M**N - 1]
 
-   (i2, weight2) = CombineWeights(i, weight, dim=0)  # i2, weight2 each of shape: (K**N), e.g. 16
-
-   (i3, weight3) = SoftSample(weight2, K)
-
-   i = i2[i3]
-   # final sparse vector is formed by i, weight3.
-
-   return (memory[i] * weight3).sum()
+    return (knowledge[i4] * weight4.unsqueeze(-1)).sum(dim=-2) # shape: (*, D), e.g. (99, 256)
+<code>
 
 
 
 
-======================
+ ## SoftSample function, mathematical version
 
-Joint-sampling operation:
+ (i, y) = SoftSample(p, K)
 
- The random function:
+  Inputs:
+     p: a vector of shape (*, M) of probabilities 0 <= p <= 1 that sum to 1 along the
+        M dimension, with at least K nonzero elements along the M dimension
+        [we'll relax the nonzero-element requirement by an epsilon, in the
+        practical version.]
+     K: an integer with 0 < K < M
 
-   (i, y) = SoftSample(p, K)
 
- accepts an input vector p of M probabilities that sum to (approximatley) one,
- and samples from it a sparse vector with exactly 0 < K < M nonzero elements,
- while preserving expectations: i.e., E[SoftSample(p)] == q, where q is the
- smoothed version of p.  In addition the sparse vector that is output will
- also sum to one.
+ Returns: (i, y), which together represent a sparse output of shape (*, M):
+   i: a tensor of int of shape (*, K), of integers in [0..M-1], which will
+      be unique along the K dimension.
+   y: a tensor of shape (*, K), of floats in [0..1], which will sum to
+      one along the K dimension.
 
- This sparse vector is represented as the nonzero indexes i and the values y,
- both of shape (K,).
-
- Assume that the input is a vector p_i, 0 <= i < M, such that
-    0 <= p_i <= 1
- and
-   \sum_i p_i \simeq 1, e.g. within 0.01.
-
- The output is a sparse vector represented as:
-    i_k, 0 <= k < K, are K distinct integers 0 <= n_0 < n_1 < n_2 < ... < n_{i-1} < M.
-    y_k, 0 <= y_i <= 1, are "weights" on the outputs that sum to one, i.e.
-          \sum_{i=0}^{K-1} y_i = 1.
-
- Our only requirements on the y_i is that
- our sampling operation preserve expectations.  Let Reconstruct(n, q) be the
- operation that constructs a M-dimensional vector from i and y; then our only hard
- requirement is that if
-     n, y = SoftSample(p, K)
- then
-    E[Reconstruct(n, q)] = q
- with the expectation taken over the internal randomness of the SoftSample operation.
+   This function will preserve expectations, i.e., E[SoftSample(p)] == p,
+   when viewing the output as a sparse tensor of shape (*, M).
 
  In addition, we would like the SoftSample() operation to produce output that is
- low-variance in some sense.  For now we'll just describe our chosen method, which is based on
- "systematic sampling"*, without much discussion of optimality.  I believe it is optimal
- though.
+ low-variance in some sense.  For now we'll just describe our chosen method,
+ which is based on "systematic sampling"*, without much discussion of
+ optimality.  I believe it is optimal though, at least when we only consider the diagonal
+ of the variance matrix.
 
  * see: "On the theory of Systematic Sampling" by Madow & Madow, https://www.jstor.org/stable/2236209
 
+ The code will be for just a single sampling operation, i.e. assuming (*) is just the empty shape (,).
+<code>
+   # We first need to compute "inclusion probabilities" r such that:
+   #   r = min(1, \beta p)          (eqn:1)
+   # where \beta is chosen such that sum(r) = K.  See ComputeBeta() [mathematical version] for
+   # how this is done.
+   beta = ComputeBeta(p, K)  # beta: float
+   r = min(1, p * beta)   # r: tensor of inclusion probabilities of shape (M,) with sum(r) == K
+   t = random integer in {0,1,..(M/2)-1}
+   s = 2*t + 1  # s is random in {1,3,5,..M-1}
+   rr = Reorder(r, s)
+   j = ScheduledSample(rr, K)  # j is a list of integers j_0, j_1, j_{K-1}, with 0 <= j_k < M.
+   i = InverseReorderIndexes(j, M, s)
 
- Mathematically, assuming at least K elements of p are nonzer, we want to
- compute "inclusion probabilities" r such that:
-    r = min(1, \beta p)          (eqn:1)
- where \beta is chosen such that sum(r) = K.  See ComputeInclusionProbabilities() for
- how this is done.  Now, "r" are values 0 <= r_i <= 1 that sum to K, that represent
- the probability of each symbol being included in the sample.
-
- The sampling process will look like this overall:
-
-    t = random integer in {0,1,..(M/2)-1}
-    \hat{r} = Reorder(r, t)
-    i = ScheduledSample(\hat{r})  # i is a list of integers i_0, i_1, i_{K-1}, with 0 <= i_k < M.
-    j = InverseReorderIndexes(i, M, t)
-
-    y_k =  p_{i_k} / r_{i_k}  # y = y_k, 0 <= k < K.
-                              # This is importance sampling: divide by
-                              # the probability of sampling it.
-    return (i, y)             # interpret this as a sparse vector.  For correctness in terms
-                              # of the answer having the same expected value as p, we only require
-                              # that the sampling probabilities r are always nonzero if p is nonzero.
-
- The Reorder() operation and the associated InverseReorderIndexes() operation are included
- to add extra randomness-- because the ScheduledSample function, while it gives the correct
- inclusion probabilities, cannot ouptput all possible combinations of input symbols.
- However, Reorder() does not allow all possible permutations-- only a subset that happens to
- be easy to implement.  So this whole procedure may lead to very slightly larger-than-necessary
- correlations between inclusion-probabilities of different symbols.
-
-=========
-Backprop for function SoftSample(p, K)
-The function returns (i, y) which are both vectors of length K, of type int and real.
-
-For the backprop we need to cache the beta from the forward pass, the input p,
-and outputs i and y.  In backprop we can recompute:
-   r = min(1, \beta p)
-We are provided y_grad.  The backprop consists of:
-  p_grad = zeros_like(p)
-  p_grad[i] = y_grad * y / p[i],
-with the [i] interpreted as vector indexing in PyTorch; or, more mathematically, writing it
-element by element, it would be:
-  p_grad[i[k]] = y_grad[k] * y[k] / p[i[k]]
-for 0 <= k < K.  The justification for this is that the forward pass can be interpreted
-as follows:
-  Let
-     z =      a random vector whose expected value is [1, 1, 1, 1... ], whose precise
-              distribution depends on the input p.
-     Y = p z  [where y is the sparse vector with indexes i and specified elements y].
-Then the backprop for this is clearly just: p_grad = Y_grad z, which can be implemented
-as: p_grad = Y / p.  In expectation over z, this backprop rule is equivalent to just:
-p_grad = Y_grad, which is what we want.  Notice that this backprop rule is different
-from what we'd get if we just naively backpropped the individual instructions; in that
-case we'd zero gradient for those elements with inclusion probability 1, and larger
-gradients for the others.  This would not be correct in expectation, because we'd
-be failing to account for the changes in inclusion probability.
-
-==========
+   # divide by inclusion probability (like importance sampling)
+   y = p[i] / r[i]
+   return (i, y)
+ <code>
 
 
+ Reorder() and InverseReorderIndexes() operation are included to add extra
+ randomness-- because the ScheduledSample function, while it gives the correct
+ inclusion probabilities, cannot ouptput all possible combinations of input
+ symbols.  Reorder() does not allow all possible permutations-- only a subset
+ that happens to be easy to implement.  So this whole procedure may lead to very
+ slightly larger-than-necessary correlations between inclusion-probabilities of
+ different symbols.
 
+================================
 
+ ## ScheduledSampled function [mathematical version]
 
-=========
- Function Reorder(x, t):
+[See: "On the theory of Systematic Sampling" by Madow & Madow, https://www.jstor.org/stable/2236209]
+
+<code>
+  ScheduledSample(p, K):
+    # p is a nonnegative vector of size M, containing inclusion-probabilities
+    # 0 < p_i <= 1, such that sum(p) == K, with at least K nonzero elements
+
+    # Compute s_i, 0 <= i <= M, as the exclusive sum of p_i, so that
+    #  s_i = \sum_{j=0}^{i-1} p_i.
+    s = exclusive_sum(p)
+
+    select a uniformly distributed real number 0 <= r < 1
+    let i be a vector of size K
+    for each k in {0,1,..K-1}:
+      set i[k] to the index j in {0,1,...,M-1} such that s_j <= r+k < s_{j+1}
+    return i
+</code>
+
+ ## Reorder() function:
+
+  y = Reorder(x, s):
+
     x is a vector of length M, with M a power of 2.
-    t is an integer in {0, 1, ..., M/2 - 1}.
+    s is a random integer in {1, 3, ..., M/2 - 1}
 
-  Return a vector y of length M, such that y_i = x_{(i*(2t + 1)) % M}.
+  For 0 <= i < M:
+    y[i] = x[(i*s) % M]
 
-  This relies on the fact that, because M is a power of 2, multiplying by an odd number
-  modulo M is a bijective function.
-==========
- Function InverseReorderIndexes(j, M, t):
+ This function relies on the fact that, because M is a power of 2, multiplying
+ by an odd number modulo M is a bijective function.
+
+
+ ## InverseReorderIndexes() function
+
+  i = InverseReorderIndexes(j, M, s):
+
+  The goal here is to compute the function-inverse of j = (i*s) % M, i.e.
+  solve for i in this equation.
+
+<code>
+ i = InverseReorderIndexes(j, M, s)
+    M is a power of 2
     j is a list of integers of length K, with elements in {0, 1, ..., M-1}
-    t is an integer in {0, 1, ... M/2 - 1}.
+    s is an integer in {1,3,5,...,M-1}.
 
-  The goal here is to compute the function inverse of:
-        j = (i*(2t + 1)) % M}.
-  We can compute this by doing:
-       s = ((2t + 1) ** (M/2 - 1)) % M
-  which, practically, speaking, we can implement as:
-       s = compute_inverse(M, 2t+1)
-  with compute_inverse as defined below.
-     i_k = (j_k * s) % M
-  return i
 
- s can be computed as follows:
+   Let s_inv = the unique integer in {1,3,...,M-1}, such that (s * s_inv) % M = 1.
+   return i = (j * s_inv) % M  # operations applied elementwise
+</code>
 
-def compute_inverse(M, u):
+  On GPU, the fastest way to compute s_inv will likely be exhaustive search.
+  Mathematically, we can do:
+<code>
+       s_inv = (s ** (M/2 - 1)) % M
+</code>
+  (this relates to Euler's totient function; \phi(M) == M/2 if M is a power of 2).
+  A reasonably efficient way to compute this on CPU is:
+<code>
+       s_inv = compute_inverse(M, s)
+</code>
+  with compute_inverse as defined below:
+<code>
+  def compute_inverse(M, u):
     # returns the inverse of u modulo M, if u is coprime to M
     m = 2
     ss = u
@@ -207,27 +218,59 @@ def compute_inverse(M, u):
        s = (s * ss) % M
        m *= 2
     return s
+ </code>
 
- InverseReorderIndexes() relies on the fact that an inverse modulo M
- of an integer j that is coprime to M, can be obtained as:
-     j ** (\phi(M) - 1) % M
- where \phi(M) is Euler's totient function, which equals M/2 if M is a
- power of 2.
- InverseReorderIndexes() might be a little slow to compute, and in fact I propose to
- use a caching mechanism to avoid this.
-===========
-Function ComputeInclusionProbabilities(p): [mathematical version]
+
+ ## Backprop for function SoftSample() [mathematical version]
+
+ The forward pass did:
+<code>
+   (i, y) = SoftSample(p, K)
+</code>
+ The function returns (i, y) which are both vectors of length K, of type int and real.
+ The backward pass is simply:
+<code>
+  p_grad = zeros_like(p)
+  p_grad[i] = y_grad * y / p[i],
+</code>
+
+ The justification for this is as follows.
+
+ The forward pass can be interpreted as:
+     z = a random vector whose expected value is [1, 1, 1, 1... ], whose precise
+         distribution depends on the input p, it actually contains
+          (1/(K*inclusion-probability)) * (1 if included, else 0)
+     Y = p z  [where y is the sparse vector with indexes i and specified elements y].
+
+ Then the backprop is:
+  p_grad = Y_grad z,
+ which can be implemented as:
+  p_grad = Y_grad * Y / p
+
+ In expectation over z, this backprop rule is equivalent to just: p_grad =
+ Y_grad, which is what we want.  Notice that this backprop rule is different
+ from what we'd get if we just naively backpropped the individual instructions;
+ in that case we'd zero gradient for those elements with inclusion probability
+ 1, and larger gradients for the others.  This would not be correct in
+ expectation, because we'd be failing to account for the changes in inclusion
+ probability.
+
+ A "straight-through" estimate of the derivative would be to use the *expected*
+ value of z (i.e. all ones), i.e. to do: p_grad = Y_grad.  But this would require
+ us to have derivative values for the zero elements of Y_grad, which would require
+ us to do the full (non-sparse) computation, which would defeat the point of
+ the sampling.
+
+
+## ComputeBeta function [mathematical version]
+
+ ComputeBeta(p, K):
 
  Given a vector of nonzero probabilities 0 <= p <= 1 of size M (that sum
- to one), and an integer 1 < K < M, return r where:
+ to one, and with at least K nonzero elements), and an integer 0 < K < M,
+ return r where:
     r = min(1, \beta p)
  and sum(r) = K.  (This implicitly defines \beta, with \beta >= K).
-
-   Here is how to compute beta:
- - First, let q = sorted(p, reverse=True), i.e. sort the elements of p in
-   decreasing order.
- - Next, compute the exclusive-sum of elements of p, as s, so that:
-     s_i = \sum_{j=0}^{i-1} p_i.
 
  The number of elements k of p such that beta p_i >= 1 is going to satisfy
  0 <= k < K (it cannot be K or more because we will ensure that elements of p are
@@ -238,182 +281,147 @@ Function ComputeInclusionProbabilities(p): [mathematical version]
  with exactly k points having r_i == 1.  We can try them one by one and see
  which one works.
 
- Define \beta_k, with 0 <= k < K, as the \beta value if k points have
- r_i == 1 and the remaining (M-k) points have r_i <= 1.
+<code>
+  def compute_beta(p, K):
+    q = sorted(p, reverse=True), i.e. sort the elements of p in decreasing order.
+    Let s, of dimension M, be the exclusive-sum of elements of q,
+    so that s_i = \sum_{j=0}^{i-1} p_i.
 
- Then the constraint that sum(r) = K can be expressed as:
-    k + \beta_n (1 - s_k) = K,
- so:
-    \beta_k = (K - k) / (1 - s_k).    (eqn:2)
- If this k is an admissible value (if this value "works"), we will have:
-     p_k \beta_k <= 1, and:
-     (k == 0 or p_{k-1} \beta_k >= 1)
- This condition must be true for at least one k in {0,1,..K-1}, and it doesn't
- matter which one we choose because the resulting \beta_k will be the same.
- So, in summary, we set \beta = \beta_n for the n which the above two
- conditions hold, and then simply return:
-   r = min(1, \beta q)
+    for k in {0,1,..K-1}:
+      # note: the constraint sum(r) = K can be expressed as:
+      # k + \beta_k (1 - s_k) = K leading to the equation below.
+      beta_k = (K - k) / (1 - s_k).      # (eqn:2)
+      if q[k] * beta_k <= 1 and (k == 0 or q[k-1] * beta_k >= 1:
+         return beta_k
+</code>
 
-================================
- Function SoftSample(p: Tensor, K: int, input_is_log: bool),
-    implementation version [forward]
+
+## ComputeBeta function [implementation version]:
+
+<code>
+  def compute_beta(P, K):
+    # P is an array of integers P_i, of length M; these are in the range [1..2**31+1],
+    # and their sum is not much greater than 2**31 so we can do math in in32.
+    # We return an integer B representing (2**31 / beta), satisfying:
+    #   K B <= sum(min(B, P)) < K (B+1)
+
+    R = sorted(P)  # sort in increasing order
+    Q = inclusive_sum(R)  # Q[i] = sum_{j=0}^i R[i]
+    for k in 0,1,...K-1, in any order:
+      # B_k is the value of B if k indexes take the l.h.s. of the "min" expression in min(B, P)
+      B_k = (Q[M-1-i]  + K - k - 1) / (K - k)   # the "+ K - k - 1" is to ensure we round up
+      if R[M-1-k] >= B_k and P[I-2-k] <= B_k:
+         return B_k
+</code>
+
+
+
+## SoftSample function, implementation version [forward]
+
 
  We will be doing the internal computation in finite precision arithmetic, because
  roundoff issues would otherwise be a problem for the algorithm.
+
 
  If input_is_log==True, we assume that the input is *normalized* log-probs,
  e.g. the output of log_softmax.  This option is there so that we can
  support float16, because otherwise the backprop of this function might
  generate too-large derivatives.
 
- We first compute integerized versions of the probabilities:
-    P_i = floor((input_is_log ? exp(p_i) : p_i) * (2**31) + 1)
- [Mathematically, we can roughly think of this as doing,
-    \hat{p} := p + 2**-31 [and then represent it in fixed precision];
-  and we need to remember this for the backprop.]
+  For simplicity we assume p is a one-dimensional input.
+<code>
+  def soft_sample(p: Tensor, K: int, input_is_log: bool):  # returns (index, y)
+     if input_is_log:
+       p = exp(p)
+     # compute unsigned int32 integerized version of p, rounding
+     # up (think of this as first adding epsilon=2**-31 to p)
+     M = len(p)
+     P = floor(exp(p)*(2**31) + 1)
+     B = compute_beta(P, K)   # [practical version].  B == (2**31 / beta), beta as in (eqn:1)
+     inv_beta = float(B) / float(2**31)   # this is 1/beta
+     t = a random integer in {0,1,..,M/2-1}
+     s = 2*t + 1
+     inv_s = the s in {1,3,..M-1} such that (inv_s * s) % M == 1.
 
- OK, so SoftSample(p, K) goes as follows:
+     # R is a pseudo-random re-ordering of min(P_i, B)
+     R = zeros(M)
+     for i in 0..M-1:
+        R[i] = min(P[(i*s) % M], B)
 
-  - P_i = floor(1 + p_i * (2**31))
-  - Let B = ComputeInclusionProbabilities(P)   # B == (2**31 / beta), w.r.t. (eq. 1)
-  - Let t be a random integer in {0,1,..,I/2-1}, where I = len(P)
-    Let s = t+1
-    Let inv_s = the s in {1,3,..I-1} such that (inv_s * s) % I == 1.
+     # Note: the rational numbers R / B represent the inclusion probabilities
+     # r_i, with sum(r_i) \simeq K.
 
-  - Let R_i be set to a pseudo-random re-ordering of min(P_i, B), implemented as:
-      R_i = min(P_{(i*s) % I}, B)
-    # Note: the rational numbers R / B represent the inclusion probabilities
-    # r_i.
-  - Let S_i, 0 <= i < I, be the inclusive-sum of R_i.
+     Let S be the inclusive-sum of R: S[i] = sum_{j=0}^i R[i]
+     Let b be a random integer drawn uniformly from {0, 1, ..., B-1}.
 
-  - Let x be a random integer drawn uniformly from {0, 1, ..., M-1}.
-  - For each i in 0..I, in no particular order:
-      S_prev = (i == 0 ? 0 : S_{i-1}).
-      k_prev = (S_prev - r) / B
-      k_cur = (S_i - r) / B
-      If S_prev >= r and k_cur > k_prev:
-         ans_i[k_prev] = (i * inv_s) % I
-         # next implement: [ignoring reordering issues],
-         #  ans_y[k_prev] = p_i / r_i, i.e. p_i divided by the inclusion
-         # probability so the expected value (over included + not-included samples)
-         # is correct.  Referring back to (eqn:1), this is p_i / r_i, where
-         # r_i == min(1, \beta p_i), so:
-         #  ans_y[k_prev] = max(p_i, 1/beta)  [where i == ans_i[k_prev]].
+     Allocate "index" and "y" as arrays of length K
 
-         inv_beta = float(B) / float(2**31)
-         ans_y[k_prec] = max(p[ans_i[k_prev]], inv_beta)
+     For each i in 0..M, in any order:
+       S_prev = (i == 0 ? 0 : S_{i-1}).
+       k_prev = (S_prev - b) // B  # integer division
+       k_cur = (S_i - b) // B      # integer division
+       if S_prev >= b and k_cur > k_prev:
+         index[k_prev] = (i * inv_s) % M
 
-  Return ans_i, ans_y
+         # Next implement: [ignoring reordering issues],
+         #  y[k_prev] = p_i / r_i,
+         # Referring back to (eqn:1)  Since r == min(1, \beta p),
+         #  ans = p / r = max(p, 1/beta) (ignoring indexes).
+         y[k_prev] = max(p[index[k_prev]], inv_beta)
 
- # The sum of ans_y will be extremely close to 1.0, because:
- # with k being the k chosen in ComputeInclusionProbabilities(), [mathematical version]
- # r_i will equal 1.0 for k indexes i.  The total of ans_y for these k indexes
- # is equal to the s_i in ComputeInclusionProbabilities() [mathematical version].
- # this satisfies: \beta = (K - k) / (1 - s_k).    (see eqn:2)
- # so the total probability mass summed over the ans_y is:
- # Summed over cases where max(p_i, 1/beta) == p_i, sum is:
- #   s_k
- # Summed over cases where max(p_i, 1/beta) == 1/beta, sum is:
- #   1/beta * (K - k) ==  (1 - s_k)/(K - k) * (K - k) == (1 - s_k)
- # So the total sum is 1.
+     Return index, y
+ </code>
 
-===================================
- Function SoftSample(p: Tensor, K: int, input_is_log: bool), implementation version [backward]:
-
- Remember the input p, and the outputs ans_i and ans_y, from the forward pass.
- We are given ans_y_grad.
-
- p_grad = zeros_like(p)
-
- # Conceptually, we view the forward pass as producing a sparse vector y,
- # computed as:
- #  y = p z
- # where p is the input (in probability space, not logs), and z is a sparse
- # random vector whose expected value is (1,1,1,...).   The backprop is just
- # going to be:
- #  p_grad = z * y_grad,
- # and since z == y / p, we can implement this as:
- #  p_grad = y_grad * y / p.
- # Note: this backprop rule is not the same as what you'd get if you were to
- # do backprop on the individual statements of the forward pass.  The issue
- # is that z changes with p, but we can ignore this because the expected value
- # of z does not change with p.
-
- if input_is_log == False:
-    p_grad[ans_i] = ans_y_grad * ans_y / p[ans_i]
- else:
-    p_grad[ans_i] = ans_y_grad * ans_y
+ The sum of the returned "y" vector be extremely close to 1.0, because:
+ with k being the k chosen in ComputeBeta(), [mathematical version]
+ r_i will equal 1.0 for k indexes i.  The total of `y` for these k indexes
+ is equal to the s_i in ComputeBeta() [mathematical version].
+ this satisfies: \beta = (K - k) / (1 - s_k).    (see eqn:2)
+ so the total probability mass summed over `y` is as follows:
+ Summed over cases where max(p_i, 1/beta) == p_i, sum is:
+   s_k
+ Summed over cases where max(p_i, 1/beta) == 1/beta, sum is:
+   1/beta * (K - k) ==  (1 - s_k)/(K - k) * (K - k) == (1 - s_k)
+ So the total of `y` is s_k + (1 - s_k) = 1.
 
 
-====================================
+ ## SoftSample function, implementation version [backward/backprop]:
 
- Function ComputeInclusionProbabilities(p): [practical version]
-   - The inputs to this function are integers P_i, {0 <= i < I}, in the range [1..2**31+1],
-     that sum to approximately 2**31.
-   - The output of this function will be a value B, representing (2**31 / beta), such that:
-       K B <= \sum_i min(B, P_i) < K (B+1)
-   - This function works as follows:
-      - Let \hat{P}_i = sorted(P_i), in increasing order.
-      - Let Q_i = the inclusive-sum of P_i.
+  The forward function was:
+<code>
+   (i, y) = SoftSample(p: Tensor, K: int, input_is_log: bool).
+</code>
+  The backprop is:
+<code>
+    p_grad = zeros_like(p)
+    if not input_is_log:
+      # the "+ 2**-31" is to avoid division by zero; it actually corresponds to
+      # how we did the forward pass, where we sampled from (p + 2**-31).
+      p_grad[i] = y_grad * y / (p[i] + 2**-31)
+    else:
+      p_grad[ans_i] = ans_y_grad * ans_y
+</code>
 
-   - For k in {0,1,..., K-1}, in no particular order:
-      # B_k is the value of B if k indexes take the l.h.s. of the "min" expression.
-      Let B_k = (Q_{I-1-i}  + K - k - 1) / (K - k)   # the "+ K - k - 1" is to ensure we round up
-      If P_{I-1-k} >= B_k and P_{I-2-k} <= B_k:
-         return B_k
+Conceptually, we view the forward pass as producing a sparse vector y,
+computed as:
+<code>
+   y = p z
+</code>
+where p is the input (in probability space, not logs), and z is a sparse
+random vector whose expected value is (1,1,1,...).   The backprop is equivalent to:
+<code>
+  p_grad = z * y_grad,
+</code>
+and since z = y / p, we can implement this as:
+<code>
+   p_grad = y_grad * y / p.
+</code>
+Note: this backprop rule is not the same as what you'd get if you were to
+do backprop on the individual statements of the forward pass.  The issue
+is that z changes with p, but we can ignore this because the expected value
+of z does not change with p.
 
-
-
-================================
-
-Function ScheduledSample(p, K)
-
- - p is a nonnegative vector of size M, containing inclusion-probabilities 0 < p_i <= 1,
-   such that sum(p) \simeq K (to within, say, 0.001).
-
-   Because we'll be relying on exact arithmetic, we will convert these probabilities to
-   integers before computing the exclusive-sum.
-
-
- - set T = (2**31 / K)
- - Compute q_i = (uint32) (p_i * T).
- - Compute c_i as the inclusive sum of q_i, so that c_i = \sum_{j=0}^i q_i.  c_{M-1} will
-   have a value quite close to 2**31.
-
- - Let O = (c_{M-1} >= 2**31 ? T  : c_{M-1} % T).  This is close to
-   the "integerized" value of 1, i.e. close to T but possibly with a slight
-   correction to avoid overflow.
-
-   Pick a random number 0 <= r <= O-1.  The returned indexes will be the K indexes
-   i such that one of: {r, r+O, .., r+(K-1)O} is within {c_i, c_i + 1, ..., c_{i+1} - 1}.
-   For each i, we can do:
-     k1 = (c_i - r) / O
-     k2 = (c_{i+1} - r) / O
-     if k1 >= 0 && k1 != k2:
-        ans[t] = k1
-   and then "ans" will contain the K indexes required.  This code will work whether division
-   rounds down or toward zero.
-
-
-
-
- - Let O = c_{M-1} / K (rounding down).    O is the integerized v
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-================
+A "straight-through derivative" approach would just use all-ones in place of
+z, i.e. use the expected value of z, but this is not workable in practice here
+because we are not going to have derivatives available at the output, w.r.t.
+the non-selected indexes in y.
