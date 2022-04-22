@@ -113,12 +113,19 @@ Defining some dimensions with example numbers:
 
  The code will be for just a single sampling operation, i.e. assuming (*) is just the empty shape (,).
 <code>
-   # We first need to compute "inclusion probabilities" r such that:
+   # We first need to compute a value 0 <= beta <= 1/K such that:
+   #   K \beta + \sum_{i: p_i > \beta} (p_i - \beta) = 1     (eqn:0)
+   # This divides the probabilities p_i into two groups.  Suppose k values of p_i are
+   # > beta.  For these, we sample them with probability 1.  For the rest, we sample
+   # them with probability p/beta, and if we choose one of these samples, we return
+   # a weight beta instead of p.  There would be (K-k) such samples with value beta,
+   # giving total weight (K-k) beta, plus k samples in the sum: \sum_{i: p_i > beta} p_i.
+   # We can rearrange this as (eqn:0).
+   # The resulting probabilities of sampling various items will be given by r, here
    #   r = min(1, \beta p)          (eqn:1)
-   # where \beta is chosen such that sum(r) = K.  See ComputeBeta() [mathematical version] for
-   # how this is done.
+   # See ComputeBeta() [mathematical version] for how beta is computed.
    beta = ComputeBeta(p, K)  # beta: float
-   r = min(1, p * beta)   # r: tensor of inclusion probabilities of shape (M,) with sum(r) == K
+   r = min(1, p / beta)   # r: tensor of inclusion probabilities of shape (M,) with sum(r) == K
    t = random integer in {0,1,..(M/2)-1}
    s = 2*t + 1  # s is random in {1,3,5,..M-1}
    rr = Reorder(r, s)
@@ -265,30 +272,35 @@ Defining some dimensions with example numbers:
 
  Given a vector of nonzero probabilities 0 <= p <= 1 of size M (that sum
  to one, and with at least K nonzero elements), and an integer 0 < K < M,
- return r where:
-    r = min(1, \beta p)
- and sum(r) = K.  (This implicitly defines \beta, with \beta >= K).
+ return a value 0 <= \beta <= 1/K such that:
 
- The number of elements k of p such that beta p_i >= 1 is going to satisfy
- 0 <= k < K (it cannot be K or more because we will ensure that elements of p are
- all greater than zero, so if n == K, there is extra probability mass
- from the other elements and sum(r) > K).
+  K \beta + \sum_{i: p_i > \beta} (p_i - \beta) = 1     (see above, this is eqn:0).
 
- So for one k in {0,1,..K-1}, we are going to be able to satisfy sum(r) = K,
- with exactly k points having r_i == 1.  We can try them one by one and see
- which one works.
+ The number of elements k of p such that p_i > beta is going to satisfy
+ 0 <= k < K (it cannot be K or more because then the LHS of eqn:0 would be >1).
+ We will ensure in practice that elements of p are all greater than zero.
+
+ Let q be p after reverse-order sorting (i.e. greatest first), and let s_i be
+ the exclusive-sum of q_i, s_k contains the sum of the largest k elements of
+ p_i.  Then, if exactly k probabilities are larger than beta, (eqn:0) could only
+ be satified if
+
+   s_k + (K-k) beta = 1
+   beta = (1 - s_k) / (K-k)
+
+ In addition will require that (k==0 or q_{k-1} > beta) and (q_k <= beta).
 
 <code>
   def compute_beta(p, K):
     q = sorted(p, reverse=True), i.e. sort the elements of p in decreasing order.
     Let s, of dimension M, be the exclusive-sum of elements of q,
-    so that s_i = \sum_{j=0}^{i-1} p_i.
+    so that s_i = \sum_{j=0}^{i-1} q_i.
 
     for k in {0,1,..K-1}:
       # note: the constraint sum(r) = K can be expressed as:
       # k + \beta_k (1 - s_k) = K leading to the equation below.
-      beta_k = (K - k) / (1 - s_k).      # (eqn:2)
-      if q[k] * beta_k <= 1 and (k == 0 or q[k-1] * beta_k >= 1:
+      beta_k = (1 - s_k) / (K - k)        # (eqn:2)
+      if (k == 0 or q[k-1] > beta_k) and q[k] <= beta_k:
          return beta_k
 </code>
 
@@ -297,17 +309,29 @@ Defining some dimensions with example numbers:
 
 <code>
   def compute_beta(P, K):
-    # P is an array of integers P_i, of length M; these are in the range [1..2**31+1],
-    # and their sum is not much greater than 2**31 so we can do math in in32.
-    # We return an integer B representing (2**31 / beta), satisfying:
-    #   K B <= sum(min(B, P)) < K (B+1)
+
+    # P is an array of integers P_i that are a fixed-precision representation of
+    # p_i, of length M; these are in the range [1..2**31+1], and their sum is
+    # not much greater than 2**31 so we can do math in int32.  It may be easier
+    # to think of these as un-normalized probbabilities.
+    # We return an integer B representing approximately (2**31 * beta), satisfying:
+    #
+    #   sum(P) - K <=  K B + \sum_{i: p_i > B} (P_i - B) <= sum(P)  (eqn:a1)
+    #
+    #   ... here, sum(P) takes the role of 1, and we replace the equality with
+    #   two inequalities.  We want B to be rounded down, not up, to avoid overflowing
+    #   the cumsum of P when sampling.
+    #   Subtracting \sum_{i: P_i > B} (P_i - B) from (eqn:a1), we
+    #   can write it more conveniently for the actual sampling operation, as:
+    #
+    #   sum(min(p_i, B)) - K <  K B  <= sum(min(p_i, B))     (eqn:a2)
 
     R = sorted(P)  # sort in ascending order
     Q = inclusive_sum(R)  # Q[i] = sum_{j=0}^i R[i]
     for k in 0,1,...K-1, in any order:
       # B_k is the value of B if k indexes take the l.h.s. of the "min" expression in min(B, P)
-      B_k = Q[M-1-k] // (K - k)   # round down
-      if (k==0 or R[M-k] >= B_k) and R[M-1-k] <= B_k:
+      B_k = Q[M-1-k] // (K - k)   # round down.  Q[M-1-k] takes role of s_k from (eqn:2)
+      if (k==0 or R[M-k] > B_k) and R[M-1-k] <= B_k:
          return B_k
 </code>
 
@@ -354,9 +378,9 @@ Defining some dimensions with example numbers:
 
      For each i in 0..M, in any order:
        S_prev = (i == 0 ? 0 : S_{i-1}).
-       k_prev = (S_prev - b) // B  # integer division
-       k_cur = (S_i - b) // B      # integer division
-       if S_prev >= b and k_cur > k_prev:
+       k_prev = (S_prev + b + 1) // B  # integer division, round down or toward zero
+       k_cur = (S_i + b + 1) // B      # integer division, round down or toward zero
+       if k_cur > k_prev:
          index[k_prev] = (i * inv_s) % M
 
          # Next implement: [ignoring reordering issues],
