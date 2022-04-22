@@ -57,6 +57,40 @@ def compute_beta(P, K):
     assert torch.all(P_min_sum <= K * (B + 1))
     return B
 
+def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
+    """
+    Forward function for soft sampling.
+    Args:
+      p: Tensor of shape (*, M)
+      K: number of samples, 1 <= K < M
+      input_is_log: if true, p must be probabilities in [0..1] that sum to one;
+          if false, p must be logprobs (that sum to one after exp())
+   Returns: (indexes, y), where:
+        indexes: shape (*, K), a LongTensor containing elements in [0..M-1], distinct
+           along the K axis
+        y: shape (*, K), a Tensor containing values in [0..1], which sum to 1 along the
+           K axis.
+    """
+    if input_is_log:
+        p = p.exp()
+    M = p.shape[-1]
+    two31 = 2 ** 31
+    # to(dtype=this rounds toward 0, which is good enough
+    P = (p*two31 + 1).to(dtype=torch.long)
+    print("P = ", P)
+    B = compute_beta(P, K)
+    inv_beta = B / two31
+    t = torch.randint(M//2, p.shape[:-1] + (1,))  # shape: *, 1
+    s = t * 2 + 1
+    s_inv = (s ** (M//2 - 1)) % M
+    assert torch.all((s * s_inv) % M == 1)
+
+    R = torch.minimum(torch.gather(P, dim=-1, index=(s * torch.arange(M)) % M),
+                      B)
+    S = torch.cumsum(R, dim=-1)
+    print("R = ", R)
+
+
 class SoftSampleFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, p: Tensor, K: int, input_is_log: bool):
@@ -68,12 +102,7 @@ class SoftSampleFunction(torch.autograd.Function):
           input_is_log: if true, p must be probabilities in [0..1] that sum to one;
               if false, p must be logprobs (that sum to one after exp())
         """
-        if input_is_log:
-            p = exp(p)
-        M = p.shape[-1]
-        P = (p*(2**31) + 1).floor()
-        B = compute_beta(P, K)
-
+        pass
 
 def _test_compute_beta():
     # use a small M-- 8 here-- because it's more likely to
@@ -84,7 +113,12 @@ def _test_compute_beta():
     print("beta = ", beta)
 
 
+def _test_soft_sample():
+    l = torch.randn(9, 64)
+    p = torch.softmax(l, dim=-1)
+    soft_sample_forward(p, K=4, input_is_log=False)
+
 if __name__ == '__main__':
     _test_compute_beta()
-
+    _test_soft_sample()
     #test_normalizer()
