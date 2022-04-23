@@ -111,7 +111,6 @@ def compute_beta(P, K):
 
     B_k = Q_part // Kk  # shape (*, K)
     remainder_k = Q_part - (B_k * Kk)   # shape (*, K)
-    assert torch.all(torch.logical_and(remainder_k >= 0, remainder_k < Kk))
 
     large_int = (2**32 - 1)
     R_part1 = torch.cat((R[...,M-K+1:M], torch.full((*R.shape[:-1], 1), large_int)), dim=-1)
@@ -143,9 +142,96 @@ def compute_beta_prods(Psum, Ptop):
     products of softmaxes.  We are still assuming an integerized representation.
 
     Args:
-      Psum: Tensor of shape (*,), treated as the batch dimension,
+      Psum: Tensor of shape (*,), treated as the batch dimension, which contains,
+           as torch.int64, the total integerized probability mass taken as a product
+           along all dimension, e.g. for a tensor of shape (*, N, K) containing integerized
+           probabilities, we'd sum along the K dimension and take a product along the N
+           dimension.
+      Ptop: Tensor of shape (*, K), containing the probabilities for the top-K
+           possible outputs (each possible output is a combination of N indexes in
+           [0..M-1]).  The sum of Ptop must be less than Psum.
+
+     Returns: (B, delta_P)
+          beta: Tensor of shape (*) containing integers B satisfying:
+                 sum(min(P, B)) == K*B                    (eqn:b1)
+             ... where conceptually, P is a matrix of shape (*, K**N)
+             that we do not materialize.
+             What this condition amounts to in terms of args of this function,
+             is that:
+                 Psum + delta_P.sum(-1) = B*K
+             [Caution: the exact equality in (eqn:b1) is only true
+             once we subtract a small number in [0..K-1] from the next-largest
+             element of P that is not >B, to correct for rounding error;
+             this is accounted for in delta_P.
+          delta_P: of shape (*, K), this contains the change, if any, that we have
+             to make to the top-K elements of the distribution before sampling.
+             Satisfies delta_P <= 0.  This combines two things: the
+             differences (min(P[i], B) - P[i]); and the values in [-(K-1)..0]
+             that we add to the largest item that's less than P to account
+             for rounding effects.
     """
-    pass
+    K = Ptop.shape[-1]
+    assert Psum.shape == Ptop.shape[:-1]
+
+    Ptop_cum = torch.cumsum(Ptop, dim=-1)  # cumsum of Ptop, i.e. inclusive-sum.  Shape (*, K)
+
+    # add zero first element per row, so Ptop_cum_shift[...,0] is all-zeros and
+    # Ptop_cum_shift[...,1] contains the top-1.  The idea is that
+    # Ptop_cum_shift[...,k] contains the sum of the top k items.
+    Ptop_cum_shift = torch.cat((torch.zeros(*Ptop.shape[:-1], 1, dtype=Ptop.dtype,
+                                       device=Ptop.device),
+                                Ptop_cum[...,:K-1]), dim=-1)
+    # S1[...,k] contains, for each batch element, the sum of all but the k largest
+    # items.  It corresponds to s-1 in the math of NOTES.md, see "ComputeBeta function
+    # [mathematical version].
+    # Shape is (*, K)
+    S1 = Psum.unsqueeze(-1) - Ptop_cum_shift
+
+    temp = torch.arange(K, -1, -1)  # [K, K-1, ..., 0]
+    # Kk, of shape (K,), contains [K, K-1, ..., 1], representing K-k for k = [0, 1, ..., K-1]
+    Kk = temp[0:K]
+    # Kk1 of shape (K,), contains [K-1, K-2, ..., 0], representing K-k-1 for k = [0, 1, ..., K-1]
+    Kk1 = temp[1:K+1]
+
+    # The following corresponds to:
+    #    beta = (1 - s_k) / (K-k)
+    # in NOTES.md.  This is integer division, we are rounding down.
+    # B_k[...,k] is the beta value if k values are >= beta.
+    B_k = S1 // Kk  # shape (*, K)
+    remainder_k = S1 - (B_k * Kk)   # shape (*, K)
+    print("B_k = ", B_k)
+    print("remainder_k = ", remainder_k)
+
+    large_int = (2**63 - 1)
+    # Ptop_shifted is Ptop shifted right with a large value put first, i.e.
+    # instead of [top1, top2, top3, top4] we have [inf, top1, top2, top3]
+    Ptop_shifted = torch.cat((torch.full((*Ptop.shape[:-1], 1), large_int),
+                              Ptop[...,:K-1]), dim=-1)
+
+    print("Ptop= ", Ptop)
+    print("Ptop_shifted= ", Ptop_shifted)
+
+    # is_ok corresponds to: "(k==0 or R[M-k] > B_k) and R[M-1-k] <= B_k" in NOTES.md
+    # It is true only for the "correct" k for each batch element, that corresponds
+    # to the number of values greater than B_k.
+    is_ok = (torch.logical_and(Ptop_shifted > B_k, Ptop <= B_k))  # shape: (*, K)
+
+    # `indexes` are the values of k.
+    B, indexes = torch.max(B_k * is_ok, dim=-1)  # shape: (*,)
+    print("B = ", B)
+
+    delta_P = (torch.minimum(Ptop, B.unsqueeze(-1)) - Ptop) - (remainder_k * is_ok)
+
+    print("B_k = ", B_k)
+    print("is_ok == ", is_ok)
+    print("delta_P = ", delta_P)
+
+    err = Psum + delta_P.sum(dim=-1) - B * K
+    print("Err = ", err)
+    assert torch.all(err == 0)
+
+    assert torch.all(torch.sum(is_ok, dim=-1)[0] == 1)
+
 
 def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
     """
@@ -243,9 +329,12 @@ def _test_soft_sample():
     soft_sample_forward(p, K=4, input_is_log=False)
 
 def _test_compute_k_largest():
-    N = 3
-    K = 2
-    l = torch.randn(2, N, 8)
+    N = 2
+    K = 4
+    M = 8
+
+    l = ((5 * torch.randn(2, N, M)).softmax(dim=-1) * 16 + 1).to(dtype=torch.int64)
+
     print("l = ", l)
     values, indexes = compute_k_largest(l, K)
     print("largest values = ", values)
@@ -266,11 +355,12 @@ def _test_compute_k_largest():
 
     l_cumsum = torch.cumsum(l, dim=-1) # (B, N, M)
     # prod_cumsum is the total sum over the M axis [i.e. the last element of cumsum],
-    # produced along the N axis.  Shape: (B,)
+    # multiplied along the N axis, so it can be thought of as the total probability mass,
+    # or the probability's normalizer, of the joint distribution.  Shape: (B,)
     prod_cumsum = l_cumsum[...,-1].prod(dim=-1)  # (B,)
     print("prod_cumsum = ", prod_cumsum)
 
-
+    compute_beta_prods(prod_cumsum, combined_values)
 
 
 if __name__ == '__main__':
