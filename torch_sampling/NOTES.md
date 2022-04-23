@@ -309,30 +309,35 @@ Defining some dimensions with example numbers:
 
 <code>
   def compute_beta(P, K):
+    # [this function returns beta, integerized, but also modifies P slightly.]
 
     # P is an array of integers P_i that are a fixed-precision representation of
     # p_i, of length M; these are in the range [1..2**31+1], and their sum is
     # not much greater than 2**31 so we can do math in int32.  It may be easier
     # to think of these as un-normalized probbabilities.
+    #
     # We return an integer B representing approximately (2**31 * beta), satisfying:
     #
-    #   sum(P) - K <=  K B + \sum_{i: p_i > B} (P_i - B) <= sum(P)  (eqn:a1)
+    #      sum(P) ==  K B + \sum_{i: p_i > B} (P_i - B)     (eqn:a1)
     #
-    #   ... here, sum(P) takes the role of 1, and we replace the equality with
-    #   two inequalities.  We want B to be rounded down, not up, to avoid overflowing
-    #   the cumsum of P when sampling.
+    #  ... note: this is after adding n to the one of the smallest elements of P,
+    #  with n < K, to ensure exact equality.
+    #
+    #   ... here, sum(P) takes the role of 1.
     #   Subtracting \sum_{i: P_i > B} (P_i - B) from (eqn:a1), we
     #   can write it more conveniently for the actual sampling operation, as:
     #
-    #   sum(min(p_i, B)) - K <  K B  <= sum(min(p_i, B))     (eqn:a2)
+    #   sum(min(p_i, B)) - K  = K B                  (eqn:a2)
 
     R = sorted(P)  # sort in ascending order
     Q = inclusive_sum(R)  # Q[i] = sum_{j=0}^i R[i]
     for k in 0,1,...K-1, in any order:
       # B_k is the value of B if k indexes take the l.h.s. of the "min" expression in min(B, P)
-      B_k = Q[M-1-k] // (K - k)   # round down.  Q[M-1-k] takes role of s_k from (eqn:2)
+      B_k, remainder_k = Q[M-1-k] // (K - k),  Q[M-1-k] % (K - k)
       if (k==0 or R[M-k] > B_k) and R[M-1-k] <= B_k:
-         return B_k
+         k_val, B, remainder = k, B_k, remainder_k
+         possibly: break
+    subtract `remainder` from the M-1-k_val'th element of P
 </code>
 
 

@@ -18,10 +18,12 @@ def compute_beta(P, K):
            cumsum does not overflow.
         K: an integer 0 < K < M
     Returns a tensor of integers B of shape (*, 1) such that:
-        sum(min(P, B)) <= K*B < sum(min(P, B)) + K
+        sum(min(P, B)) == K*B
+    [It will subtract a number in {0,1,..K-1} from one element of each row of P
+    to make this sum exact.]
     """
     M = P.shape[-1]
-    R, _ = torch.sort(P, dim=-1)  # (*, M)
+    R, R_indexes = torch.sort(P, dim=-1)  # (*, M)
     Q = torch.cumsum(R, dim=-1)
     # Reference pseudocode was:
     #for k in 0,1,...K-1, in any order:
@@ -40,6 +42,8 @@ def compute_beta(P, K):
     Q_part = Q[...,M-K:M]   # represents: Q[...,M-1-k] for k = K-1,K-2,...,1,0
 
     B_k = Q_part // Kk  # shape (*, K)
+    remainder_k = Q_part - (B_k * Kk)   # shape (*, K)
+    assert torch.all(torch.logical_and(remainder_k >= 0, remainder_k < Kk))
 
     large_int = (2**32 - 1)
     R_part1 = torch.cat((R[...,M-K+1:M], torch.full((*R.shape[:-1], 1), large_int)), dim=-1)
@@ -49,13 +53,20 @@ def compute_beta(P, K):
     is_ok = (torch.logical_and(R_part1 > B_k, R_part2 <= B_k))  # shape: (*, K)
 
     assert torch.all(torch.max(is_ok, dim=-1)[0] == 1)
-    B = torch.max(B_k * is_ok, dim=-1, keepdim=True)[0]  # shape: (*, 1)
+    B, indexes = torch.max(B_k * is_ok, dim=-1, keepdim=True)  # shape: (*, 1)
+    remainder = torch.gather(remainder_k, dim=-1, index=indexes)
+
+    remainder = torch.max(remainder_k * is_ok, dim=-1, keepdim=True)[0]  # shape: (*, 1)
+    index = torch.max(R_indexes[...,M-K:M] * is_ok, dim=-1, keepdim=True)[0]
+    P_index = torch.gather(R_indexes[...,M-K:M], dim=-1, index=indexes)
+    P_val = torch.gather(P, dim=-1, index=P_index)
+    P_val -= remainder
+    P.scatter_(dim=-1, index=P_index, src=P_val)
 
     P_min = torch.minimum(P, B)
 
     P_min_sum = P_min.sum(dim=-1, keepdim=True)
-    assert torch.all(K * B <= P_min_sum)
-    assert torch.all(P_min_sum - K < K*B)
+    assert torch.all(K * B == P_min_sum)
     return B
 
 def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
@@ -142,7 +153,7 @@ class SoftSampleFunction(torch.autograd.Function):
 def _test_compute_beta():
     # use a small M-- 8 here-- because it's more likely to
     # choose k != 0 in compute_beta(), giving a more complete test.
-    a = torch.randint(low=1, high=65535, size=(9, 8))
+    a = torch.randint(low=1, high=65535, size=(9, 16))
     K = 4
     beta = compute_beta(a, K)  # it checks its own answer..
     print("beta = ", beta)
