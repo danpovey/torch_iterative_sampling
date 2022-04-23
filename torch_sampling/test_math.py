@@ -137,6 +137,16 @@ def compute_beta(P, K):
     assert torch.all(K * B == P_min_sum)
     return B
 
+def compute_beta_prods(Psum, Ptop):
+    """
+    Version of compute_beta() with a different interface, which is intended to work with
+    products of softmaxes.  We are still assuming an integerized representation.
+
+    Args:
+      Psum: Tensor of shape (*,), treated as the batch dimension,
+    """
+    pass
+
 def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
     """
     Forward function for soft sampling.
@@ -253,6 +263,13 @@ def _test_compute_k_largest():
 
     print("combined_values = ", combined_values)
     print("combined_indexes = ", combined_indexes)
+
+    l_cumsum = torch.cumsum(l, dim=-1) # (B, N, M)
+    # prod_cumsum is the total sum over the M axis [i.e. the last element of cumsum],
+    # produced along the N axis.  Shape: (B,)
+    prod_cumsum = l_cumsum[...,-1].prod(dim=-1)  # (B,)
+    print("prod_cumsum = ", prod_cumsum)
+
 
 
 
