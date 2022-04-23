@@ -450,6 +450,22 @@ def _test_compute_k_largest():
 
     assert torch.all(combined_values + delta_P > 0)
 
+    # CAUTION: if the product of sums is too large, this rand_values
+    # will not be sufficiently
+    # random!!  We need to leave some headroom.
+    # rand_values are random in {0, 1, ..., B-1}
+    rand_values = torch.randint((2**63 - 1), B.shape) % B
+    # rand_values, rand_values + B, rand_values + 2B, ...., rand_values + (K-1)B
+    sampled_values = rand_values.unsqueeze(-1) + B.unsqueeze(-1) * torch.arange(K)
+    print("rand_values = ", rand_values)
+    print("sampled_values = ", sampled_values)
+
+    sampled_values_plus = sampled_values + -delta_P.sum(dim=-1).unsqueeze(-1)
+
+    print("sampled_values_plus = ",
+          sampled_values_plus)
+    assert torch.all(sampled_values_plus < prod_cumsum.unsqueeze(-1))
+
 
 if __name__ == '__main__':
     _test_compute_k_largest()
