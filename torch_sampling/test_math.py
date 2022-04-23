@@ -9,6 +9,26 @@ from typing import Tuple
 
 
 
+def compute_k_largest(X, K):
+    """
+    Returns, for each row of X, the values and indexes of the K largest elements,
+    sorted from largest to smallest.
+    Args:
+      X: Tensor of any type, of shape (*, M) with M > K
+      K: an integer with 0 < K <= M
+    Returns (values, indexes), with
+       values: K most positive values of each row of X, shape (*, K)
+       indexes: indexes [on last axis] of K most positive values of each row of X,
+            shape (*, K)
+    """
+    values, indexes = torch.sort(X, dim=-1, descending=True)
+    return values[...,:K], indexes[...,:K]
+
+def compute_products(P):
+    """
+    """
+
+
 def compute_beta(P, K):
     """
     See: ComputeBeta function [practical version] in NOTES.md.
@@ -164,7 +184,15 @@ def _test_soft_sample():
     p = torch.softmax(l, dim=-1)
     soft_sample_forward(p, K=4, input_is_log=False)
 
+def _test_compute_k_largest():
+    l = torch.randn(3, 8)
+    print("l = ", l)
+    values, indexes = compute_k_largest(l, 2)
+    print("largest values = ", values)
+    print("largest indexes = ", indexes)
+
 if __name__ == '__main__':
+    _test_compute_k_largest()
     _test_compute_beta()
     _test_soft_sample()
     #test_normalizer()
