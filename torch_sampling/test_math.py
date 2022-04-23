@@ -24,9 +24,57 @@ def compute_k_largest(X, K):
     values, indexes = torch.sort(X, dim=-1, descending=True)
     return values[...,:K], indexes[...,:K]
 
-def compute_products(P):
+def compute_products(values, indexes):
     """
+    This is intended to be called on the outputs of compute_k_largest().  It computes the
+    products of different combinations of `values`, as follows:
+
+     values: Tensor of shape (*, N, K)
+    indexes: Tensor of shape (*, N, K)
+
+    The K refers to the K-best, e.g. K=4, which will have been computed by
+    compute_k_largest.  `values` contains the K largest elements per row, of a source
+    tensor.  We are computing all products of these, over the N axis.
+
+   Returns:  (values, indexes), where:
+        prod_values: Tensor of shape (*, K**N)  containing the products of elements of `values`,
+                    treating the dimensions in `*` as batch dimensions and taking products
+                    along the N axis.
+        prod_indexes: Tensor of shape (*, K**N, N)  containing the indexes of the original
+                    elements that we took products of.
     """
+    assert values.shape == indexes.shape
+    K = values.shape[-1]
+    N = values.shape[-2]
+
+    # assume (*) == (B,) and N==3 for example shapes.
+    # e.g. (B, 1, 1, 1)
+    unit_shape = list(values.shape[:-2]) + ([1] * N)
+    # e.g. (B, K, K, K)
+    full_shape = list(values.shape[:-2]) + ([K] * N)
+    # e.g. (B, K, K, K, N)
+    indexes_shape = list(values.shape[:-2]) + ([K] * N) + [N]
+
+    prod_values = 1
+    prod_indexes = torch.empty(*indexes_shape, dtype=indexes.dtype,
+                               device=indexes.device)
+
+
+    for n in range(N):
+        shape = list(unit_shape)  # copy it
+        shape[-N + n] = K   # e.g. if n==1, shape might be (B, K, 1, 1)
+        this_values = values.select(dim=-2, index=n).reshape(shape)
+        this_src_indexes = indexes.select(dim=-2, index=n).reshape(shape)
+        this_dest_indexes = prod_indexes.select(dim=-1, index=n) # e.g. (B, K, K, K)
+
+        this_dest_indexes[:] = this_src_indexes # will broadcast
+        prod_values = prod_values * this_values # will broadcast
+
+
+    values_shape = list(values.shape[:-2]) + [K**N]
+    indexes_shape = values_shape + [N]
+    return prod_values.reshape(values_shape), prod_indexes.reshape(indexes_shape)
+
 
 
 def compute_beta(P, K):
@@ -185,11 +233,28 @@ def _test_soft_sample():
     soft_sample_forward(p, K=4, input_is_log=False)
 
 def _test_compute_k_largest():
-    l = torch.randn(3, 8)
+    N = 3
+    K = 2
+    l = torch.randn(2, N, 8)
     print("l = ", l)
-    values, indexes = compute_k_largest(l, 2)
+    values, indexes = compute_k_largest(l, K)
     print("largest values = ", values)
     print("largest indexes = ", indexes)
+    prod_values, prod_indexes = compute_products(values, indexes)
+    assert prod_values.shape == prod_indexes.shape[:-1]
+    print("prod_values = ", prod_values)
+    print("prod_indexes = ", prod_indexes)
+
+    # combined_values, combined_indexes: (B, K)
+    combined_values, combined_indexes = compute_k_largest(prod_values, K)
+
+    combined_indexes_shape = list(combined_indexes.shape) + [N]
+    combined_indexes = torch.gather(prod_indexes, dim=-2, index=combined_indexes.unsqueeze(-1).expand(combined_indexes_shape))
+
+    print("combined_values = ", combined_values)
+    print("combined_indexes = ", combined_indexes)
+
+
 
 if __name__ == '__main__':
     _test_compute_k_largest()
