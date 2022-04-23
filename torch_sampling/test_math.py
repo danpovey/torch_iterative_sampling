@@ -24,6 +24,75 @@ def compute_k_largest(X, K):
     values, indexes = torch.sort(X, dim=-1, descending=True)
     return values[...,:K], indexes[...,:K]
 
+def get_combined_cumsums(P_cumsum,
+                         combined_indexes):
+    """
+    This is a function called while sampling from a distribution that's a product of
+    N categorical distributions each of size M.
+
+    Args:
+       P_cumsum: Tensor of int64 of shape (*, N, M), containing the (inclusive) cumulative
+          sums of the integerized individual softmaxes.  Suppose that N == 3, so we have
+            cumsum0 = P_sumsum[...,0,:], cumsum1 = P_cumsum[...,1,:], cumsum2 = P_cumsum[...,2,:].
+          We assign probability mass to combinations of indexes over the N axes, by
+          multipliying these integerized probabilities, and we're interested in the cumulative
+          sum of these products, assuming that index 0 varies fastest.  So the (inclusive) cumsum of the
+          combination with indexes m0, m1, m2, would have a value given by:
+              P_cumsum[..., 0, m0] + P_cumsum[..., 1, m1] * sum0 + P_cumsum[..., 2, m2] * sum0 * sum1
+          where sum0 is the total sum from cumsum0 (its last element), and so on.
+        combined_indexes: A tensor of int64 of shape (*, K, N), containing the top-K combinations
+          of indexes in {0,1,..,M-1} that have the most probability mass, from greatest to least.
+          We are interested in the (exclusive) cumulative sum at these points, i.e.  for each index
+          in `combined_indexes` we are interested in the sum of all prior items.
+
+      Returns:
+          Returns a Tensor of int64 of shape (*, K), returning the cumulative sum of all
+          combinations of indexes preceding each of the ones in 'combined_indexes'.
+    """
+    # P_cumsum_shifted, of shape (*, N, M+1), is P_cumsum preceded by a 0 in each row,
+    # so it represents the exclusive-sum.
+    P_cumsum_shifted = torch.cat((torch.zeros(*P_cumsum.shape[:-1], 1, dtype=P_cumsum.dtype,
+                                              device=P_cumsum.device),
+                                  P_cumsum), dim=-1)
+
+    M = P_cumsum.shape[-1]
+    N = P_cumsum.shape[-2]
+    K = combined_indexes.shape[-2]
+    assert combined_indexes.shape[-1] == N
+    assert combined_indexes.shape[:-2] == P_cumsum.shape[:-2]
+
+    # ans: shape (*, K)
+    ans = torch.zeros(*combined_indexes.shape[:-1],
+                      dtype=P_cumsum.dtype, device=P_cumsum.device)
+
+    # P_sum is the total sum of the individual softmaxes/distributions.
+    # Shape: (*, N)
+    P_sum = P_cumsum.select(dim=-1, index=M-1)
+
+    # P_prev_sum_product, of shape (*, N) contains the product of all the P_sum
+    # values for the *previous* indexes n, i.e, over n_prev < n.  We divide by
+    # P_sum to make it an exclusive, not an inclusive, product.
+    P_prev_sum_product = torch.cumprod(P_sum, dim=-1) // P_sum
+    print("P_sum = ", P_sum)
+    print("P_prev_sum_product = ", P_prev_sum_product)
+
+
+    # P_cumsum_selected, of shape (*, N, K), contains the individual looked-up
+    # exclusive-cumulative-sum values, i.e. the cumulative sum within the individual
+    # softmax/distribution, of all preceding items.
+    P_cumsum_selected = P_cumsum_shifted.gather(dim=-1, index=combined_indexes.transpose(-2, -1))
+
+
+    # answer is sum over the N dimension, multipliying the
+    # indexes for n>0 by P_prev_sum_product, i.e. the product over previous
+    # sums.  [Earlier indexes are considered to vary fastest, this was easiest
+    # to implement.]
+    # Shape: (*, K)
+    ans = (P_cumsum_selected * P_prev_sum_product.unsqueeze(-1)).sum(dim=-2)
+    print("Ans = ", ans)
+    return ans
+
+
 def compute_products(values, indexes):
     """
     This is intended to be called on the outputs of compute_k_largest().  It computes the
@@ -100,8 +169,7 @@ def compute_beta(P, K):
     #  if R[M-1-k] >= B_k and P[I-2-k] <= B_k:
     #     return B_k
 
-
-    temp = torch.arange(K+1)
+    temp = torch.arange(K+1, dtype=R.dtype, device=R.device)
     # Kk, of shape (K,), contains [1, 2, ..., K], representing K-k for k = [K-1, K-2, ..., 0]
     Kk = temp[1:K+1]
     # Kk1 of shape (K,), contains [0, 1, ..., K-1], representing K-k-1 for k = [K-1, K-2, ..., 0]
@@ -229,8 +297,9 @@ def compute_beta_prods(Psum, Ptop):
     err = Psum + delta_P.sum(dim=-1) - B * K
     print("Err = ", err)
     assert torch.all(err == 0)
-
     assert torch.all(torch.sum(is_ok, dim=-1)[0] == 1)
+
+    return B, delta_P
 
 
 def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
@@ -344,23 +413,42 @@ def _test_compute_k_largest():
     print("prod_values = ", prod_values)
     print("prod_indexes = ", prod_indexes)
 
-    # combined_values, combined_indexes: (B, K)
+    # combined_values, combined_indexes: (B, K) these are the top-K
+    # most-probable combinations of (integerized_ probabilities and their
+    # indexes, from best to worst.
     combined_values, combined_indexes = compute_k_largest(prod_values, K)
 
     combined_indexes_shape = list(combined_indexes.shape) + [N]
-    combined_indexes = torch.gather(prod_indexes, dim=-2, index=combined_indexes.unsqueeze(-1).expand(combined_indexes_shape))
+    # combined_indexes: (B, K, N)
+    combined_indexes = torch.gather(prod_indexes, dim=-2,
+                                    index=combined_indexes.unsqueeze(-1).expand(combined_indexes_shape))
 
     print("combined_values = ", combined_values)
     print("combined_indexes = ", combined_indexes)
 
+
     l_cumsum = torch.cumsum(l, dim=-1) # (B, N, M)
+
+
+    combined_cumsums = get_combined_cumsums(l_cumsum,
+                                            combined_indexes)
+    print("combined_cumsums = ", combined_cumsums)
+    print("combined_cumsums + combined_values= ", combined_cumsums + combined_values)
+
+
     # prod_cumsum is the total sum over the M axis [i.e. the last element of cumsum],
     # multiplied along the N axis, so it can be thought of as the total probability mass,
     # or the probability's normalizer, of the joint distribution.  Shape: (B,)
     prod_cumsum = l_cumsum[...,-1].prod(dim=-1)  # (B,)
     print("prod_cumsum = ", prod_cumsum)
 
-    compute_beta_prods(prod_cumsum, combined_values)
+    assert torch.all(prod_cumsum.unsqueeze(-1) > combined_cumsums)
+
+    assert torch.all(prod_cumsum.unsqueeze(-1) >= combined_cumsums + combined_values)
+
+    B, delta_P = compute_beta_prods(prod_cumsum, combined_values)
+
+    assert torch.all(combined_values + delta_P > 0)
 
 
 if __name__ == '__main__':
