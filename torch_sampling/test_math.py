@@ -453,6 +453,68 @@ def get_indexes_for_samples(P: Tensor,
     print("ans_indexes = ", ans_indexes)
     return ans_indexes
 
+def get_weights_for_samples(P: Tensor,
+                            P_sum_product: Tensor,
+                            B: Tensor,
+                            indexes: Tensor,
+                            dtype: torch.dtype) -> Tensor:
+    """
+    Return output weights for the K samples we selected for each distribution.
+    The probability of selecting a particular sample with probability p_i
+    is: min(1, p_i/beta), and the output weight for a sample (if we select it)
+    will be p_i divided by the probability with which we sampled it,
+    i.e. p_i / min(1, p_i/beta) = max(p_i, beta).  P and B are integerized
+    forms of p and beta, we have to divide by P_sum_product to get
+    the actual values.
+
+    Args:
+        P: integerized probabilities for the individual distributions
+           in our product-of-distributions, of shape
+           (*, N, M), where * is the batch dimension(s), N is the
+           number of distributions in the product (e.g. 2 or 3), and
+           M is the size of each distribution (e.g. 128).
+       P_sum_product: of shape (*,) the result of taking the sum of
+           P over the M dimension and then the product over the N
+           dimension.
+        B: of shape (*,), the integerized value of beta
+           (B/P_sum_product == beta).  We sample each item with
+           probability min(1, prob_of_item/beta), with beta
+           chosen such that the sum of those probabilities is
+           exactly K
+        indexes: the indexes of the chosen samples, of
+           shape (*, K, N).  K is the number of samples;
+           each sample is an N-tuple of indexes.
+       dtype: the desired data-type of the returned probabilities.
+     Returns:
+          Returns the probabilities for the chosen indexes, of
+          shape (*, K); these will sum to one along the K axis.
+    """
+    if dtype == torch.float16:
+        return get_weights_for_samples(P, P_sum_product,
+                                       B, indexes, torch.float32).to(dtype)
+    assert dtype in [torch.float32, torch.float64]
+
+    # probs: of shape (*, N, K), the integer probabilities for
+    # the individual distributions
+    probs = torch.gather(P, dim=-1, index=indexes.transpose(-2, -1))
+
+    # multiply probs across the N axis to get products of shape (*, K)
+    probs = probs.prod(dim=-2)
+
+    # P_sum_product: (*,)
+    P_sum_product = P_sum_product.to(dtype=dtype)
+    # beta: (*,)
+    beta = B.to(dtype=dtype) / P_sum_product
+    print("beta = ", beta)
+    p = probs.to(dtype=dtype) / P_sum_product.unsqueeze(-1)
+    # ans: shape (*, K)
+    ans = torch.maximum(p, beta.unsqueeze(-1))
+    print("ans = ", ans)
+    # ans_sum: shape (*,)
+    ans_sum = ans.sum(dim=-1)
+    assert torch.all((ans_sum - 1.0).abs() < 0.01)
+    return ans
+
 
 
 def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
@@ -673,7 +735,13 @@ def _test_combined():
                           shifted_samples,
                           P_sum_product)
 
-    indexes = get_indexes_for_samples(P, P_cumsum, P_cumsum_exclusive, shifted_samples)
+    indexes = get_indexes_for_samples(P, P_cumsum,
+                                      P_cumsum_exclusive,
+                                      shifted_samples)
+
+    weights = get_weights_for_samples(P, P_sum_product, B, indexes,
+                                      dtype=torch.float32)
+    print("weights = ", weights)
 
 
 if __name__ == '__main__':
