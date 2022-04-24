@@ -593,10 +593,21 @@ def _test_combined():
     # P_prev_sum_product, of shape (*, N) contains the product of all the P_sum
     # values for the *previous* indexes n, i.e, over n_prev < n.  We divide by
     # P_sum to make it an exclusive, not an inclusive, product.
-    P_prev_sum_product = torch.cumprod(P_sum, dim=-1) // P_sum
+
+    # P_sum_product is the inclusive cumulative product of P_sum, multiplied
+    # over the N axis.
+    # Shape: (B,)
+    P_sum_cumprod = torch.cumprod(P_sum, dim=-1)
+    # P_prev_sum_cumprod is the exclusive-product versin of P_sum_cumprod, i.e.
+    # contains the product over previous elements of P_sum.  Shape: (B,)
+    P_sum_product = P_sum_cumprod[...,-1]
+    print("P_sum_product = ", P_sum_product)
+    P_prev_sum_cumprod = P_sum_cumprod // P_sum
 
 
-    P_cumsum_exclusive_scaled = P_cumsum_exclusive * P_prev_sum_product.unsqueeze(-1)
+    P_cumsum_cat_scaled = P_cumsum_cat * P_prev_sum_cumprod.unsqueeze(-1)
+    P_cumsum_exclusive_scaled = P_cumsum_cat_scaled[...,:-1]
+    P_cumsum_scaled = P_cumsum_cat_scaled[...,1:]
 
     # combined_cumsums: (B, K)
     combined_cumsums = get_combined_cumsums(P,
@@ -606,18 +617,11 @@ def _test_combined():
     print("combined_cumsums + combined_values= ", combined_cumsums + combined_values)
 
 
+    assert torch.all(P_sum_product.unsqueeze(-1) > combined_cumsums)
 
-    # prod_cumsum is the total sum over the M axis [i.e. the last element of cumsum],
-    # multiplied along the N axis, so it can be thought of as the total probability mass,
-    # or the probability's normalizer, of the joint distribution.  Shape: (B,)
-    prod_cumsum = P_cumsum[...,-1].prod(dim=-1)  # (B,)
-    print("prod_cumsum = ", prod_cumsum)
+    assert torch.all(P_sum_product.unsqueeze(-1) >= combined_cumsums + combined_values)
 
-    assert torch.all(prod_cumsum.unsqueeze(-1) > combined_cumsums)
-
-    assert torch.all(prod_cumsum.unsqueeze(-1) >= combined_cumsums + combined_values)
-
-    B, delta_P = compute_beta_prods(prod_cumsum, combined_values)
+    B, delta_P = compute_beta_prods(P_sum_product, combined_values)
 
     assert torch.all(combined_values + delta_P > 0)
 
@@ -667,7 +671,7 @@ def _test_combined():
     check_shifted_samples(combined_cumsums,
                           delta_P,
                           shifted_samples,
-                          prod_cumsum)
+                          P_sum_product)
 
     indexes = get_indexes_for_samples(P, P_cumsum, P_cumsum_exclusive, shifted_samples)
 
