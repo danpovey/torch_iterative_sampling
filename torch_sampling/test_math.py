@@ -26,7 +26,7 @@ def compute_k_largest(X, K):
 
 def get_combined_cumsums(P,
                          P_cumsum,
-                         P_cumsum_exclusive,
+                         P_cumsum_exclusive_scaled,
                          combined_indexes):
     """
     This is a function called while sampling from a distribution that's a product of
@@ -44,7 +44,10 @@ def get_combined_cumsums(P,
           combination with indexes m0, m1, m2, would have a value given by:
               P_cumsum[..., 0, m0] + P_cumsum[..., 1, m1] * sum0 + P_cumsum[..., 2, m2] * sum0 * sum1
           where sum0 is the total sum from cumsum0 (its last element), and so on.
-      P_cumsum_exclusive: exclusive-sum version of P_cumsum, equal to P_cumsum - P
+      P_cumsum_exclusive_scaled: scaled exclusive-sum version of P_cumsum, equal to
+              (P_cumsum - P) * prod_prev_totals
+          where prod_prev_totals is the product of the largest, final elements of P_cumsum
+           over previous n indexes)
         combined_indexes: A tensor of int64 of shape (*, K, N), containing the top-K combinations
           of indexes in {0,1,..,M-1} that have the most probability mass, from greatest to least.
           We are interested in the (exclusive) cumulative sum at these points, i.e.  for each index
@@ -64,22 +67,14 @@ def get_combined_cumsums(P,
     ans = torch.zeros(*combined_indexes.shape[:-1],
                       dtype=P_cumsum.dtype, device=P_cumsum.device)
 
-    # P_sum is the total sum of the individual softmaxes/distributions.
-    # Shape: (*, N)
-    P_sum = P_cumsum.select(dim=-1, index=M-1)
-
-    # P_prev_sum_product, of shape (*, N) contains the product of all the P_sum
-    # values for the *previous* indexes n, i.e, over n_prev < n.  We divide by
-    # P_sum to make it an exclusive, not an inclusive, product.
-    P_prev_sum_product = torch.cumprod(P_sum, dim=-1) // P_sum
-    print("P_sum = ", P_sum)
-    print("P_prev_sum_product = ", P_prev_sum_product)
 
 
-    # P_cumsum_selected, of shape (*, N, K), contains the individual looked-up
+    # P_cumsum_selected_scaled, of shape (*, N, K), contains the individual looked-up
     # exclusive-cumulative-sum values, i.e. the cumulative sum within the
-    # individual softmax/distribution, of all preceding items.
-    P_cumsum_selected = P_cumsum_exclusive.gather(dim=-1, index=combined_indexes.transpose(-2, -1))
+    # individual softmax/distribution, of all preceding items;
+    # these are pre-scaled by the product of total sum [P_sum] over previous
+    # n indexes.
+    P_cumsum_selected_scaled = P_cumsum_exclusive_scaled.gather(dim=-1, index=combined_indexes.transpose(-2, -1))
 
     # P_selected, of shape (*, N, K) contains the individual probability values
     # [corresponding to the indexes we want for the cumulative sum]
@@ -97,7 +92,7 @@ def get_combined_cumsums(P,
     # sums.  [Earlier indexes are considered to vary fastest, this was easiest
     # to implement.]
     # Shape: (*, K)
-    ans = (P_cumsum_selected * P_prev_sum_product.unsqueeze(-1) * P_selected_laterprod).sum(dim=-2)
+    ans = (P_cumsum_selected_scaled * P_selected_laterprod).sum(dim=-2)
     print("Ans = ", ans)
     return ans
 
@@ -596,6 +591,14 @@ def _test_combined():
                               P_cumsum), dim=-1)
     P_cumsum_exclusive = P_cumsum_cat[...,:-1]
     P_cumsum = P_cumsum_cat[...,1:]
+
+    # P_sum is the total sum of the individual softmaxes/distributions.
+    # Shape: (*, N)
+    P_sum = P_cumsum[..., M-1]
+    # P_prev_sum_product, of shape (*, N) contains the product of all the P_sum
+    # values for the *previous* indexes n, i.e, over n_prev < n.  We divide by
+    # P_sum to make it an exclusive, not an inclusive, product.
+    P_prev_sum_product = torch.cumprod(P_sum, dim=-1) // P_sum
 
 
     # combined_cumsums: (B, K)
