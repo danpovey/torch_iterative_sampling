@@ -26,6 +26,7 @@ def compute_k_largest(X, K):
 
 def get_combined_cumsums(P,
                          P_cumsum,
+                         P_cumsum_exclusive,
                          combined_indexes):
     """
     This is a function called while sampling from a distribution that's a product of
@@ -43,6 +44,7 @@ def get_combined_cumsums(P,
           combination with indexes m0, m1, m2, would have a value given by:
               P_cumsum[..., 0, m0] + P_cumsum[..., 1, m1] * sum0 + P_cumsum[..., 2, m2] * sum0 * sum1
           where sum0 is the total sum from cumsum0 (its last element), and so on.
+      P_cumsum_exclusive: exclusive-sum version of P_cumsum, equal to P_cumsum - P
         combined_indexes: A tensor of int64 of shape (*, K, N), containing the top-K combinations
           of indexes in {0,1,..,M-1} that have the most probability mass, from greatest to least.
           We are interested in the (exclusive) cumulative sum at these points, i.e.  for each index
@@ -52,12 +54,6 @@ def get_combined_cumsums(P,
           Returns a Tensor of int64 of shape (*, K), returning the cumulative sum of all
           combinations of indexes preceding each of the ones in 'combined_indexes'.
     """
-    # P_cumsum_shifted, of shape (*, N, M+1), is P_cumsum preceded by a 0 in each row,
-    # so it represents the exclusive-sum.
-    P_cumsum_shifted = torch.cat((torch.zeros(*P_cumsum.shape[:-1], 1, dtype=P_cumsum.dtype,
-                                              device=P_cumsum.device),
-                                  P_cumsum), dim=-1)
-
     M = P_cumsum.shape[-1]
     N = P_cumsum.shape[-2]
     K = combined_indexes.shape[-2]
@@ -81,9 +77,9 @@ def get_combined_cumsums(P,
 
 
     # P_cumsum_selected, of shape (*, N, K), contains the individual looked-up
-    # exclusive-cumulative-sum values, i.e. the cumulative sum within the individual
-    # softmax/distribution, of all preceding items.
-    P_cumsum_selected = P_cumsum_shifted.gather(dim=-1, index=combined_indexes.transpose(-2, -1))
+    # exclusive-cumulative-sum values, i.e. the cumulative sum within the
+    # individual softmax/distribution, of all preceding items.
+    P_cumsum_selected = P_cumsum_exclusive.gather(dim=-1, index=combined_indexes.transpose(-2, -1))
 
     # P_selected, of shape (*, N, K) contains the individual probability values
     # [corresponding to the indexes we want for the cumulative sum]
@@ -91,7 +87,7 @@ def get_combined_cumsums(P,
 
     P_selected_cumprod = torch.cumprod(P_selected, dim=-2)
     # P_selected_laterprod, of shape (*, N, K), contains the sum of
-    # P values for *later* N.
+    # P values for *later* n.
     P_selected_laterprod = P_selected_cumprod[...,N-1:N,:] // P_selected_cumprod
     print("P_selected_laterprod = ", P_selected_laterprod)
 
@@ -316,7 +312,7 @@ def compute_beta_prods(Psum, Ptop):
 
 def compute_shifted_samples(combined_cumsums_mod: Tensor,
                             delta_P: Tensor,
-                            samples: Tensor):
+                            samples: Tensor) -> Tensor:
     """
     Modified randomly sampled values by adding values to correct for "disallowed regions",
     i.e. parts of probability space that we skip because they correspond to a probability
@@ -368,10 +364,6 @@ def check_shifted_samples(combined_cumsums: Tensor,
                  space, including "disallowed regions".    This is to check that
                  `shifted_samples` are less than this value.
     """
-    print("shifted_samples = ", shifted_samples)
-    print("prod_cumsum = ", prod_cumsum)
-    print("Cond1 = ", shifted_samples >= 0)
-    print("Cond2 = ", shifted_samples < prod_cumsum.unsqueeze(-1))
     assert torch.all(torch.logical_and(shifted_samples >= 0,
                                        shifted_samples < prod_cumsum.unsqueeze(-1)))
 
@@ -386,6 +378,90 @@ def check_shifted_samples(combined_cumsums: Tensor,
     in_disallowed_region = torch.logical_and(shifted_samples >= disallowed_regions_start,
                                              shifted_samples < disallowed_regions_end)
     assert torch.all(torch.logical_not(in_disallowed_region))
+
+
+
+def get_indexes_for_samples(P: Tensor,
+                            P_cumsum: Tensor,
+                            P_cumsum_exclusive: Tensor,
+                            shifted_samples: Tensor) -> Tensor:
+    """
+    From K `shifted_samples` which are in the joint probability-space of N softmaxes
+    of size M, figure out which sample indexes they correspond to.
+    Args:
+      P:  of shape (*, N, M), the original integerized probabilities we
+          are interested in the products over [i.e. over the N dimension],
+          e.g. N=2, M=128.
+      P_cumsum:  Of shape (*, N, M), this is the (inclusive) cumulative sum of
+          the original integerized probabilities P.  Conceptually, the entire
+          probability space is over all possible products, over the N
+          dimension, of different choices of m, arranged so that m-indexes for
+          the earlier n indexes vary fastest, like [000,100,200,010,110,210, ... ].
+      P_cumsum_exclusive:  Of shape (*, N, M), the exclusive-sum version of
+          P_cumsum, equivalent to P_cumsum - P.
+      shifted_samples:  Of shape (*, K), contains the random samples we want
+          to find indexes for, "shifted" means we have skipped over "disallowed regions"
+          corresponding to combinations of indexes that had too much probability mass.
+          Will satisfy:
+          0 <= shifted_samples < P_cumsum[...,-1].prod(dim=-1, keepdim=True)
+    Returns:
+        indexes: Of shape (*, K, N), the N-tuples of indexes in {0,1...M-1}
+          corresponding to each of the K samples.
+    """
+
+    # P_sum_cumprod is the cumulative product of the total sum of the original
+    # integerized probabilities P, of shape (*, M)
+    P_sum_cumprod = torch.cumprod(P_cumsum[...,-1], dim=-1)
+    print("P_sum_cumprod = ", P_sum_cumprod)
+    M = P.shape[-1]
+    N = P.shape[-2]
+
+    ans_indexes_shape = list(shifted_samples.shape) + [N]  # (*, K, N)
+    ans_indexes = torch.empty(*ans_indexes_shape, dtype=P.dtype,
+                              device=P.device)
+
+    cur_samples = shifted_samples  # (*, K)
+    for n in range(N-1, -1, -1): # [N-1, N-2, ..., 0]
+        this_samples = cur_samples  # (*, K)
+        print("this_samples = ", this_samples)
+        print("n=", n)
+        if n > 0:
+            # divide by the total product of probs *previous* indexes n,
+            # so we can compare directly with P_cumsum.
+            this_samples = this_samples // P_sum_cumprod[...,n-1:n]
+        # right=True means we find
+        # P_cumsum[...,index-1] <= this_samples[...,k] < P_cumsum[...,index],
+        # which is what we want, as opposed to ... < ... <= (i.e. swap < and <=)
+        idx = ans_indexes[...,n] = torch.searchsorted(P_cumsum[...,n,:], # (*, M)
+                                                      this_samples, # (*, K)
+                                                      right=True)
+        print("idx = ", idx)
+        this_P = torch.gather(P[...,n,:], dim=-1, index=idx)  # shape: (*, K)
+        print("this_P = ", this_P)
+
+        if n == 0:
+            break
+
+        # get cumsum corresponding to the indexes we just computed, we need
+        # to subtract the start of the region corresponding to this index.
+        # need exclusive-sum here..
+        cur_cumsum = torch.gather(P_cumsum_exclusive[...,n,:], dim=-1, index=idx)
+        print("cur_cumsum = ", cur_cumsum)
+        # account for the product of previous dims' total sums...
+        # TODO: multiply P_cumsum by P_sum_cumprod
+        cur_cumsum *= P_sum_cumprod[...,n-1:n]
+        print("cur_cumsum = ", cur_cumsum)
+        # Get the remainder after subtracting the indexes we just worked out,
+        # this will be used to get previous indexes, i.e. for lower n.
+        remainder = cur_samples - cur_cumsum
+        print("remainder = ", remainder)
+        # Also divide by this_P, since all probability masses corresponding
+        # to this index we just worked out will be scaled by this amount.
+        remainder = remainder // this_P
+        cur_samples = remainder
+
+    print("ans_indexes = ", ans_indexes)
+    return ans_indexes
 
 
 
@@ -515,10 +591,16 @@ def _test_combined():
 
 
     l_cumsum = torch.cumsum(l, dim=-1) # (B, N, M)
+    l_cumsum_cat = torch.cat((torch.zeros(*l_cumsum.shape[:-1], 1, dtype=l_cumsum.dtype,
+                                          device=l_cumsum.device),
+                              l_cumsum), dim=-1)
+    l_cumsum_exclusive = l_cumsum_cat[...,:-1]
+    l_cumsum = l_cumsum_cat[...,1:]
 
 
     # combined_cumsums: (B, K)
     combined_cumsums = get_combined_cumsums(l, l_cumsum,
+                                            l_cumsum_exclusive,
                                             combined_indexes)
     print("combined_cumsums = ", combined_cumsums)
     print("combined_cumsums + combined_values= ", combined_cumsums + combined_values)
@@ -586,8 +668,8 @@ def _test_combined():
                           delta_P,
                           shifted_samples,
                           prod_cumsum)
-    assert torch.all(shifted_samples < prod_cumsum.unsqueeze(-1))
 
+    indexes = get_indexes_for_samples(l, l_cumsum, l_cumsum_exclusive, shifted_samples)
 
 
 if __name__ == '__main__':
