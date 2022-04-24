@@ -2,7 +2,7 @@
 
 import torch
 from torch import Tensor
-from typing import Tuple
+from typing import Tuple, Optional
 
 # This file is not part of the implementation; it exists to test that the
 # algorithms described in NOTES.md are correct.
@@ -516,6 +516,9 @@ def get_weights_for_samples(P: Tensor,
     return ans
 
 
+_max_bits = 54  # used in sample_combined_forward and sample_combined_backward,
+                # see comment in sample_combined_forward.
+
 def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
     """
     Sample from a distribution that is the product of softmaxes.  We will sample
@@ -541,6 +544,9 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     p = p.detach()  # call sample_combined() if you need derivatives.
     N = p.shape[-2]
     M = p.shape[-1]
+    assert M & (M-1) == 0 # required for the random reordering to work (see
+                          # rand_perm), this ensures odd numbers would be
+                          # coprime to M.
     dtype = p.dtype
     assert N > 0 and N <= 4
     # allocating 54 bits for the product of distributions means that, for instance,
@@ -551,7 +557,7 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     # the total probability mass.  However it's not super-critical that this
     # gap be very large because in any case we randomize the order of indexes
     # before the sampling procedure.
-    num_bits_per_sample = 54 // N
+    num_bits_per_sample = _max_bits // N
 
     if input_is_log:
         p = p.exp()
@@ -663,12 +669,113 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
                                       shifted_samples)
 
     weights = get_weights_for_samples(P, P_sum_product, B, indexes,
-                                      dtype=torch.float32)
+                                      dtype=p.dtype)
 
     indexes = (indexes * rand_perm.transpose(-2, -1)) % M
 
     return weights, indexes
 
+def sample_combined_backward(p: Tensor, input_is_log: bool, indexes: Tensor,
+                             weights: Tensor, weights_grad: Tensor) -> Tensor:
+    """
+    Backward for sample_combined(); see sample_combined_forward() for detailed docs on
+    the forward pass.  Notice that we don't use Torch's inbuilt autograd for this;
+    that would not give us the answer we want.
+
+    View the output of the forward pass as a sparse vector q.  You can view the
+    forward pass as implementing: q = z p, where z is a sparse vector whose
+    *expected* value is [1,1,..].  Because the expected value of z does not change
+    with p, we treat z as being independent of p, even though actually
+    the detailed distribution of z does depend on p.  So the backprop in non-log
+    space would just be:
+          p_grad = z * output_grad
+    where z is the sparse vector we multiplied by in the forward pass.  Since
+    we can express z as just q / p, this becomes:
+          p_grad = q / p * output_grad
+    where q is the sparse output of the forward pass.  In log-space, this is just
+    equivalent to log_p_grad = log_output_grad.
+    In non-log space, division by p could lead to infinite output if p is zero;
+    in the forward pass we smoothed p by adding 2**-(num_bits_per_sample), and
+    if you work it out, the backprop rule correcting for this would just become
+          p_grad = q / (p + 2**-(num_bits_per_sample) * output_grad
+
+    Args:
+         p: the probabilities as used in the forward pass, of shape (*, N, M)
+  input_is_log: if False, p should be probabilities; if True, p should
+         be normalized log-probs, e.g. the output of log_softmax.
+      weights: the `weights` output of simple_combined_forward, of shape (*, K)
+      indexes:  the `indexes` output of simple_combined_forward, of shape (*, K, N)
+   weights_grad: the loss-function gradient w.r.t the output weights, of shape
+               (*, K)
+    """
+    K = weights.shape[-1]
+    N = indexes.shape[-1]
+
+    log_p_grad = torch.zeros_like(p)  # (*, N, M)
+    # log_weights_grad is derivative w.r.t. log(weights).
+    log_weights_grad = weights_grad * weights
+    # expanded_log_weights_grad: (*, N, K),
+    # duplicate along the N dimension
+    expanded_log_weights_grad = log_weights_grad.unsqueeze(-2).expand(*weights.shape[:-1],
+                                                                      N, K)
+    log_p_grad.scatter_add_(dim=-1, index=indexes.transpose(-2, -1), src=expanded_log_weights_grad)
+
+    if not input_is_log:
+        if p.dtype == torch.float16:
+            raise ValueError("For float16 input you have to use log-space for input probabilities, "
+                             "require input_is_log=True")
+        num_bits_per_sample = _max_bits // N
+        # 2**-num_bits_per_sample is very small, so don't worry about renormalizing p.
+        # This is just to stop division by zero.
+        p_smoothed = p + (2.0**-num_bits_per_sample)
+        log_p_grad.divide_(p_smoothed)
+        return log_p_grad
+    return log_p_grad
+
+class SampleCombinedFunction(torch.autograd.Function):
+    # please see sample_combined() or sample_combined_forward() or
+    # sample_combined_backward() for documentation
+    @staticmethod
+    def forward(ctx, p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
+        with torch.no_grad():
+            weights, indexes = sample_combined_forward(p, K, input_is_log)
+        ctx.save_for_backward(p, indexes, weights)
+        ctx.input_is_log = input_is_log
+        return weights, indexes
+
+    @staticmethod
+    def backward(ctx, weights_grad: Optional[Tensor], indexes_grad: Optional[Tensor]) -> Tuple[Tensor, None, None]:
+        #print("indexes_grad = ", indexes_grad)
+        print("weights_grad = ", weights_grad)
+        #assert indexes_grad is None
+        p, indexes, weights = ctx.saved_tensors
+        p_grad = sample_combined_backward(p, ctx.input_is_log, indexes, weights, weights_grad)
+        return p_grad, None, None
+
+
+def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
+    """
+    Sample from a distribution that is the product of softmaxes.  We will sample
+    K *distinct* samples.  This entails using sampling weights of the form min(1, p/beta)
+    for a computed beta.
+    Args:
+         p: A Tensor of shape (*, N, M): either normalized log-probs (if input_is_log==False),
+             or normalized probabilities; normalized along the M axis.  M must be
+             a power of 2, and N must be in [1,2,3,4].
+         K: An integer, the number of samples required, with 0 < K < N
+   input_is_log:  True if p represents normalized log-probs, False if it represents
+             probabilities.
+
+    Returns: (indexes, weights)
+       indexes: of shape (*, K, N), for each of K samples from a distribution it contains
+            an N-tuple of indexes saying which combination of indexes from the
+            component distributions were sampled.
+       weights: of shape (*, K), gives the weight associated with each sample,
+            which will equal max(p, beta) for a beta specific to the batch element,
+            i.e. to the product of the distributions (0 < beta <= 1/K).  The
+            weights will sum to 1 along the K axis.
+    """
+    return SampleCombinedFunction.apply(p, K, input_is_log)
 
 
 
@@ -691,6 +798,7 @@ def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, 
     if input_is_log:
         p = p.exp()
     M = p.shape[-1]
+    assert M & (M-1) == 0
     two31 = 2 ** 31 # TEMP for testing, should be 2**31
     # to(dtype=this rounds toward 0, which is good enough
     P = (p*two31 + 1).to(dtype=torch.long)
@@ -904,11 +1012,22 @@ def _test_combined2():
     M = 8
 
     p = torch.randn(2, N, M).log_softmax(dim=-1)
+
     print("test_combined2: p = ", p.exp())
     weights, indexes = sample_combined_forward(p, K, True)
     print("test_combined2: p = ", p.exp())
     print("weights = ", weights)
     print("indexes = ", indexes)
+
+    print("test_combined2: p(2nd time) = ", p.exp())
+    p = p.detach()
+    p.requires_grad = True
+    weights, indexes = sample_combined(p, K, True)
+    print("weights2 = ", weights)
+    print("indexes2 = ", indexes)
+
+    weights.sum().backward()
+    print("p grad = ", p.grad)
 
 
 if __name__ == '__main__':
