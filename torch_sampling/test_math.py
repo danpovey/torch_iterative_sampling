@@ -79,7 +79,6 @@ def get_combined_cumsums(P,
     # P_selected_laterprod, of shape (*, N, K), contains the sum of
     # P values for *later* n.
     P_selected_laterprod = P_selected_cumprod[...,N-1:N,:] // P_selected_cumprod
-    print("P_selected_laterprod = ", P_selected_laterprod)
 
 
     # answer is sum over the N dimension, multipliying the
@@ -88,7 +87,6 @@ def get_combined_cumsums(P,
     # to implement.]
     # Shape: (*, K)
     ans = (P_cumsum_selected_scaled * P_selected_laterprod).sum(dim=-2)
-    print("Ans = ", ans)
     return ans
 
 
@@ -266,8 +264,6 @@ def compute_beta_prods(Psum, Ptop):
     # B_k[...,k] is the beta value if k values are >= beta.
     B_k = S1 // Kk  # shape (*, K)
     remainder_k = S1 - (B_k * Kk)   # shape (*, K)
-    print("B_k = ", B_k)
-    print("remainder_k = ", remainder_k)
 
     large_int = (2**63 - 1)
     # Ptop_shifted is Ptop shifted right with a large value put first, i.e.
@@ -275,8 +271,6 @@ def compute_beta_prods(Psum, Ptop):
     Ptop_shifted = torch.cat((torch.full((*Ptop.shape[:-1], 1), large_int),
                               Ptop[...,:K-1]), dim=-1)
 
-    print("Ptop= ", Ptop)
-    print("Ptop_shifted= ", Ptop_shifted)
 
     # is_ok corresponds to: "(k==0 or R[M-k] > B_k) and R[M-1-k] <= B_k" in NOTES.md
     # It is true only for the "correct" k for each batch element, that corresponds
@@ -285,16 +279,10 @@ def compute_beta_prods(Psum, Ptop):
 
     # `indexes` are the values of k.
     B, indexes = torch.max(B_k * is_ok, dim=-1)  # shape: (*,)
-    print("B = ", B)
 
     delta_P = (torch.minimum(Ptop, B.unsqueeze(-1)) - Ptop) - (remainder_k * is_ok)
 
-    print("B_k = ", B_k)
-    print("is_ok == ", is_ok)
-    print("delta_P = ", delta_P)
-
     err = Psum + delta_P.sum(dim=-1) - B * K
-    print("Err = ", err)
     assert torch.all(err == 0)
     assert torch.all(torch.sum(is_ok, dim=-1)[0] == 1)
 
@@ -402,7 +390,6 @@ def get_indexes_for_samples(P: Tensor,
     # P_sum_cumprod is the cumulative product of the total sum of the original
     # integerized probabilities P, of shape (*, M)
     P_sum_cumprod = torch.cumprod(P_cumsum[...,-1], dim=-1)
-    print("P_sum_cumprod = ", P_sum_cumprod)
     M = P.shape[-1]
     N = P.shape[-2]
 
@@ -413,8 +400,6 @@ def get_indexes_for_samples(P: Tensor,
     cur_samples = shifted_samples  # (*, K)
     for n in range(N-1, -1, -1): # [N-1, N-2, ..., 0]
         this_samples = cur_samples  # (*, K)
-        print("this_samples = ", this_samples)
-        print("n=", n)
         if n > 0:
             # divide by the total product of probs *previous* indexes n,
             # so we can compare directly with P_cumsum.
@@ -425,9 +410,7 @@ def get_indexes_for_samples(P: Tensor,
         idx = ans_indexes[...,n] = torch.searchsorted(P_cumsum[...,n,:], # (*, M)
                                                       this_samples, # (*, K)
                                                       right=True)
-        print("idx = ", idx)
         this_P = torch.gather(P[...,n,:], dim=-1, index=idx)  # shape: (*, K)
-        print("this_P = ", this_P)
 
         if n == 0:
             break
@@ -436,21 +419,17 @@ def get_indexes_for_samples(P: Tensor,
         # to subtract the start of the region corresponding to this index.
         # need exclusive-sum here..
         cur_cumsum = torch.gather(P_cumsum_exclusive[...,n,:], dim=-1, index=idx)
-        print("cur_cumsum = ", cur_cumsum)
         # account for the product of previous dims' total sums...
         # TODO: multiply P_cumsum by P_sum_cumprod
         cur_cumsum *= P_sum_cumprod[...,n-1:n]
-        print("cur_cumsum = ", cur_cumsum)
         # Get the remainder after subtracting the indexes we just worked out,
         # this will be used to get previous indexes, i.e. for lower n.
         remainder = cur_samples - cur_cumsum
-        print("remainder = ", remainder)
         # Also divide by this_P, since all probability masses corresponding
         # to this index we just worked out will be scaled by this amount.
         remainder = remainder // this_P
         cur_samples = remainder
 
-    print("ans_indexes = ", ans_indexes)
     return ans_indexes
 
 def get_weights_for_samples(P: Tensor,
@@ -505,11 +484,9 @@ def get_weights_for_samples(P: Tensor,
     P_sum_product = P_sum_product.to(dtype=dtype)
     # beta: (*,)
     beta = B.to(dtype=dtype) / P_sum_product
-    print("beta = ", beta)
     p = probs.to(dtype=dtype) / P_sum_product.unsqueeze(-1)
     # ans: shape (*, K)
     ans = torch.maximum(p, beta.unsqueeze(-1))
-    print("ans = ", ans)
     # ans_sum: shape (*,)
     ans_sum = ans.sum(dim=-1)
     assert torch.all((ans_sum - 1.0).abs() < 0.01)
@@ -610,7 +587,6 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     # P_prev_sum_cumprod is the exclusive-product versin of P_sum_cumprod, i.e.
     # contains the product over previous elements of P_sum.  Shape: (B,)
     P_sum_product = P_sum_cumprod[...,-1]
-    print("P_sum_product = ", P_sum_product)
     P_prev_sum_cumprod = P_sum_cumprod // P_sum
 
 
@@ -745,11 +721,9 @@ class SampleCombinedFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, weights_grad: Optional[Tensor], indexes_grad: Optional[Tensor]) -> Tuple[Tensor, None, None]:
-        #print("indexes_grad = ", indexes_grad)
-        print("weights_grad = ", weights_grad)
-        #assert indexes_grad is None
         p, indexes, weights = ctx.saved_tensors
-        p_grad = sample_combined_backward(p, ctx.input_is_log, indexes, weights, weights_grad)
+        p_grad = sample_combined_backward(p, ctx.input_is_log, indexes,
+                                          weights, weights_grad)
         return p_grad, None, None
 
 
@@ -802,10 +776,8 @@ def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, 
     two31 = 2 ** 31 # TEMP for testing, should be 2**31
     # to(dtype=this rounds toward 0, which is good enough
     P = (p*two31 + 1).to(dtype=torch.long)
-    print("P = ", P)
     B = compute_beta(P, K)
     beta = B / two31
-    print("B = ", B, ", beta = ", beta)
     t = torch.randint(M//2, p.shape[:-1] + (1,))  # shape: *, 1
     s = t * 2 + 1
     #s = torch.ones_like(t)
@@ -823,10 +795,6 @@ def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, 
     # Let b be a random integer drawn uniformly from {0, 1, ..., B-1}.
     b = torch.randint((2**63 - 1), B.shape) % B
 
-    print("R = ", R)
-    print("S = ", S)
-    print("b = ", b)
-
     S_prev = torch.cat((torch.zeros(*S.shape[:-1], 1), S[...,:-1]), dim=-1)
 
     k_prev = (S_prev + b) // B
@@ -834,15 +802,11 @@ def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, 
     # if S_prev >= b and k_cur > k_prev:.. don't need S_prev >= b because rounded down.
     is_ok = (k_cur > k_prev)
 
-    print("is_ok = ", is_ok, ", sum = ", is_ok.sum(dim=-1))
-    print("k_cur = ", k_cur)
     # sort so the "false" goes first and the "true" goes in last K indexes.
     values, indices = is_ok.sort(dim=-1)
     i = indices[...,M-K:M]
     i = (i * s) % M  # Reverse the pseudo-random reordering
-    print("beta = ", beta)
     y = torch.maximum(torch.gather(p, dim=-1, index=i), beta)
-    print("i = ", i, ", y = ", y)
     assert torch.all(is_ok.sum(dim=-1) == K)
     assert torch.all((y.sum(dim=-1) - 1.0).abs() < 0.01)
 
