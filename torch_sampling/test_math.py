@@ -565,10 +565,10 @@ def _test_combined():
     K = 4
     M = 8
 
-    l = ((5 * torch.randn(2, N, M)).softmax(dim=-1) * 16 + 1).to(dtype=torch.int64)
+    P = ((5 * torch.randn(2, N, M)).softmax(dim=-1) * 16 + 1).to(dtype=torch.int64)
 
-    print("l = ", l)
-    values, indexes = compute_k_largest(l, K)
+    print("P = ", P)
+    values, indexes = compute_k_largest(P, K)
     print("largest values = ", values)
     print("largest indexes = ", indexes)
     prod_values, prod_indexes = compute_products(values, indexes)
@@ -590,17 +590,17 @@ def _test_combined():
     print("combined_indexes = ", combined_indexes)
 
 
-    l_cumsum = torch.cumsum(l, dim=-1) # (B, N, M)
-    l_cumsum_cat = torch.cat((torch.zeros(*l_cumsum.shape[:-1], 1, dtype=l_cumsum.dtype,
-                                          device=l_cumsum.device),
-                              l_cumsum), dim=-1)
-    l_cumsum_exclusive = l_cumsum_cat[...,:-1]
-    l_cumsum = l_cumsum_cat[...,1:]
+    P_cumsum = torch.cumsum(P, dim=-1) # (B, N, M)
+    P_cumsum_cat = torch.cat((torch.zeros(*P_cumsum.shape[:-1], 1, dtype=P_cumsum.dtype,
+                                          device=P_cumsum.device),
+                              P_cumsum), dim=-1)
+    P_cumsum_exclusive = P_cumsum_cat[...,:-1]
+    P_cumsum = P_cumsum_cat[...,1:]
 
 
     # combined_cumsums: (B, K)
-    combined_cumsums = get_combined_cumsums(l, l_cumsum,
-                                            l_cumsum_exclusive,
+    combined_cumsums = get_combined_cumsums(P, P_cumsum,
+                                            P_cumsum_exclusive,
                                             combined_indexes)
     print("combined_cumsums = ", combined_cumsums)
     print("combined_cumsums + combined_values= ", combined_cumsums + combined_values)
@@ -610,7 +610,7 @@ def _test_combined():
     # prod_cumsum is the total sum over the M axis [i.e. the last element of cumsum],
     # multiplied along the N axis, so it can be thought of as the total probability mass,
     # or the probability's normalizer, of the joint distribution.  Shape: (B,)
-    prod_cumsum = l_cumsum[...,-1].prod(dim=-1)  # (B,)
+    prod_cumsum = P_cumsum[...,-1].prod(dim=-1)  # (B,)
     print("prod_cumsum = ", prod_cumsum)
 
     assert torch.all(prod_cumsum.unsqueeze(-1) > combined_cumsums)
@@ -669,7 +669,7 @@ def _test_combined():
                           shifted_samples,
                           prod_cumsum)
 
-    indexes = get_indexes_for_samples(l, l_cumsum, l_cumsum_exclusive, shifted_samples)
+    indexes = get_indexes_for_samples(P, P_cumsum, P_cumsum_exclusive, shifted_samples)
 
 
 if __name__ == '__main__':
