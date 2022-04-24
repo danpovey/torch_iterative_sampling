@@ -4,6 +4,8 @@ import torch
 from torch import Tensor
 from typing import Tuple, Optional
 
+# The main export of this file is the function sample_combined().
+
 # This file is not part of the implementation; it exists to test that the
 # algorithms described in NOTES.md are correct.
 
