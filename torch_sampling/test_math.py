@@ -970,7 +970,7 @@ def _test_combined():
                                       dtype=torch.float32)
     print("weights = ", weights)
 
-def _test_combined2():
+def _test_sample_combined():
     for N in [2, 3]:
         K = 4
         M = 8
@@ -994,8 +994,34 @@ def _test_combined2():
         print("p grad = ", p.grad)
 
 
+def _test_sample_combined_mean():
+    for N in [2, 3]:
+        K = 4
+        M = 8
+
+        p = torch.randn(2, N, M).log_softmax(dim=-1)
+
+        avg_p = torch.zeros_like(p)
+        num_samples = 1000
+        for _ in range(num_samples):
+
+            # weights: (B, K)
+            # indexes: (B, K, N)
+            weights, indexes = sample_combined_forward(p, K, True)
+
+            sampled_p = torch.zeros_like(p)
+            weights_expanded = weights.unsqueeze(-2).expand(*weights.shape[:-1], N, K)
+            sampled_p.scatter_add_(dim=-1, index=indexes.transpose(-2, -1),
+                                   src=weights_expanded)
+            avg_p += sampled_p * (1.0/num_samples)
+        print("sample_combined_mean(): N = ", N, ", p = ", p.exp())
+        print("avg_p = ", avg_p)
+
+
+
 if __name__ == '__main__':
-    _test_combined2()
+    _test_sample_combined()
+    _test_sample_combined_mean()
     _test_combined()
     _test_compute_beta()
     _test_soft_sample()
