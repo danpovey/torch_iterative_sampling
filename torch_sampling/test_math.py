@@ -516,6 +516,150 @@ def get_weights_for_samples(P: Tensor,
     return ans
 
 
+def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
+    """
+    Sample from a distribution that is the product of softmaxes.  We will sample
+    K *distinct* samples.  This entails using sampling weights of the form min(1, p/beta)
+    for a computed beta.
+    Args:
+         p: A Tensor of shape (*, N, M): either normalized log-probs (if input_is_log==False),
+             or normalized probabilities; normalized along the M axis.  M must be
+             a power of 2, and N must be in [1,2,3,4].
+         K: An integer, the number of samples required, with 0 < K < N
+   input_is_log:  True if p represents normalized log-probs, False if it represents
+             probabilities.
+
+    Returns: (indexes, weights)
+       indexes: of shape (*, K, N), for each of K samples from a distribution it contains
+            an N-tuple of indexes saying which combination of indexes from the
+            component distributions were sampled.
+       weights: of shape (*, K), gives the weight associated with each sample,
+            which will equal max(p, beta) for a beta specific to the batch element,
+            i.e. to the product of the distributions (0 < beta <= 1/K).  The
+            weights will sum to 1 along the K axis.
+    """
+    p = p.detach()  # call sample_combined() if you need derivatives.
+    N = p.shape[-2]
+    M = p.shape[-1]
+    dtype = p.dtype
+    assert N > 0 and N <= 4
+    # allocating 54 bits for the product of distributions means that, for instance,
+    # with 3 distributions we can have 18 bits per distribution.  The reason
+    # we don't go closer to 64, is that to choose random numbers we
+    # do: `b = torch.randint((2**63 - 1), B.shape) % B`, and for this to actually
+    # be uniformly distributed we need 2**63 - 1 to be substantially larger than
+    # the total probability mass.  However it's not super-critical that this
+    # gap be very large because in any case we randomize the order of indexes
+    # before the sampling procedure.
+    num_bits_per_sample = 54 // N
+
+    if input_is_log:
+        p = p.exp()
+
+    # the + 1 is because we need all elements of P to be nonzero (this will avoid
+    # some nasty edge cases)
+    P = (p * (2**(num_bits_per_sample)) + 1).to(dtype=torch.int64)
+    values, indexes = compute_k_largest(P, K)
+    prod_values, prod_indexes = compute_products(values, indexes)
+
+    # combined_values, combined_indexes: (B, K) these are the top-K
+    # most-probable combinations of (integerized_ probabilities and their
+    # indexes, from largest to smallest probability
+    combined_values, combined_indexes = compute_k_largest(prod_values, K)
+
+    # let combined_indexes contain the original N-tuples
+    combined_indexes_shape = list(combined_indexes.shape) + [N]
+    # combined_indexes: (B, K, N)
+    combined_indexes = torch.gather(prod_indexes, dim=-2,
+                                    index=combined_indexes.unsqueeze(-1).expand(combined_indexes_shape))
+
+    P_cumsum = torch.cumsum(P, dim=-1) # (B, N, M)
+    P_cumsum_cat = torch.cat((torch.zeros(*P_cumsum.shape[:-1], 1, dtype=P_cumsum.dtype,
+                                          device=P_cumsum.device),
+                              P_cumsum), dim=-1)
+    P_cumsum_exclusive = P_cumsum_cat[...,:-1]
+    P_cumsum = P_cumsum_cat[...,1:]
+
+    # P_sum is the total sum of the individual softmaxes/distributions.
+    # Shape: (*, N)
+    P_sum = P_cumsum[..., M-1]
+    # P_prev_sum_product, of shape (*, N) contains the product of all the P_sum
+    # values for the *previous* indexes n, i.e, over n_prev < n.  We divide by
+    # P_sum to make it an exclusive, not an inclusive, product.
+
+    # P_sum_product is the inclusive cumulative product of P_sum, multiplied
+    # over the N axis.
+    # Shape: (B,)
+    P_sum_cumprod = torch.cumprod(P_sum, dim=-1)
+    # P_prev_sum_cumprod is the exclusive-product versin of P_sum_cumprod, i.e.
+    # contains the product over previous elements of P_sum.  Shape: (B,)
+    P_sum_product = P_sum_cumprod[...,-1]
+    print("P_sum_product = ", P_sum_product)
+    P_prev_sum_cumprod = P_sum_cumprod // P_sum
+
+
+    P_cumsum_cat_scaled = P_cumsum_cat * P_prev_sum_cumprod.unsqueeze(-1)
+    P_cumsum_exclusive_scaled = P_cumsum_cat_scaled[...,:-1]
+    P_cumsum_scaled = P_cumsum_cat_scaled[...,1:]
+
+    # combined_cumsums: (B, K)
+    combined_cumsums = get_combined_cumsums(P,
+                                            P_cumsum_exclusive_scaled,
+                                            combined_indexes)
+
+    B, delta_P = compute_beta_prods(P_sum_product, combined_values)
+
+
+    # reorder combined_cumsums from smallest to largest, which we'll require
+    # when interpolating the "skipped regions" into the random numbers.
+    combined_cumsums, reorder_indexes = torch.sort(combined_cumsums, dim=-1)
+    # also reorder delta_P [so that delta_P and combined_cumsums are reordered
+    # in the same way]
+    delta_P = torch.gather(delta_P, dim=-1, index=reorder_indexes)
+
+    # delta_P_exclusive, of shape (*, K), is the exclusive cumulative sum of
+    # delta_P, containing negative values.
+    delta_P_cumsum = torch.cumsum(delta_P, dim=-1)
+    delta_P_exclusive = delta_P_cumsum - delta_P
+
+    # combined_cumsums_mod is combined_cumsums modified by adding the product
+    # of previous delta_P's (which will be negative).  This compensates for
+    # the fact that the random numbers in "sampled_values" are in a compressed
+    # space where we "skip over" regions of size -delta_P.
+    #
+    # These are the cutoffs for subtracting the delta_P's
+    # from sampled_values
+    combined_cumsums_mod = combined_cumsums + delta_P_exclusive
+
+
+    # CAUTION: if the product of sums is too large, this rand_values
+    # will not be sufficiently
+    # random!!  We need to leave some headroom.
+    # rand_values are random in {0, 1, ..., B-1}
+    rand = torch.randint((2**63 - 1), B.shape) % B
+    # rand, rand + B, rand + 2B, ...., rand + (K-1)B
+    samples = rand.unsqueeze(-1) + B.unsqueeze(-1) * torch.arange(K)
+
+    shifted_samples = compute_shifted_samples(combined_cumsums_mod,
+                                              delta_P,
+                                              samples)
+
+    # TODO: could remove the next call
+    check_shifted_samples(combined_cumsums, delta_P,
+                          shifted_samples, P_sum_product)
+
+    indexes = get_indexes_for_samples(P, P_cumsum,
+                                      P_cumsum_exclusive,
+                                      shifted_samples)
+
+    weights = get_weights_for_samples(P, P_sum_product, B, indexes,
+                                      dtype=torch.float32)
+
+
+    return indexes, weights
+
+
+
 
 def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
     """
@@ -743,8 +887,20 @@ def _test_combined():
                                       dtype=torch.float32)
     print("weights = ", weights)
 
+def _test_combined2():
+    N = 2
+    K = 4
+    M = 8
+
+    p = torch.randn(2, N, M).log_softmax(dim=-1)
+    print("test_combined2: p = ", p.exp())
+    weights, indexes = sample_combined_forward(p, K, True)
+    print("weights = ", weights)
+    print("indexes = ", indexes)
+
 
 if __name__ == '__main__':
+    _test_combined2()
     _test_combined()
     _test_compute_beta()
     _test_soft_sample()
