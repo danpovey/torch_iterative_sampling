@@ -556,6 +556,16 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     if input_is_log:
         p = p.exp()
 
+    # rand_perm is in {1,3,..M-1}, it is of shape (*, N, 1); we'll
+    # use it to pseudo-randomly reorder each distribution.
+    rand_perm = torch.randint(M//2, p.shape[:-1] + (1,), device=p.device) * 2 + 1
+    # Note: we could implement this more efficiently with a special kernel.
+    rand_perm_indexes = (rand_perm * torch.arange(M, device=p.device)) % M
+    # reorder the elements of p; we'll correct for the reordering later when
+    # we return indexes.
+    p = torch.gather(p, dim=-1, index=rand_perm_indexes)
+
+
     # the + 1 is because we need all elements of P to be nonzero (this will avoid
     # some nasty edge cases)
     P = (p * (2**(num_bits_per_sample)) + 1).to(dtype=torch.int64)
@@ -655,8 +665,9 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     weights = get_weights_for_samples(P, P_sum_product, B, indexes,
                                       dtype=torch.float32)
 
+    indexes = (indexes * rand_perm.transpose(-2, -1)) % M
 
-    return indexes, weights
+    return weights, indexes
 
 
 
@@ -895,6 +906,7 @@ def _test_combined2():
     p = torch.randn(2, N, M).log_softmax(dim=-1)
     print("test_combined2: p = ", p.exp())
     weights, indexes = sample_combined_forward(p, K, True)
+    print("test_combined2: p = ", p.exp())
     print("weights = ", weights)
     print("indexes = ", indexes)
 
