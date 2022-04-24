@@ -25,7 +25,6 @@ def compute_k_largest(X, K):
     return values[...,:K], indexes[...,:K]
 
 def get_combined_cumsums(P,
-                         P_cumsum,
                          P_cumsum_exclusive_scaled,
                          combined_indexes):
     """
@@ -35,16 +34,8 @@ def get_combined_cumsums(P,
     Args:
        P: Tensor of int64 of shape (*, N, M), containing the individual integerized
           probabilities of classes.
-       P_cumsum: Tensor of int64 of shape (*, N, M), containing the (inclusive) cumulative
-          sums of the integerized individual softmaxes.  Suppose that N == 3, so we have
-            cumsum0 = P_sumsum[...,0,:], cumsum1 = P_cumsum[...,1,:], cumsum2 = P_cumsum[...,2,:].
-          We assign probability mass to combinations of indexes over the N axes, by
-          multipliying these integerized probabilities, and we're interested in the cumulative
-          sum of these products, assuming that index 0 varies fastest.  So the (inclusive) cumsum of the
-          combination with indexes m0, m1, m2, would have a value given by:
-              P_cumsum[..., 0, m0] + P_cumsum[..., 1, m1] * sum0 + P_cumsum[..., 2, m2] * sum0 * sum1
-          where sum0 is the total sum from cumsum0 (its last element), and so on.
-      P_cumsum_exclusive_scaled: scaled exclusive-sum version of P_cumsum, equal to
+      P_cumsum_exclusive_scaled: scaled exclusive-sum version of P_cumsum which is cumulative
+           sum of P along M dimension, equal to
               (P_cumsum - P) * prod_prev_totals
           where prod_prev_totals is the product of the largest, final elements of P_cumsum
            over previous n indexes)
@@ -56,18 +47,22 @@ def get_combined_cumsums(P,
       Returns:
           Returns a Tensor of int64 of shape (*, K), returning the cumulative sum of all
           combinations of indexes preceding each of the ones in 'combined_indexes'.
+
+          We assign probability mass to combinations of indexes over the N axes, by
+          multipliying these integerized probabilities, and we're interested in the cumulative
+          sum of these products, assuming that index 0 varies fastest.  So the (inclusive) cumsum of the
+          combination with indexes m0, m1, m2, would have a value given by:
+              P_cumsum[..., 0, m0] + P_cumsum[..., 1, m1] * sum0 + P_cumsum[..., 2, m2] * sum0 * sum1
+          where sum0 is the total sum from cumsum0 (its last element), and so on.
     """
-    M = P_cumsum.shape[-1]
-    N = P_cumsum.shape[-2]
+    M = P.shape[-1]
+    N = P.shape[-2]
     K = combined_indexes.shape[-2]
     assert combined_indexes.shape[-1] == N
-    assert combined_indexes.shape[:-2] == P_cumsum.shape[:-2]
+    assert combined_indexes.shape[:-2] == P.shape[:-2]
 
     # ans: shape (*, K)
-    ans = torch.zeros(*combined_indexes.shape[:-1],
-                      dtype=P_cumsum.dtype, device=P_cumsum.device)
-
-
+    ans = torch.zeros(*combined_indexes.shape[:-1], dtype=P.dtype, device=P.device)
 
     # P_cumsum_selected_scaled, of shape (*, N, K), contains the individual looked-up
     # exclusive-cumulative-sum values, i.e. the cumulative sum within the
@@ -601,9 +596,11 @@ def _test_combined():
     P_prev_sum_product = torch.cumprod(P_sum, dim=-1) // P_sum
 
 
+    P_cumsum_exclusive_scaled = P_cumsum_exclusive * P_prev_sum_product.unsqueeze(-1)
+
     # combined_cumsums: (B, K)
-    combined_cumsums = get_combined_cumsums(P, P_cumsum,
-                                            P_cumsum_exclusive,
+    combined_cumsums = get_combined_cumsums(P,
+                                            P_cumsum_exclusive_scaled,
                                             combined_indexes)
     print("combined_cumsums = ", combined_cumsums)
     print("combined_cumsums + combined_values= ", combined_cumsums + combined_values)
