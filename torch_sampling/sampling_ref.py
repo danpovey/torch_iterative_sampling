@@ -742,14 +742,14 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
 
-    Returns: (indexes, weights)
-       indexes: of shape (*, K, N), for each of K samples from a distribution it contains
-            an N-tuple of indexes saying which combination of indexes from the
-            component distributions were sampled.
+    Returns: (weights, indexes)
        weights: of shape (*, K), gives the weight associated with each sample,
             which will equal max(p, beta) for a beta specific to the batch element,
             i.e. to the product of the distributions (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
+       indexes: of shape (*, K, N), for each of K samples from a distribution it contains
+            an N-tuple of indexes saying which combination of indexes from the
+            component distributions were sampled.
     """
     return SampleCombinedFunction.apply(p, K, input_is_log)
 
@@ -814,18 +814,7 @@ def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, 
 
 
 
-class SoftSampleFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, p: Tensor, K: int, input_is_log: bool):
-        """
-        Forward function.
-        Args:
-          p: Tensor of shape (*, M)
-          K: number of samples, 1 <= K < M
-          input_is_log: if true, p must be probabilities in [0..1] that sum to one;
-              if false, p must be logprobs (that sum to one after exp())
-        """
-        pass
+
 
 def _test_compute_beta():
     # use a small M-- 8 here-- because it's more likely to
