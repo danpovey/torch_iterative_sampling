@@ -971,27 +971,27 @@ def _test_combined():
     print("weights = ", weights)
 
 def _test_combined2():
-    N = 2
-    K = 4
-    M = 8
+    for N in [2, 3]:
+        K = 4
+        M = 8
 
-    p = torch.randn(2, N, M).log_softmax(dim=-1)
+        p = torch.randn(2, N, M).log_softmax(dim=-1)
 
-    print("test_combined2: p = ", p.exp())
-    weights, indexes = sample_combined_forward(p, K, True)
-    print("test_combined2: p = ", p.exp())
-    print("weights = ", weights)
-    print("indexes = ", indexes)
+        print("N = ", N, ", test_combined2: p = ", p.exp())
+        weights, indexes = sample_combined_forward(p, K, True)
+        print("test_combined2: p = ", p.exp())
+        print("weights = ", weights)
+        print("indexes = ", indexes)
 
-    print("test_combined2: p(2nd time) = ", p.exp())
-    p = p.detach()
-    p.requires_grad = True
-    weights, indexes = sample_combined(p, K, True)
-    print("weights2 = ", weights)
-    print("indexes2 = ", indexes)
+        print("test_combined2: p(2nd time) = ", p.exp())
+        p = p.detach()
+        p.requires_grad = True
+        weights, indexes = sample_combined(p, K, True)
+        print("weights2 = ", weights)
+        print("indexes2 = ", indexes)
 
-    weights.sum().backward()
-    print("p grad = ", p.grad)
+        weights.sum().backward()
+        print("p grad = ", p.grad)
 
 
 if __name__ == '__main__':
