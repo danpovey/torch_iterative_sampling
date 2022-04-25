@@ -122,7 +122,7 @@ Defining some dimensions with example numbers:
    # giving total weight (K-k) beta, plus k samples in the sum: \sum_{i: p_i > beta} p_i.
    # We can rearrange this as (eqn:0).
    # The resulting probabilities of sampling various items will be given by r, here
-   #   r = min(1, \beta p)          (eqn:1)
+   #   r = min(1, p / \beta)          (eqn:1)
    # See ComputeBeta() [mathematical version] for how beta is computed.
    beta = ComputeBeta(p, K)  # beta: float
    r = min(1, p / beta)   # r: tensor of inclusion probabilities of shape (M,) with sum(r) == K
