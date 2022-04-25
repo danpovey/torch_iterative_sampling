@@ -1,6 +1,16 @@
 
  # Some notes on knowledge-bank lookup
 
+[Caution: this NOTES.md is slightly out of date, but still useful in explaining
+the basic principles. We make reference in this NOTES.md to doing two sequential
+sampling operations, first from the indiviudal distributions and then from the
+product of the 1st samples.  In the end we realized that this is not optimal;
+what we implemented in sampling_ref.py is based on doing a single sampling
+operation, from a joint distribution that's the product of discrete
+distributions.  The same basic principles apply but it gets a little more
+complicated.  It is all documented in the code though]
+
+
 This is a sampling operation intended for use in an efficient "knowledge-bank
 lookup" operation for neural nets.  The knowledge bank is part of the neural
 net's parameters; we avoid using the term "memory" because "memory" generally
@@ -173,7 +183,7 @@ Defining some dimensions with example numbers:
   y = Reorder(x, s):
 
     x is a vector of length M, with M a power of 2.
-    s is a random integer in {1, 3, ..., M/2 - 1}
+    s is a random integer in {1, 3, ..., M-1}
 
   For 0 <= i < M:
     y[i] = x[(i*s) % M]
