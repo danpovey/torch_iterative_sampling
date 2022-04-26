@@ -28,9 +28,9 @@ def compute_k_largest(X, K):
     values, indexes = torch.sort(X, dim=-1, descending=True)
     return values[...,:K], indexes[...,:K]
 
-def get_combined_cumsums(P,
-                         P_cumsum_exclusive_scaled,
-                         combined_indexes):
+def get_topK_cumsums(P,
+                     P_cumsum_exclusive_scaled,
+                     topK_indexes):
     """
     This is a function called while sampling from a distribution that's a product of
     N categorical distributions each of size M.
@@ -43,14 +43,14 @@ def get_combined_cumsums(P,
               (P_cumsum - P) * prod_prev_totals
           where prod_prev_totals is the product of the largest, final elements of P_cumsum
            over previous n indexes)
-        combined_indexes: A tensor of int64 of shape (*, K, N), containing the top-K combinations
+        topK_indexes: A tensor of int64 of shape (*, K, N), containing the top-K combinations
           of indexes in {0,1,..,M-1} that have the most probability mass, from greatest to least.
           We are interested in the (exclusive) cumulative sum at these points, i.e.  for each index
-          in `combined_indexes` we are interested in the sum of all prior items.
+          in `topK_indexes` we are interested in the sum of all prior items.
 
       Returns:
           Returns a Tensor of int64 of shape (*, K), returning the cumulative sum of all
-          combinations of indexes preceding each of the ones in 'combined_indexes'.
+          combinations of indexes preceding each of the ones in 'topK_indexes'.
 
           We assign probability mass to combinations of indexes over the N axes, by
           multipliying these integerized probabilities, and we're interested in the cumulative
@@ -61,23 +61,23 @@ def get_combined_cumsums(P,
     """
     M = P.shape[-1]
     N = P.shape[-2]
-    K = combined_indexes.shape[-2]
-    assert combined_indexes.shape[-1] == N
-    assert combined_indexes.shape[:-2] == P.shape[:-2]
+    K = topK_indexes.shape[-2]
+    assert topK_indexes.shape[-1] == N
+    assert topK_indexes.shape[:-2] == P.shape[:-2]
 
     # ans: shape (*, K)
-    ans = torch.zeros(*combined_indexes.shape[:-1], dtype=P.dtype, device=P.device)
+    ans = torch.zeros(*topK_indexes.shape[:-1], dtype=P.dtype, device=P.device)
 
     # P_cumsum_selected_scaled, of shape (*, N, K), contains the individual looked-up
     # exclusive-cumulative-sum values, i.e. the cumulative sum within the
     # individual softmax/distribution, of all preceding items;
     # these are pre-scaled by the product of total sum [P_sum] over previous
     # n indexes.
-    P_cumsum_selected_scaled = P_cumsum_exclusive_scaled.gather(dim=-1, index=combined_indexes.transpose(-2, -1))
+    P_cumsum_selected_scaled = P_cumsum_exclusive_scaled.gather(dim=-1, index=topK_indexes.transpose(-2, -1))
 
     # P_selected, of shape (*, N, K) contains the individual probability values
     # [corresponding to the indexes we want for the cumulative sum]
-    P_selected = P.gather(dim=-1, index=combined_indexes.transpose(-2, -1))
+    P_selected = P.gather(dim=-1, index=topK_indexes.transpose(-2, -1))
 
     P_selected_cumprod = torch.cumprod(P_selected, dim=-2)
     # P_selected_laterprod, of shape (*, N, K), contains the sum of
@@ -293,7 +293,7 @@ def compute_beta_prods(Psum, Ptop):
 
     return B, delta_P
 
-def compute_shifted_samples(combined_cumsums_mod: Tensor,
+def compute_shifted_samples(topK_cumsums_mod: Tensor,
                             delta_P: Tensor,
                             samples: Tensor) -> Tensor:
     """
@@ -301,7 +301,7 @@ def compute_shifted_samples(combined_cumsums_mod: Tensor,
     i.e. parts of probability space that we skip because they correspond to a probability
     mass greater than beta [or because they correspond to small padding for roundoff].
 
-      combined_cumsums_mod:  Modified cumulative sums which when they were "combined_cumsums"
+      topK_cumsums_mod:  Modified cumulative sums which when they were "topK_cumsums"
                  can be thought of as points in probability space, but when they become
                  "modified" are reduced to account for "disallowed regions" that
                  we cannot sample.  The shape is (*, K) where `*` is the batch dimension
@@ -316,18 +316,18 @@ def compute_shifted_samples(combined_cumsums_mod: Tensor,
                  with larger values, i.e. shifted_samples >= samples
     """
     samples = samples.unsqueeze(-1)
-    combined_cumsums_mod = combined_cumsums_mod.unsqueeze(-2)
+    topK_cumsums_mod = topK_cumsums_mod.unsqueeze(-2)
     delta_P = delta_P.unsqueeze(-2)
 
-    # of shape (*, K, K), is_ge is True if sample k1 is >= combined_cumsum k2,
+    # of shape (*, K, K), is_ge is True if sample k1 is >= topK_cumsum k2,
     # meaning we need to add the corresponding delta_p.
-    is_ge = (samples >= combined_cumsums_mod)
+    is_ge = (samples >= topK_cumsums_mod)
 
     shifted_samples = samples - (is_ge * delta_P).sum(dim=-1, keepdim=True)
     shifted_samples = shifted_samples.squeeze(-1)
     return shifted_samples
 
-def check_shifted_samples(combined_cumsums: Tensor,
+def check_shifted_samples(topK_cumsums: Tensor,
                           delta_P: Tensor,
                           shifted_samples: Tensor,
                           prod_cumsum: Tensor):
@@ -335,7 +335,7 @@ def check_shifted_samples(combined_cumsums: Tensor,
     Checks samples as modified by `compute_shifted_samples`: specifically, checks
     that they are not in the "disallowed regions" that we are supposed to skip over.
 
-    combined_cumsums: Cumulative sums which can be thought of as the start of
+    topK_cumsums: Cumulative sums which can be thought of as the start of
                  "disallowed regions" in probability space.  Shape is (*, K)
              delta_P: the negative of the size of "disallowed regions".  Shape is (*, K)
      shifted_samples: The samples as modified by `compute_shifted_samples`.  None
@@ -351,11 +351,11 @@ def check_shifted_samples(combined_cumsums: Tensor,
                                        shifted_samples < prod_cumsum.unsqueeze(-1)))
 
     shifted_samples = shifted_samples.unsqueeze(-1)
-    combined_cumsums = combined_cumsums.unsqueeze(-2)
+    topK_cumsums = topK_cumsums.unsqueeze(-2)
     delta_P = delta_P.unsqueeze(-2)
 
-    disallowed_regions_start = combined_cumsums
-    disallowed_regions_end = combined_cumsums - delta_P  # delta_p is <= 0.
+    disallowed_regions_start = topK_cumsums
+    disallowed_regions_end = topK_cumsums - delta_P  # delta_p is <= 0.
 
     # in_disallowed_region is of shape (*, K, K)
     in_disallowed_region = torch.logical_and(shifted_samples >= disallowed_regions_start,
@@ -564,16 +564,16 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     values, indexes = compute_k_largest(P, K);
     prod_values, prod_indexes = compute_products(values, indexes)
 
-    # combined_values, combined_indexes: (*, K) these are the top-K
+    # topK_values, topK_indexes: (*, K) these are the top-K
     # most-probable combinations of (integerized probabilities and their
     # indexes, from largest to smallest probability
-    combined_values, combined_indexes = compute_k_largest(prod_values, K)
+    topK_values, topK_indexes = compute_k_largest(prod_values, K)
 
-    # let combined_indexes contain the original N-tuples
-    combined_indexes_shape = list(combined_indexes.shape) + [N]
-    # combined_indexes: (*, K, N)
-    combined_indexes = torch.gather(prod_indexes, dim=-2,
-                                    index=combined_indexes.unsqueeze(-1).expand(combined_indexes_shape))
+    # let topK_indexes contain the original N-tuples
+    topK_indexes_shape = list(topK_indexes.shape) + [N]
+    # topK_indexes: (*, K, N)
+    topK_indexes = torch.gather(prod_indexes, dim=-2,
+                                    index=topK_indexes.unsqueeze(-1).expand(topK_indexes_shape))
 
     P_cumsum_cat = torch.zeros(*P.shape[:-1], M+1, dtype=P.dtype,
                                device=P.device)  # # (*, N, M+1)
@@ -601,18 +601,18 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     P_cumsum_exclusive_scaled = P_cumsum_cat_scaled[...,:-1]
     P_cumsum_scaled = P_cumsum_cat_scaled[...,1:]
 
-    # combined_cumsums: (*, K)
-    combined_cumsums = get_combined_cumsums(P,
+    # topK_cumsums: (*, K)
+    topK_cumsums = get_topK_cumsums(P,
                                             P_cumsum_exclusive_scaled,
-                                            combined_indexes)
+                                            topK_indexes)
 
-    B, delta_P = compute_beta_prods(P_sum_product, combined_values)
+    B, delta_P = compute_beta_prods(P_sum_product, topK_values)
 
 
-    # reorder combined_cumsums from smallest to largest, which we'll require
+    # reorder topK_cumsums from smallest to largest, which we'll require
     # when interpolating the "skipped regions" into the random numbers.
-    combined_cumsums, reorder_indexes = torch.sort(combined_cumsums, dim=-1)
-    # also reorder delta_P [so that delta_P and combined_cumsums are reordered
+    topK_cumsums, reorder_indexes = torch.sort(topK_cumsums, dim=-1)
+    # also reorder delta_P [so that delta_P and topK_cumsums are reordered
     # in the same way]
     delta_P = torch.gather(delta_P, dim=-1, index=reorder_indexes)
 
@@ -621,14 +621,14 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     delta_P_cumsum = torch.cumsum(delta_P, dim=-1)
     delta_P_exclusive = delta_P_cumsum - delta_P
 
-    # combined_cumsums_mod is combined_cumsums modified by adding the product
+    # topK_cumsums_mod is topK_cumsums modified by adding the product
     # of previous delta_P's (which will be negative).  This compensates for
     # the fact that the random numbers in "sampled_values" are in a compressed
     # space where we "skip over" regions of size -delta_P.
     #
     # These are the cutoffs for subtracting the delta_P's
     # from sampled_values
-    combined_cumsums_mod = combined_cumsums + delta_P_exclusive
+    topK_cumsums_mod = topK_cumsums + delta_P_exclusive
 
 
     # CAUTION: if the product of sums is too large, this rand_values
@@ -639,12 +639,12 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     # rand, rand + B, rand + 2B, ...., rand + (K-1)B
     samples = rand.unsqueeze(-1) + B.unsqueeze(-1) * torch.arange(K, device=B.device)
 
-    shifted_samples = compute_shifted_samples(combined_cumsums_mod,
+    shifted_samples = compute_shifted_samples(topK_cumsums_mod,
                                               delta_P,
                                               samples)
 
     # TODO: could remove the next call
-    check_shifted_samples(combined_cumsums, delta_P,
+    check_shifted_samples(topK_cumsums, delta_P,
                           shifted_samples, P_sum_product)
 
     indexes = get_indexes_for_samples(P, P_cumsum,
@@ -861,18 +861,18 @@ def _test_combined():
     print("prod_values = ", prod_values)
     print("prod_indexes = ", prod_indexes)
 
-    # combined_values, combined_indexes: (B, K) these are the top-K
+    # topK_values, topK_indexes: (B, K) these are the top-K
     # most-probable combinations of (integerized_ probabilities and their
     # indexes, from best to worst.
-    combined_values, combined_indexes = compute_k_largest(prod_values, K)
+    topK_values, topK_indexes = compute_k_largest(prod_values, K)
 
-    combined_indexes_shape = list(combined_indexes.shape) + [N]
-    # combined_indexes: (B, K, N)
-    combined_indexes = torch.gather(prod_indexes, dim=-2,
-                                    index=combined_indexes.unsqueeze(-1).expand(combined_indexes_shape))
+    topK_indexes_shape = list(topK_indexes.shape) + [N]
+    # topK_indexes: (B, K, N)
+    topK_indexes = torch.gather(prod_indexes, dim=-2,
+                                    index=topK_indexes.unsqueeze(-1).expand(topK_indexes_shape))
 
-    print("combined_values = ", combined_values)
-    print("combined_indexes = ", combined_indexes)
+    print("topK_values = ", topK_values)
+    print("topK_indexes = ", topK_indexes)
 
 
     P_cumsum = torch.cumsum(P, dim=-1) # (B, N, M)
@@ -904,32 +904,32 @@ def _test_combined():
     P_cumsum_exclusive_scaled = P_cumsum_cat_scaled[...,:-1]
     P_cumsum_scaled = P_cumsum_cat_scaled[...,1:]
 
-    # combined_cumsums: (B, K)
-    combined_cumsums = get_combined_cumsums(P,
+    # topK_cumsums: (B, K)
+    topK_cumsums = get_topK_cumsums(P,
                                             P_cumsum_exclusive_scaled,
-                                            combined_indexes)
-    # combined_cumsums: (B, K)
-    print("combined_cumsums = ", combined_cumsums)
-    print("combined_cumsums + combined_values= ", combined_cumsums + combined_values)
+                                            topK_indexes)
+    # topK_cumsums: (B, K)
+    print("topK_cumsums = ", topK_cumsums)
+    print("topK_cumsums + topK_values= ", topK_cumsums + topK_values)
 
 
-    assert torch.all(P_sum_product.unsqueeze(-1) > combined_cumsums)
+    assert torch.all(P_sum_product.unsqueeze(-1) > topK_cumsums)
 
-    assert torch.all(P_sum_product.unsqueeze(-1) >= combined_cumsums + combined_values)
+    assert torch.all(P_sum_product.unsqueeze(-1) >= topK_cumsums + topK_values)
 
-    B, delta_P = compute_beta_prods(P_sum_product, combined_values)
+    B, delta_P = compute_beta_prods(P_sum_product, topK_values)
 
-    assert torch.all(combined_values + delta_P > 0)
+    assert torch.all(topK_values + delta_P > 0)
 
 
-    # reorder combined_cumsums from smallest to largest, which we'll require
+    # reorder topK_cumsums from smallest to largest, which we'll require
     # when interpolating the "skipped regions" into the random numbers.
-    combined_cumsums, reorder_indexes = torch.sort(combined_cumsums, dim=-1)
-    # also reorder delta_P [so that delta_P and combined_cumsums are reordered
+    topK_cumsums, reorder_indexes = torch.sort(topK_cumsums, dim=-1)
+    # also reorder delta_P [so that delta_P and topK_cumsums are reordered
     # in the same way]
     delta_P = torch.gather(delta_P, dim=-1, index=reorder_indexes)
 
-    print("combined_cumsums, reordered, = ", combined_cumsums)
+    print("topK_cumsums, reordered, = ", topK_cumsums)
     print("delta_P, reordered, = ", delta_P)
 
     # delta_P_exclusive, of shape (*, K), is the exclusive cumulative sum of
@@ -938,15 +938,15 @@ def _test_combined():
     delta_P_exclusive = delta_P_cumsum - delta_P
     print("delta_P_exclusive = ", delta_P_exclusive)
 
-    # combined_cumsums_mod is combined_cumsums modified by adding the product
+    # topK_cumsums_mod is topK_cumsums modified by adding the product
     # of previous delta_P's (which will be negative).  This compensates for
     # the fact that the random numbers in "sampled_values" are in a compressed
     # space where we "skip over" regions of size -delta_P.
     #
     # These are the cutoffs for subtracting the delta_P's
     # from sampled_values
-    combined_cumsums_mod = combined_cumsums + delta_P_exclusive
-    print("combined_cumsums_mod = ", combined_cumsums_mod)
+    topK_cumsums_mod = topK_cumsums + delta_P_exclusive
+    print("topK_cumsums_mod = ", topK_cumsums_mod)
 
 
     # CAUTION: if the product of sums is too large, this rand_values
@@ -959,14 +959,14 @@ def _test_combined():
     print("rand = ", rand)
     print("sampled = ", samples)
 
-    shifted_samples = compute_shifted_samples(combined_cumsums_mod,
+    shifted_samples = compute_shifted_samples(topK_cumsums_mod,
                                               delta_P,
                                               samples)
     print("shifted_samples = ", shifted_samples)
 
     # TODO: can remove this
     if random.random() < 0.01:
-        check_shifted_samples(combined_cumsums,
+        check_shifted_samples(topK_cumsums,
                               delta_P,
                               shifted_samples,
                               P_sum_product)
