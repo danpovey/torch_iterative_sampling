@@ -70,32 +70,306 @@ inline uint32_t zoom(uint32_t r, uint32_t orig_r,
   return ans;
 }
 
+class CombinedSampler {
+ public:
+  CombinedSampler(uint32_t N, uint32_t M, uint32_t K): N_(N), M_(M), K_(K),
+                                                       M_unique_(find_prod_unique_prime_factors(M)) {
+    assert(N < 5);
+    assert((K&(K-1)) == 0);  // require K is a power of 2.
+    M_bits_ = 1;
+    while ((1 << M_bits_) < M)
+      M_bits_++;
+    K_bits_ = 1;
+    while ((1 << k_bits_) < K)
+      K_bits_++;
+
+    p_bits_ = min(uint32_t(54) / K, // so product of N of these is comfortably less than 64, search for "headroom"
+                  min(uint32_t(63) - K_bits_) / K,
+                  uint32_t(31) - M_bits_); // so we can sort the indexes and probs in one integer.
+
+    // Allocate buffers..
+  }
+
+
+
+  template <typename Real>
+  void LoadP(torch::PackedTensorAccessor<int64_t, 1, torch::RestrictPtrTraits> &p,
+             bool input_is_log) {
+    torch::PackedTensorAccessor<Real, 2, torch::RestrictPtrTraits> &p) {
+    // loads P into internal buffer as integers, with reordering.
+    // Sets M_reorder_
+
+    // TODO.
+
+    // TODO: write zero, one past the end.
+  }
+
+
+  void Compute() {
+    ComputeKLargest();
+
+
+  }
+
+
+ private:
+
+  uint32_t N_; // number of softmaxes
+  uint32_t M_; // size of each softmax
+  uint32_t K_; // number of samples we require per softmax.
+  uint32_t M_unique_;  // product of unique prime factors of M_
+  uint32_t *M_reorder_; // [K].  pseudo-random numbers coprime to M_ that we use to reorder
+                        // m indexes at input and output.
+
+  // number of bits used for storing index 0 <= m < M_ when sorting R_; require (1<<M_bits_) >= M_
+  uint32_t M_bits_;
+  // number of bits used for probabilities; require:
+  //  (i) K*p_bits_ <= 54 [an arbitrary choice with 54 << 64,
+  //       search for "headroom" to understand]
+  //  (ii) (p_bits_*K_bits) <= 63 [1 less than 64 to allow for rounding error].
+  //  (iii) also p_bits_ + M_bits_ + 1 <= 32 because of how we
+  //      sort [the +1 is in case some probs or sums of probs are slightly more than
+  //      1 due to rounding].
+  uint32_t p_bits_;
+  // number of bits used for indexes 0 <= k < K;
+  uint32_t K_bits_;
+
+
+  /* of shape [N][M+1], indexed P_cumsum_[n*(M+1) + m], P_cumsum_ is used
+     to store the exclusive cumulative sums of the integerized input probabilities P;
+     elements with m==0 are zero, and the last column contains the sums of P. */
+  uint32_t *P_cumsum_;
+
+  /*
+    Of shape [N+1], P_sum_cumprod_ is the exclusive cumulative product of P_cumsum_[n][M],
+    i.e. the cumulative product of the total sum of P which is the last column of P_cumsum_.
+   */
+  uint64_t *P_sum_cumprod_;
+
+  /*
+    of shape [N][M], this is a temporary buffer used to store things we're sorting, in particular
+    it is used to store the sorted probability values which we call R, shifted up by  M_bits_,
+    plus the corresponding indexes.
+    [Note: we can eventually share the space for this with P_cumsum_, since we need them at different
+    times.  Although the sorting process would overwrite P_cumsum_, because we store the indexes with
+    the probs we have enough information to recover the order; a load, __syncthreads__, recover-indexes,
+    and write would do it.
+   */
+  uint32_t *M_buf1_;  // R_and_indexes_buf_;   k_largest_values_and_indexes_
+
+  /*
+    second misc. temporary buffer of shape [max(M, K**N)].
+   */
+  uint32_t *M_buf2_;
+  /*
+    buffer of uint64_t of size [K**M], may overlap with some other buffers.
+   */
+  uint64_t *M_buf64_;
+
+  /*
+    of shape [K][N], indexed [k*N + n], topK_indexes_ contains the N-tuples of indexes
+    (in 0,1,...,M-1) of the top K combinations of indexes, from highest to lowest
+    probability.
+   */
+  uint32_t *topK_indexes_;
+  /*
+    of shape [K], contains from highest to lowest the top-K product probabilities;
+    these are products of "P" values.
+   */
+  uint64_t *topK_P_;
+
+  /*
+    Contains B_ which is the integerized beta value.
+   */
+  uint64_t B_;
+  /*
+    of shape [K], accessed delta_P_[n*K + k], contains original un-reordered *negated* delta_P values as returned
+    by compute_beta_prods() in the python version.  These are the amounts of probability mass we remove
+    for each of the top-K index-N-tuples.
+   */
+  uint64_t *neg_delta_P_;
+  /*
+    of shape [K], delta_p_reordered_ contains the delta_P_ values reordered by smallest to largest
+    index-tuples.
+   */
+  uint64_t *delta_P_reordered_;
+  /*
+    of shape [K+1], delta_p_reordered_cumsum_ contains the exclusive cumulative sum of delta_P_reordered_.
+   */
+  uint64_t *delta_P_reordered_cumsum_;
+
+
+  /*
+    combined_cumsums_ is the
+   */
+  uint64_t *combined_cumsums_;
+
+
+  uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
+    assert(i != 0);
+    uint32_t ans = 1;
+    for (uint32_t p = 2; i != 1; p++) {
+      if (i % p == 0) {
+        ans *= p;
+        i /= p;
+        while (i % p == 0)
+          i /= p;  // divide by duplicates of this factor.
+      }
+    }
+    return ans;  // product of unique prime factors of i, e.g. 4 -> 2, 18 -> 6.
+  }
+
+
+  void ComputeKLargest() {
+    // [1] compute K largest probabilities P and their corresponding indexes.
+    // [2] sort the [K**N] products of the K largest probabilities, remembering their
+    //     original indexes in 0..K-1.
+    // [3] note the original [K][N] indexes of these products (in [0..M-1],
+    //     and the corresponding [K] probabilities, ordered from largest to smallest.
+
+    uint32_t *sort_P = M_buf1_,
+        *P = P_cumsum_;  // currently stores integerized probs P.
+    uint32_t M_bits = M_bits_, M = M_, N = N_, K = K_;
+    for (uint32_t n = 0; n < N; n++) {
+      uint32_t *this_sort_P = sort_P + (n * (M+1)),
+          *this_P = P + (n * (M+1));
+      for (uint32_t m = 0; m < M; m++) {
+        uint3_t p = this_P[m];
+        this_sort_P[m] = m + (p << M_bits);
+      }
+      this_sort_P[M] = 0;
+      // note: we are only actually interested in the K-best here.  In principle we could
+      // use std::nth_element and then std::sort.  We'll probably just sort when we do it in
+      // CUDA though.
+      std::nth_element(this_sort_P, this_sort_P + K, this_sort_P + M, std::greater<>());
+      std::sort(this_sort_P, this_sort_P + K, std::greater<>());
+    }
+    uint32_t KpowN = K;  // K ** N
+    for (uint32_t i = 1; i < N; i++)
+      KpowN *= N;
+    uint64_t *sort_combinations = M_buf64_;
+    uint32_t K_bits = K_bits_, K_bits_mask = (K-1), KpowN_bits = K_bits_ * N;
+    for (uint32_t i = 0; i < KpowN; i++) {
+      // product of probabilities.  This index i represents an n-tuple of e.g. k1,k2,k3, which are all indexes in [0..K-1] specifying a
+      uint64_t P_prod = 1;
+      for (uint32_t n = 0; n < N; n++) {
+        uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K
+        uint32_t this_p = sort_P[(n * M) + k]; // one of the k-best for the n'th softmax
+        P_prod *= this_p
+      }
+      sort_combinations[i] = (P_prod << KpowN_bits) + i;
+    }
+    // we'll probably just sort, when we do this on GPU.   But only need top-K.
+    std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + KpowN,
+                     std::greater<>());
+    std::sort(sort_combinations, sort_combinations + K, std::greater<>());
+    // OK, now top-K combinations are in `sort_combinations`.
+
+    // TODO: set topK_indexes_, topK_P_.
+  }
+
+  void ComputePsum() {
+    // P_cumsum_ currently stores integerized probs P, we'll make it store the cumulative sum.
+    uint32_t *P = P_cumsum_;
+    uint32_t M = M_, N = N_;
+    uint64_t P_sum_cumprod = 1;
+    for (uint32_t n = 0; n < N; n++) {
+      // compute exclusive cumulative sum
+      uint32_t *this_P = P + (M+1) * N;
+      uint32_t sum = 0;
+      for (uint32_t m = 0; m <= M; m++) {  // note, we wrote 0 at one past the end.
+        uint32_t next_sum = sum + this_P[m];
+        this_P[m] = next_sum;
+        sum = next_sum;
+      }
+      P_sum_cumprod *= sum;
+      P_sum_cumprod_[n] = P_sum_cumprod;
+    }
+    P_sum_cumprod_[N] = P_sum_cumprod;
+  }
+
+  void ComputeBeta() {
+    // see compute_beta_prods() in sampling_ref.py
+    uint64_t Psum = P_sum_cumprod_[N_];
+    // Ptop corresponds to topK_P_[0..K-1]
+
+    uint64_t *Ptop_shifted ... ; // topK_P_, with "large-value" placed first    Let Ptop
+
+    uint64_t *Ptop_exclusive_sum = ... ; // dim = K + 1, contains [0,.. and exclusive-sum...]
+    // ?from sort_combinations_, create Ptop_exclusive_sum_
+
+    uint64_t B, remainder;
+    for (uint64_t k = 0; k < K; k++) {
+      // We are trying out to see whether we get an admissible B (i.e.,
+      // integerized beta) value with exactly k top probabilities exceeding B.  Exactly
+      // one such k index will "work".
+
+      uint64_t Ptop_shifted = Ptop_shifted[k],
+          Ptop = Ptop[k+1];
+      uint64_t S1 = Psum - Ptop_exclusive_sum[k];  // corresponds to 1-s_k in the math.
+      uint64_t B_k = S1 / (K-k),
+          remainder_k = S1 % (K-k);
+      bool is_ok = Ptop_shifted > B_k && Ptop <= B_k;
+      if (is_ok) { // should happen exactly once!!
+        B = B_k;
+        remainder = remainder_k;
+        break;
+      }
+    }
+    B_ = B;
+    assert(k < K);  // check that we broke from the loop.
+    uint64_t neg_delta_P_sum = 0;
+    for (uint32_t k = 0; k < K; i++) {
+      uint64_t Ptop = Ptop_shifted[k+1];
+      neg_delta_P_[k] = remainder + Ptop - std::min<uint64_t>(Ptop, B);
+      neg_delta_P_sum += neg_delta_P_[k];
+    }
+    err = Psum - neg_delta_P_sum - (B * K);
+    assert(err == 0);
+    // outputs: B_, neg_delta_P_.
+  }
+
+};
+
 
 /*
-  sample function.
+  sampling forward function (the backward is implemented in python).  Please see
+  `sample_combined_forward` in sampling_ref.py for a comparable PyTorch implementation
+  in Python, that is easier to follow.
 
-    cumsum: (inclusive) cumulative probabilities of input classes, of shape (B, N),
-        where B is the batch size and N is the number of classes, so element
-        cumsum[b][k] is the sum of probs[b][i] for 0 <= i < k.  Must be of
-        type int32_t; we recommend to convert probs to int32_t by multiplying
-        by (1<<31) and converting to integer, then computing cumsum.
-        Any overflow to negative values will not matter, as we convert to
-        unsigned for math.
+  Sample from a distribution that is the product of softmaxes.  We will sample
+  K *distinct* samples.  This entails using sampling weights of the form min(1, p/beta)
+  for a computed beta.
 
-     rand:  random int32_t integers uniformly distributed on {0..1<<31 - 1}, of shape (B,S), where
-         S is the number of separate sequences of samples we are choosing from
-         each distribution in `cumsum`.
-       K: length of the random sequence to draw; must satisfy 0 < K < N.
+    Args:
+         p: A Tensor of shape (B, N, M): either normalized log-probs (if input_is_log==False),
+             or normalized probabilities; normalized along the M axis.  B is the batch
+             size; M will typically be a power of 2 but can be any number, ideally with only
+             small prime factors; and N must be in [1,2,3,4].  The type of p can be half,
+             float or double.
 
-  Returns:  Tensor of shape (B, S, K) and type torch::kInt64, containing,
-            for each B, a squence of K distinct sampled integers (class
-            labels) in the range [0..N-1], drawn with probability proportional
-            to the differences between `cumsum` elements, but always excluding
-            previously drawn classes within the current sequence.
+        rand: A Tensor of int64_t of shape (B * (N+1),) containing random numbers in [0..2**63-1]
+           which is the largest int64_t.  Actually this could just as easily be randum
+           numbers in 0..2**64-1, as we'll be interpreting this as uint64_t.  The reason
+           we want a flat array rather than array of shape (B, N+1) is so that we
+           can access it in a more memory-efficient way, avoiding scattered reads.
+
+         K: An integer, the number of samples required, with 0 < K < N
+   input_is_log:  True if p represents normalized log-probs, False if it represents
+             probabilities.
+
+    Returns: (indexes, weights)
+       indexes: of shape (B, K, N), for each of K samples from a distribution it contains
+            an N-tuple of indexes saying which combination of indexes from the
+            component distributions were sampled.
+       weights: of shape (B, K), gives the weight associated with each sample,
+            which will equal max(p, beta) for a beta specific to the batch element,
+            i.e. to the product of the distributions (0 < beta <= 1/K).  The
+            weights will sum to 1 along the K axis.
 */
-torch::Tensor sample_cpu(torch::Tensor probs, // [B][N]
-                                   torch::Tensor rand,   // [B][S]
-                                   int K) {
+torch::Tensor sample_combined_cpu_forward(torch::Tensor probs, // [B][N]
+                                          torch::Tensor rand,   // [B][S]
+                                          int K) {
   TORCH_CHECK(probs.dim() == 2, "probs must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
   auto int32_type = torch::kInt32,

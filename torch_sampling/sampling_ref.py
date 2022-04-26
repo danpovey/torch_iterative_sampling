@@ -146,7 +146,6 @@ def compute_products(values, indexes):
     return prod_values.reshape(values_shape), prod_indexes.reshape(indexes_shape)
 
 
-
 def compute_beta(P, K):
     """
     See: ComputeBeta function [practical version] in NOTES.md.
@@ -252,7 +251,7 @@ def compute_beta_prods(Psum, Ptop):
                                        device=Ptop.device),
                                 Ptop_cum[...,:K-1]), dim=-1)
     # S1[...,k] contains, for each batch element, the sum of all but the k largest
-    # items.  It corresponds to s-1 in the math of NOTES.md, see "ComputeBeta function
+    # items.  It corresponds to 1-s_k in the math of NOTES.md, see "ComputeBeta function
     # [mathematical version].
     # Shape is (*, K)
     S1 = Psum.unsqueeze(-1) - Ptop_cum_shift
@@ -562,7 +561,7 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     # some nasty edge cases)  .to(torch.float32) is because we can't multiply
     # by such a large number in half precision
     P = (p.to(torch.float32) * (2**(num_bits_per_sample)) + 1).to(dtype=torch.int64)
-    values, indexes = compute_k_largest(P, K)
+    values, indexes = compute_k_largest(P, K);
     prod_values, prod_indexes = compute_products(values, indexes)
 
     # combined_values, combined_indexes: (*, K) these are the top-K
