@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import random
 import torch
 from torch import Tensor
+from torch.cuda.amp import custom_fwd, custom_bwd
 from typing import Tuple, Optional
 
 # The main export of this file is the function sample_combined().
@@ -180,7 +182,8 @@ def compute_beta(P, K):
     remainder_k = Q_part - (B_k * Kk)   # shape (*, K)
 
     large_int = (2**32 - 1)
-    R_part1 = torch.cat((R[...,M-K+1:M], torch.full((*R.shape[:-1], 1), large_int)), dim=-1)
+    R_part1 = torch.cat((R[...,M-K+1:M], torch.full((*R.shape[:-1], 1), large_int,
+                                                    device=R.device)), dim=-1)
     R_part2 = R[...,M-K:M]
 
     # is_ok corresponds to: "(k==0 or R[M-k] > B_k) and R[M-1-k] <= B_k" in NOTES.md
@@ -254,7 +257,7 @@ def compute_beta_prods(Psum, Ptop):
     # Shape is (*, K)
     S1 = Psum.unsqueeze(-1) - Ptop_cum_shift
 
-    temp = torch.arange(K, -1, -1)  # [K, K-1, ..., 0]
+    temp = torch.arange(K, -1, -1, device=Psum.device)  # [K, K-1, ..., 0]
     # Kk, of shape (K,), contains [K, K-1, ..., 1], representing K-k for k = [0, 1, ..., K-1]
     Kk = temp[0:K]
     # Kk1 of shape (K,), contains [K-1, K-2, ..., 0], representing K-k-1 for k = [0, 1, ..., K-1]
@@ -270,7 +273,8 @@ def compute_beta_prods(Psum, Ptop):
     large_int = (2**63 - 1)
     # Ptop_shifted is Ptop shifted right with a large value put first, i.e.
     # instead of [top1, top2, top3, top4] we have [inf, top1, top2, top3]
-    Ptop_shifted = torch.cat((torch.full((*Ptop.shape[:-1], 1), large_int),
+    Ptop_shifted = torch.cat((torch.full((*Ptop.shape[:-1], 1), large_int,
+                                         device=Ptop.device),
                               Ptop[...,:K-1]), dim=-1)
 
 
@@ -409,9 +413,12 @@ def get_indexes_for_samples(P: Tensor,
         # right=True means we find
         # P_cumsum[...,index-1] <= this_samples[...,k] < P_cumsum[...,index],
         # which is what we want, as opposed to ... < ... <= (i.e. swap < and <=)
-        idx = ans_indexes[...,n] = torch.searchsorted(P_cumsum[...,n,:], # (*, M)
-                                                      this_samples, # (*, K)
-                                                      right=True)
+        # .contiguous() suppresses a warning about searchsorted needing contiguous
+        # input.  N tends to be 2 or 3 so this copy is not too big a deal.
+        idx = ans_indexes[...,n] = torch.searchsorted(
+            P_cumsum[...,n,:].contiguous(), # (*, M)
+            this_samples, # (*, K)
+            right=True)
         this_P = torch.gather(P[...,n,:], dim=-1, index=idx)  # shape: (*, K)
 
         if n == 0:
@@ -552,28 +559,27 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
 
 
     # the + 1 is because we need all elements of P to be nonzero (this will avoid
-    # some nasty edge cases)
-    P = (p * (2**(num_bits_per_sample)) + 1).to(dtype=torch.int64)
+    # some nasty edge cases)  .to(torch.float32) is because we can't multiply
+    # by such a large number in half precision
+    P = (p.to(torch.float32) * (2**(num_bits_per_sample)) + 1).to(dtype=torch.int64)
     values, indexes = compute_k_largest(P, K)
     prod_values, prod_indexes = compute_products(values, indexes)
 
-    # combined_values, combined_indexes: (B, K) these are the top-K
-    # most-probable combinations of (integerized_ probabilities and their
+    # combined_values, combined_indexes: (*, K) these are the top-K
+    # most-probable combinations of (integerized probabilities and their
     # indexes, from largest to smallest probability
     combined_values, combined_indexes = compute_k_largest(prod_values, K)
 
     # let combined_indexes contain the original N-tuples
     combined_indexes_shape = list(combined_indexes.shape) + [N]
-    # combined_indexes: (B, K, N)
+    # combined_indexes: (*, K, N)
     combined_indexes = torch.gather(prod_indexes, dim=-2,
                                     index=combined_indexes.unsqueeze(-1).expand(combined_indexes_shape))
 
-    P_cumsum = torch.cumsum(P, dim=-1) # (B, N, M)
-    P_cumsum_cat = torch.cat((torch.zeros(*P_cumsum.shape[:-1], 1, dtype=P_cumsum.dtype,
-                                          device=P_cumsum.device),
-                              P_cumsum), dim=-1)
+    P_cumsum_cat = torch.zeros(*P.shape[:-1], M+1, dtype=P.dtype,
+                               device=P.device)  # # (*, N, M+1)
+    P_cumsum = torch.cumsum(P, dim=-1, out=P_cumsum_cat[...,1:]) # (*, N, M)
     P_cumsum_exclusive = P_cumsum_cat[...,:-1]
-    P_cumsum = P_cumsum_cat[...,1:]
 
     # P_sum is the total sum of the individual softmaxes/distributions.
     # Shape: (*, N)
@@ -584,10 +590,10 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
 
     # P_sum_product is the inclusive cumulative product of P_sum, multiplied
     # over the N axis.
-    # Shape: (B,)
+    # Shape: (*,)
     P_sum_cumprod = torch.cumprod(P_sum, dim=-1)
     # P_prev_sum_cumprod is the exclusive-product versin of P_sum_cumprod, i.e.
-    # contains the product over previous elements of P_sum.  Shape: (B,)
+    # contains the product over previous elements of P_sum.  Shape: (*,)
     P_sum_product = P_sum_cumprod[...,-1]
     P_prev_sum_cumprod = P_sum_cumprod // P_sum
 
@@ -596,7 +602,7 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     P_cumsum_exclusive_scaled = P_cumsum_cat_scaled[...,:-1]
     P_cumsum_scaled = P_cumsum_cat_scaled[...,1:]
 
-    # combined_cumsums: (B, K)
+    # combined_cumsums: (*, K)
     combined_cumsums = get_combined_cumsums(P,
                                             P_cumsum_exclusive_scaled,
                                             combined_indexes)
@@ -630,9 +636,9 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     # will not be sufficiently
     # random!!  We need to leave some headroom.
     # rand_values are random in {0, 1, ..., B-1}
-    rand = torch.randint((2**63 - 1), B.shape) % B
+    rand = torch.randint((2**63 - 1), B.shape, device=B.device) % B
     # rand, rand + B, rand + 2B, ...., rand + (K-1)B
-    samples = rand.unsqueeze(-1) + B.unsqueeze(-1) * torch.arange(K)
+    samples = rand.unsqueeze(-1) + B.unsqueeze(-1) * torch.arange(K, device=B.device)
 
     shifted_samples = compute_shifted_samples(combined_cumsums_mod,
                                               delta_P,
@@ -714,6 +720,7 @@ class SampleCombinedFunction(torch.autograd.Function):
     # please see sample_combined() or sample_combined_forward() or
     # sample_combined_backward() for documentation
     @staticmethod
+    @custom_fwd
     def forward(ctx, p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
         with torch.no_grad():
             weights, indexes = sample_combined_forward(p, K, input_is_log)
@@ -722,6 +729,7 @@ class SampleCombinedFunction(torch.autograd.Function):
         return weights, indexes
 
     @staticmethod
+    @custom_bwd
     def backward(ctx, weights_grad: Optional[Tensor], indexes_grad: Optional[Tensor]) -> Tuple[Tensor, None, None]:
         p, indexes, weights = ctx.saved_tensors
         p_grad = sample_combined_backward(p, ctx.input_is_log, indexes,
@@ -780,7 +788,8 @@ def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, 
     P = (p*two31 + 1).to(dtype=torch.long)
     B = compute_beta(P, K)
     beta = B / two31
-    t = torch.randint(M//2, p.shape[:-1] + (1,))  # shape: *, 1
+    t = torch.randint(M//2, p.shape[:-1] + (1,),
+                      device=P.device)  # shape: *, 1
     s = t * 2 + 1
     #s = torch.ones_like(t)
 
@@ -789,15 +798,15 @@ def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, 
     assert torch.all((s * inv_s) % M == 1)  # if this fails, check that M is a power of 2
 
     # R = pseudo-random re-ordering of p.
-    R = torch.minimum(torch.gather(P, dim=-1, index=(s * torch.arange(M)) % M),
+    R = torch.minimum(torch.gather(P, dim=-1, index=(s * torch.arange(M, device=P.device)) % M),
                       B)
     # S = inclusive-sum of R
     S = torch.cumsum(R, dim=-1)
 
     # Let b be a random integer drawn uniformly from {0, 1, ..., B-1}.
-    b = torch.randint((2**63 - 1), B.shape) % B
+    b = torch.randint((2**63 - 1), B.shape, device=B.device) % B
 
-    S_prev = torch.cat((torch.zeros(*S.shape[:-1], 1), S[...,:-1]), dim=-1)
+    S_prev = torch.cat((torch.zeros(*S.shape[:-1], 1, device=S.device), S[...,:-1]), dim=-1)
 
     k_prev = (S_prev + b) // B
     k_cur = (S + b) // B
@@ -810,9 +819,7 @@ def soft_sample_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, 
     i = (i * s) % M  # Reverse the pseudo-random reordering
     y = torch.maximum(torch.gather(p, dim=-1, index=i), beta)
     assert torch.all(is_ok.sum(dim=-1) == K)
-    assert torch.all((y.sum(dim=-1) - 1.0).abs() < 0.01)
-
-
+    assert torch.all((y.sum(dim=-1) - 1.0).abs() < 0.1)
 
 
 
@@ -893,6 +900,7 @@ def _test_combined():
     combined_cumsums = get_combined_cumsums(P,
                                             P_cumsum_exclusive_scaled,
                                             combined_indexes)
+    # combined_cumsums: (B, K)
     print("combined_cumsums = ", combined_cumsums)
     print("combined_cumsums + combined_values= ", combined_cumsums + combined_values)
 
@@ -937,9 +945,9 @@ def _test_combined():
     # will not be sufficiently
     # random!!  We need to leave some headroom.
     # rand_values are random in {0, 1, ..., B-1}
-    rand = torch.randint((2**63 - 1), B.shape) % B
+    rand = torch.randint((2**63 - 1), B.shape, device=B.device) % B
     # rand, rand + B, rand + 2B, ...., rand + (K-1)B
-    samples = rand.unsqueeze(-1) + B.unsqueeze(-1) * torch.arange(K)
+    samples = rand.unsqueeze(-1) + B.unsqueeze(-1) * torch.arange(K, device=B.device)
     print("rand = ", rand)
     print("sampled = ", samples)
 
@@ -948,10 +956,12 @@ def _test_combined():
                                               samples)
     print("shifted_samples = ", shifted_samples)
 
-    check_shifted_samples(combined_cumsums,
-                          delta_P,
-                          shifted_samples,
-                          P_sum_product)
+    # TODO: can remove this
+    if random.random() < 0.01:
+        check_shifted_samples(combined_cumsums,
+                              delta_P,
+                              shifted_samples,
+                              P_sum_product)
 
     indexes = get_indexes_for_samples(P, P_cumsum,
                                       P_cumsum_exclusive,
