@@ -746,6 +746,15 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
          p: A Tensor of shape (*, N, M): either normalized log-probs (if input_is_log==False),
              or normalized probabilities; normalized along the M axis.  M must be
              a power of 2, and N must be in [1,2,3,4].
+             [We can later relax the requirement that M be a power of 2.  The assumption is now
+              only used for convenience of sampling a random number coprime to M, i.e. with
+              s = 1 + 2*(torch.randint(M//2, shape)), but in general we can replace the 2 in
+              this formula by the product of distinct prime factors in M, e.g. for 768
+              this would be 6 because the prime factors are 2 and 3.  This is not totally optimal
+              as we end up only choosing a subset of the numbers coprime to M,
+              but it will be fine for typical cases because no sane person chooses parameter sizes
+              with large prime factors and anyway we only need to randomize the order a little
+              bit to reduce the correlation between indexes to a reasonable level.]
          K: An integer, the number of samples required, with 0 < K < N
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
