@@ -11,7 +11,7 @@
 */
 template <typename IterType> int find_class(
     IterType cumsum, int begin, int end, uint32_t r) {
-  assert(end > begin);
+  TORCH_CHECK(end > begin);
   while (end > begin + 1) {
     int mid = begin + (end - begin) / 2;
     if (((uint32_t)cumsum[mid]) <= r)
@@ -23,31 +23,33 @@ template <typename IterType> int find_class(
 }
 
 
-
 class CombinedSampler {
  public:
   CombinedSampler(uint32_t N, uint32_t M, uint32_t K):
       N_(N), M_(M), K_(K),
       M_unique_(find_prod_unique_prime_factors(M)) {
-    assert(N < 5);
-    assert((K&(K-1)) == 0);  // require K is a power of 2.
+    TORCH_CHECK(N < 5);
+    TORCH_CHECK((K&(K-1)) == 0);  // require K is a power of 2.
     M_bits_ = FindNumBitsFor(N);
     K_bits_ = FindNumBitsFor(K);
 
 
-    p_bits_ = min(uint32_t(54) / K, // so product of N of these is comfortably less than 64, search for "headroom"
-                  min(uint32_t(63) - (K_bits_ * N) / K, // for when we sort `this_sort_P`
-                      uint32_t(31) - M_bits_)); // for when we sort `sort_combinations`.
+    p_bits_ = std::min(uint32_t(54) / K, // so product of N of these is comfortably less than 64, search for "headroom"
+                       std::min(uint32_t(63) - (K_bits_ * N) / K, // for when we sort `this_sort_P`
+                                uint32_t(31) - M_bits_)); // for when we sort `sort_combinations`.
 
     // TODO: allocate buffers..
   }
 
 
 
-  template <typename Real>
+  template <typename Real, typename AccessorT>
   void LoadP(uint64_t rand_source,
              bool input_is_log,
-             torch::PackedTensorAccessor<Real, 2, torch::RestrictPtrTraits> &p) {
+             AccessorT p) { // p: [N][M]
+    // torch::PackedTensorAccessor32<Real, 2, torch::DefaultPtrTraits> p) {
+
+    // TODO: maybe in future, use torch::RestrictPtrTraits
     rand_source_ = rand_source;
 
 
@@ -69,10 +71,9 @@ class CombinedSampler {
   /*
     `weights` is of shape [K].  We write the samples' weights to here.
    */
-  template <typename Real>
+  template <typename Real, typename AccessorT>
   void GetWeightsForSamples(
-      torch::PackedTensorAccessor<Real, 1, torch::RestrictPtrTraits> &weights) {
-
+      AccessorT weights) {
     uint32_t N = N_, M = M_, K = K_;
     float denom = (float)P_sum_cumprod_[N];
     float beta = (float)B_ / denom;
@@ -80,24 +81,26 @@ class CombinedSampler {
     for (uint32_t k2 = 0; k2 < K; k2++) { // parallelize over k2
       uint64_t prod_P = 1;
       for (uint32_t n = 0; n < N; n++) {
-        uint32_t this_idx = indexes_for_samples_[k2 * N + n];
-        uint32_t this_P = P_cumsum_[n * (M + 1) + m + 1] - P_cumsum_[n * (M + 1) + m];
+        uint32_t this_m_idx = indexes_for_samples_[k2 * N + n];
+        uint32_t this_P = P_cumsum_[n * (M + 1) + this_m_idx + 1] - P_cumsum_[n * (M + 1) + this_m_idx];
         prod_P *= this_P;
       }
       float p = (float)prod_P / denom;
-      weights[k] = (Real)max(p, beta);
+      weights[k2] = (Real)std::max(p, beta);
     }
   }
 
+
+  template <typename Accessor1, typename Accessor2>
   void GetIndexesForSamples(
-      torch::PackedTensorAccessor<int64_t, 2, torch::RestrictPtrTraits> &indexes,
-      torch::PackedTensorAccessor<int64_t, 1, torch::RestrictPtrTraits> &combined_indexes) {
+      Accessor1 indexes,  // torch::TensorAccessor32<int64_t, 2>
+      Accessor2 combined_indexes) {  // torch::TensorAccessor32<int64_t, 1>
     uint32_t N = N_, M = M_, K = K_;
     for (uint32_t k2 = 0; k2 < K; k2++) { // parallelize over k2, maybe also over n.
       uint64_t combined_index = 0;
       uint32_t M_prod = 1;
       for (uint32_t n = 0; n < N; n++) {
-        uint32_t this_m = indexes_for_samples_[k*N + n];
+        uint32_t this_m = indexes_for_samples_[k2*N + n];
         indexes[k2][n] = this_m;
         combined_index += this_m * M_prod;
         M_prod *= M;
@@ -200,12 +203,6 @@ class CombinedSampler {
     sum of delta_P_.
    */
   uint64_t *topK_delta_P_cumsum_;
-  /*
-    Of shape [K], the top-K most likely N-tuples of indexes in [0,1,...,M-1].  They are
-    encoded by bit-wise shifting, as
-      (index0 + (index1 << M_bits_) + (index2 << (2*M_bits_))..
-   */
-  uint64_t topK_indexes_;
 
   /*
     topK_cumsums_, of shape [K], contains the cumulative-sums of products of
@@ -235,7 +232,7 @@ class CombinedSampler {
 
 
   uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
-    assert(i != 0);
+    TORCH_CHECK(i != 0);
     uint32_t ans = 1;
     for (uint32_t p = 2; i != 1; p++) {
       if (i % p == 0) {
@@ -263,7 +260,7 @@ class CombinedSampler {
       uint32_t *this_sort_P = sort_P + (n * (M+1)),
           *this_P = P + (n * (M+1));
       for (uint32_t m = 0; m < M; m++) {
-        uint3_t p = this_P[m];
+        uint32_t p = this_P[m];
         this_sort_P[m] = m + (p << M_bits);
       }
       this_sort_P[M] = 0;
@@ -284,7 +281,7 @@ class CombinedSampler {
       for (uint32_t n = 0; n < N; n++) {
         uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K
         uint32_t this_p = sort_P[(n * M) + k]; // one of the k-best for the n'th softmax
-        P_prod *= this_p
+        P_prod *= this_p;
       }
       sort_combinations[i] = (P_prod << KpowN_bits) + i;
     }
@@ -319,26 +316,28 @@ class CombinedSampler {
 
   void ComputeBeta() {
     // see compute_beta_prods() in sampling_ref.py
-    uint64_t Psum = P_sum_cumprod_[N_];
+    uint32_t N = N_, K = K_;
+    uint64_t Psum = P_sum_cumprod_[N];
     // Ptop corresponds to topK_P_[0..K-1]
 
-    uint64_t *Ptop_shifted ... ; // topK_P_, with "large-value" placed first    Let Ptop
+    uint64_t *Ptop_shifted = 0 ; // TODO. topK_P_, with large values placed first
 
-    uint64_t *Ptop_exclusive_sum = ... ; // dim = K + 1, contains [0,.. and exclusive-sum...]
+    uint64_t *Ptop_exclusive_sum = 0 ; // TODO. dim = K + 1, contains [0,.. and exclusive-sum...]
     // ?from sort_combinations_, create Ptop_exclusive_sum_
 
     uint64_t B, remainder;
-    for (uint64_t k = 0; k < K; k++) {
+    uint32_t k;
+    for (k = 0; k < K; k++) {
       // We are trying out to see whether we get an admissible B (i.e.,
       // integerized beta) value with exactly k top probabilities exceeding B.  Exactly
       // one such k index will "work".
 
-      uint64_t Ptop_shifted = Ptop_shifted[k],
-          Ptop = Ptop[k+1];
+      uint64_t this_Ptop_shifted = Ptop_shifted[k],
+          this_Ptop = Ptop_shifted[k+1];
       uint64_t S1 = Psum - Ptop_exclusive_sum[k];  // corresponds to 1-s_k in the math.
       uint64_t B_k = S1 / (K-k),
           remainder_k = S1 % (K-k);
-      bool is_ok = Ptop_shifted > B_k && Ptop <= B_k;
+      bool is_ok = this_Ptop_shifted > B_k && this_Ptop <= B_k;
       if (is_ok) { // should happen exactly once!!
         B = B_k;
         remainder = remainder_k;
@@ -346,15 +345,15 @@ class CombinedSampler {
       }
     }
     B_ = B;
-    assert(k < K);  // check that we broke from the loop.
+    TORCH_CHECK(k < K);  // check that we broke from the loop.
     uint64_t delta_P_sum = 0;
-    for (uint32_t k = 0; k < K; i++) {
+    for (uint32_t k = 0; k < K; k++) {
       uint64_t Ptop = Ptop_shifted[k+1];
-      delta_P_[k] = remainder + Ptop - std::min<uint64_t>(Ptop, B);
-      delta_P_sum += delta_P_[k];
+      topK_delta_P_[k] = remainder + Ptop - std::min<uint64_t>(Ptop, B);
+      delta_P_sum += topK_delta_P_[k];
     }
-    err = Psum - delta_P_sum - (B * K);
-    assert(err == 0);
+    uint64_t err = Psum - delta_P_sum - (B * K);
+    TORCH_CHECK(err == 0);
     // outputs: B_, and the array delta_P_.
   }
 
@@ -376,8 +375,8 @@ class CombinedSampler {
     // Computes top-K cumulative sums; these are the cumulative sums of probabilities of
     // all N-tuples of indexes that precede each of the top-K cumulative sums.
 
-    uint32_t M_bits = M_bits_, M_mask = (1 << M_bits)  - 1;
-    for (k = 0; k < K_; k++) {  // this will be separate kernels
+    uint32_t M = M_, M_bits = M_bits_, M_mask = (1 << M_bits)  - 1;
+    for (uint32_t k = 0; k < K_; k++) {  // this will be separate kernels
       uint64_t P_selected_laterprod = 1,
           cumsum = 0;
 
@@ -386,7 +385,7 @@ class CombinedSampler {
       // as N will only be 2 or at most 3 in practice.
 
       uint64_t index_combined = topK_indexes_[k];
-      for (int32_t n = int32_t(N) - 1; n >= 0; --n) {
+      for (int32_t n = int32_t(N_) - 1; n >= 0; --n) {
         // 0 <= this_m < M
         uint32_t this_m = (index_combined >> (M_bits * n)) & M_mask,
             this_P_cumsum_idx = (k*(M+1)) + this_m;
@@ -398,19 +397,21 @@ class CombinedSampler {
         uint64_t prev_Psum_cumprod = P_sum_cumprod_[n];
 
         cumsum += prev_Psum_cumprod * P_selected_laterprod * uint64_t(this_P_cumsum);
+        P_selected_laterprod *= this_P;
       }
       topK_cumsums_[k] = cumsum;
     }
   }
 
   void ComputeShiftedSamples() {
-    // will parallelize over (k2, k) pairs.  k2 corresponds to the output samples, k to the top-K probs.
+    // will parallelize over (k2, k) pairs.  k2 corresponds to the output samples, k to the top-K probs
+    uint32_t K = K_, N = N_;
     for (uint32_t k2 = 0; k2 < K; k2++) {
       uint64_t B = B_;
-      // each k2 has a different rand_k2.  Treat rand_k2 as "reduced" at this
+      // each k2 has a different rand.  Treat rand as "reduced" at this
       // point, meaning it's in a space where disallowed regions have been
       // removed.
-      uint64_t rand_k2 = (rand_source_ % B) + B * k;
+      uint64_t rand = (rand_source_ % B) + B * k2;
 
       // uint64_t *delta_P_buf_ = M_buf64_;
       uint64_t delta_P_sum = 0;  // we'll compute this via a reduction in CUDA.
@@ -419,22 +420,23 @@ class CombinedSampler {
       // the following is compute_shifted_samples() in python.
       for (uint32_t k = 0; k < K; k++) {
         uint64_t topK_cumsum_reduced = topK_cumsums_[k] - topK_delta_P_cumsum_[k];
-        delta_P_sum += (rand_k2 >= topK_cumsum_reduced) * topK_delta_P_[k];
+        delta_P_sum += (rand >= topK_cumsum_reduced) * topK_delta_P_[k];
       }
-      uint64_t rand_shifted = rand_k2 + delta_P_sum;
+      uint64_t rand_shifted = rand + delta_P_sum;
       shifted_samples_[k2] = rand_shifted;
 
       for (uint32_t k = 0; k < K; k++) { // check_shifted_samples()
         uint64_t topK_disallowed_start = topK_cumsums_[k],
             topK_disallowed_end = topK_disallowed_start + topK_delta_P_[k];
-        assert (!(rand_shifted >= topK_disallowed_start &&
+        TORCH_CHECK(!(rand_shifted >= topK_disallowed_start &&
                   rand_shifted < topK_disallowed_end));
-        assert (rand_shifted < P_sum_cumprod_[N]);
+        TORCH_CHECK(rand_shifted < P_sum_cumprod_[N]);
       }
     }
   }
 
-  void GetIndexesForSamples() {
+  void ComputeIndexesForSamples() {
+    uint32_t K = K_, N = N_, M = M_;
     for (uint32_t k2 = 0; k2 < K; k2++) {
       uint64_t cur_sample = shifted_samples_[k2];
 
@@ -444,18 +446,17 @@ class CombinedSampler {
         uint64_t P_sum_cumprod = P_sum_cumprod_[n];
         uint32_t this_sample = uint32_t(cur_sample / P_sum_cumprod);
 
-        uint32_t *P_cumsum_start = Pcumsum_ + n * (M+1);
-        uint32_t *cumsum_ptr = find_class(P_cumsum_start,
-                                          0, M, this_sample);
+        uint32_t *P_cumsum_start = P_cumsum_ + n * (M+1);
         // This uses find_class() which implements a binary search.
-        uint32_t this_m_idx = uint32_t(find_class(cumsum_ptr - P_cumsum_start));
+        uint32_t this_m_idx = find_class(P_cumsum_start,
+                                         (int)0, (int)M, this_sample);
 
-        indexes_for_samples_[k*N  + n] = this_m_idx;
+        indexes_for_samples_[k2 * N + n] = this_m_idx;
 
         if (n == 0)
           break;
-        uint32_t this_cumsum = cumsum_ptr[0],
-            next_cumsum = cumsum_ptr[1],
+        uint32_t this_cumsum = P_cumsum_start[this_m_idx],
+            next_cumsum = P_cumsum_start[this_m_idx + 1],
             this_P = next_cumsum - this_cumsum;
 
         uint64_t remainder = cur_sample - this_cumsum * P_sum_cumprod;
@@ -467,12 +468,12 @@ class CombinedSampler {
   // returns a pseudo random number coprime to M_, as a function of n.
   // this is deterministic within a batch.
   inline uint32_t GetRandomCoprime(uint32_t n) {
-    return 1 + M_unique_ * (rand_source1_ >> (M_bits_ * n)) % (M_ / M_unique_);
+    return 1 + M_unique_ * (rand_source_ >> (M_bits_ * n)) % (M_ / M_unique_);
   }
   // returns num_bits >= 1 such that (1 << num_bits) >= n.
   inline uint32_t FindNumBitsFor(uint32_t n) {
-    num_bits = 1;
-    while ((1 << num_bits) < n)
+    uint32_t num_bits = 1;
+    while ((uint32_t(1) << num_bits) < n)
       num_bits++;
     return num_bits;
   }
@@ -517,20 +518,21 @@ class CombinedSampler {
             i.e. to the product of the distributions (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
 */
-torch::Tensor sample_combined_cpu_forward(torch::Tensor probs, // [B][N][M]
-                                          torch::Tensor rand,   // [B]
-                                          int K, bool input_is_log) {
+std::vector<torch::Tensor>
+sample_combined_cpu_forward(torch::Tensor probs, // [B][N][M]
+                            torch::Tensor rand,   // [B]
+                            int K, bool input_is_log) {
   TORCH_CHECK(probs.dim() == 3, "probs must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 1, "rand must be 1-dimensional");
   auto int64_type = torch::kInt64,
       float_type = torch::kFloat32;
-  TORCH_CHECK(torch.probs.scalar_type() == float_type);
-  TORCH_CHECK(rand.scalar_type() == int32_type);
+  TORCH_CHECK(probs.scalar_type() == float_type);
+  TORCH_CHECK(rand.scalar_type() == int64_type);
 
   int B = probs.size(0),  // batch size
       N = probs.size(1),  // num distributions
-      M = probs.size(2),  // num classes
-  assert(rand.size(0) == B);
+      M = probs.size(2);  // num classes
+  TORCH_CHECK(rand.size(0) == B);
 
   TORCH_CHECK(K > 0 && K < N && ((K&(K-1))==0));  // K is sequence length
   TORCH_CHECK(N >= 0 && N <= 4);
@@ -551,18 +553,21 @@ torch::Tensor sample_combined_cpu_forward(torch::Tensor probs, // [B][N][M]
 
   AT_DISPATCH_FLOATING_TYPES(probs.scalar_type(), "sample_combined_cpu_forward_dispatch", ([&] {
         auto probs_a = probs.packed_accessor32<scalar_t, 3>();  // scalar_t comes from the macro.
-        auto weights_a = indexes.packed_accessor32<scalar_t, 2>();
+        auto weights_a = weights.packed_accessor32<scalar_t, 2>();
         auto rand_a = rand.packed_accessor32<int64_t, 1>();
         auto indexes_a = indexes.packed_accessor32<int64_t, 3>();
-        auto combined_indexes_a = indexes.packed_accessor32<int64_t, 3>();
-
+        auto combined_indexes_a = combined_indexes.packed_accessor32<int64_t, 2>();
 
         CombinedSampler sampler(N, M, K);
 
         for (int b = 0; b < B; b++) {
-          sampler.LoadP(rand_a[b], input_is_log, probs_a[b]);
+          uint64_t rand = uint64_t(rand_a[b]);
+          //          torch_scheduled_sampling/sampling_cpu.cpp:563:55: error: no matching function for call to 'CombinedSampler::LoadP(uint64_t&, bool&, at::TensorAccessor<double, 2, at::DefaultPtrTraits, int>)'
+          sampler.LoadP<scalar_t>(rand, input_is_log, probs_a[b]);
           sampler.Compute();
-          sampler.GetWeightsForSamples(weights_a[b]);
+          // torch_scheduled_sampling/sampling_cpu.cpp:565:52: error: no matching function for call to 'CombinedSampler::GetWeightsForSamples(at::TensorAccessor<double, 1, at::DefaultPtrTraits, int>)'
+          sampler.GetWeightsForSamples<scalar_t>(weights_a[b]);
+          // torch_scheduled_sampling/sampling_cpu.cpp:565:52: note:   'at::TensorAccessor<double, 1, at::DefaultPtrTraits, int>' is not derived from 'at::PackedTensorAccessor32<Real, 1>'
           sampler.GetIndexesForSamples(indexes_a[b], combined_indexes_a[b]);
         }
       }));
@@ -575,5 +580,6 @@ torch::Tensor sample_combined_cpu_forward(torch::Tensor probs, // [B][N][M]
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("sample_cpu", &sample_cpu, "Iterative sampling function (CPU)");
+  m.def("sample_cpu", &sample_combined_cpu_forward,
+        "Multi-softmax sampling function (CPU)");
 }

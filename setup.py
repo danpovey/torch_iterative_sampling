@@ -24,9 +24,9 @@ to model the probability of the output distribution.
 def configure_extensions():
     out = [
         CppExtension(
-            'torch_iterative_sampling_cpu',
+            'torch_scheduled_sampling_cpu',
             [
-                os.path.join('torch_iterative_sampling', 'iterative_sampling_cpu.cpp'),
+                os.path.join('torch_scheduled_sampling', 'sampling_cpu.cpp'),
             ],
         )
     ]
@@ -35,10 +35,10 @@ def configure_extensions():
         this_dir = pathlib.Path(__file__).parent.resolve()
         out.append(
             CUDAExtension(
-                'torch_iterative_sampling_cuda',
+                'torch_scheduled_sampling_cuda',
                 [
-                    os.path.join('torch_iterative_sampling', 'iterative_sampling_cuda.cpp'),
-                    os.path.join('torch_iterative_sampling', 'iterative_sampling_cuda_kernel.cu'),
+                    os.path.join('torch_scheduled_sampling', 'sampling_cuda.cpp'),
+                    os.path.join('torch_scheduled_sampling', 'sampling_cuda_kernel.cu'),
                 ],
                 extra_compile_args={'cxx': [], 'nvcc': [f'-I{this_dir}/cub']}
             )
