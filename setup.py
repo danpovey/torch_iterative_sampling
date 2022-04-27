@@ -49,7 +49,7 @@ def configure_extensions():
 
 
 setup(
-    name='torch_iterative_sampling',
+    name='torch_scheduled_sampling',
     version='1.0.0',
     description='Differentiable sampling of a categorical variable',
     long_description=long_description,

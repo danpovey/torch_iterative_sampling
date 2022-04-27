@@ -3,7 +3,6 @@
 
 
 
-
 /*
   Return the index i into cumsum, with begin <= i < end,
   such that cumsum[i] <= r < cumsum[i + 1].
@@ -25,77 +24,33 @@ template <typename IterType> int find_class(
 
 
 
-/*
-  Zoom into an interval.  What we are trying to emulate here is something like this:
-
-  float cur_begin = 0.4, cur_end = 0.6,
-         r = 0.423143, end = 0.7;
-  r = (r - cur_begin) * end / (cur_end - cur_begin);
-  .. that is, in the real-number version, we are taking some r with
-  cur_begin <= r <= cur_end, and shifting and scaling it so that 0 <= r <= end.
-  Look at this as "zooming into an interval", as in arithmetic coding.  This is
-  all done in integer math, though.  Integer math is more convenient because
-  we don't have to worry about roundoff here.
-
-         r:       Random number with cur_begin <= r < cur_end.
-    orig_r:       A number that we use as an auxiliary source of randomness, if
-                  needed (e.g. if we have to zoom in "very far").
-    cur_begin:    Beginning of interval that `r` is in.  We require
-                     0 < cur_begin < (int)((1<<31) + 1.1)
-    cur_end:      One-past-the-last of interval that `r` is in.  We require
-                     cur_begin < cur_end < (int)((1<<31) + 1.1),
-       end:      One past the last element of the interval that we are
-                 shifting r to (first element is 0).
-
-    Return:   Returns a number that, conceptually, is uniformly distributed on the
-              interval [0..end-1], assuming r was originally uniformly distributed
-              on the interval [cur_begin..cur_end-1].
- */
-inline uint32_t zoom(uint32_t r, uint32_t orig_r,
-                     uint32_t cur_begin, uint32_t cur_end,
-                     uint32_t end) {
-  // prod will not overflow because none of these numbers are significantly larger
-  // than 1 << 31.
-  //
-  // Adding ((orig_r + cur_begin) % end) is intended to provide randomness in
-  // the lower bits, to avoid going to exactly zero when cur_begin - cur_end ==
-  // 1, which could happen (extremely rarely)
-  uint64_t prod = (uint64_t)(r - cur_begin) * (uint64_t)end  +  ((orig_r + cur_begin) % end);
-  // We know that prod < (cur_end - cur_begin) * end, because
-  // (uint64_t)(r - cur_begin) * (uint64_t)end <= (cur_end - 1 - cur_begin) * end,
-  //                        and (orig_r % end) < 1 * end.
-
-  // We know that ans < end, because prod < (cur_end - cur_begin) * end.
-  uint32_t ans = prod / (cur_end - cur_begin);
-  return ans;
-}
-
 class CombinedSampler {
  public:
-  CombinedSampler(uint32_t N, uint32_t M, uint32_t K): N_(N), M_(M), K_(K),
-                                                       M_unique_(find_prod_unique_prime_factors(M)) {
+  CombinedSampler(uint32_t N, uint32_t M, uint32_t K):
+      N_(N), M_(M), K_(K),
+      M_unique_(find_prod_unique_prime_factors(M)) {
     assert(N < 5);
     assert((K&(K-1)) == 0);  // require K is a power of 2.
-    M_bits_ = 1;
-    while ((1 << M_bits_) < M)
-      M_bits_++;
-    K_bits_ = 1;
-    while ((1 << k_bits_) < K)
-      K_bits_++;
+    M_bits_ = FindNumBitsFor(N);
+    K_bits_ = FindNumBitsFor(K);
+
 
     p_bits_ = min(uint32_t(54) / K, // so product of N of these is comfortably less than 64, search for "headroom"
-                  min(uint32_t(63) - K_bits_) / K,
-                  uint32_t(31) - M_bits_); // so we can sort the indexes and probs in one integer.
+                  min(uint32_t(63) - (K_bits_ * N) / K, // for when we sort `this_sort_P`
+                      uint32_t(31) - M_bits_)); // for when we sort `sort_combinations`.
 
-    // Allocate buffers..
+    // TODO: allocate buffers..
   }
 
 
 
   template <typename Real>
-  void LoadP(torch::PackedTensorAccessor<int64_t, 1, torch::RestrictPtrTraits> &rand,
-             bool input_is_log) {
-    torch::PackedTensorAccessor<Real, 2, torch::RestrictPtrTraits> &p) {
+  void LoadP(uint64_t rand_source,
+             bool input_is_log,
+             torch::PackedTensorAccessor<Real, 2, torch::RestrictPtrTraits> &p) {
+    rand_source_ = rand_source;
+
+
     // loads P into internal buffer as integers, with reordering.
     // Sets M_reorder_, rand_source_.
 
@@ -111,6 +66,47 @@ class CombinedSampler {
 
   }
 
+  /*
+    `weights` is of shape [K].  We write the samples' weights to here.
+   */
+  template <typename Real>
+  void GetWeightsForSamples(
+      torch::PackedTensorAccessor<Real, 1, torch::RestrictPtrTraits> &weights) {
+
+    uint32_t N = N_, M = M_, K = K_;
+    float denom = (float)P_sum_cumprod_[N];
+    float beta = (float)B_ / denom;
+
+    for (uint32_t k2 = 0; k2 < K; k2++) { // parallelize over k2
+      uint64_t prod_P = 1;
+      for (uint32_t n = 0; n < N; n++) {
+        uint32_t this_idx = indexes_for_samples_[k2 * N + n];
+        uint32_t this_P = P_cumsum_[n * (M + 1) + m + 1] - P_cumsum_[n * (M + 1) + m];
+        prod_P *= this_P;
+      }
+      float p = (float)prod_P / denom;
+      weights[k] = (Real)max(p, beta);
+    }
+  }
+
+  void GetIndexesForSamples(
+      torch::PackedTensorAccessor<int64_t, 2, torch::RestrictPtrTraits> &indexes,
+      torch::PackedTensorAccessor<int64_t, 1, torch::RestrictPtrTraits> &combined_indexes) {
+    uint32_t N = N_, M = M_, K = K_;
+    for (uint32_t k2 = 0; k2 < K; k2++) { // parallelize over k2, maybe also over n.
+      uint64_t combined_index = 0;
+      uint32_t M_prod = 1;
+      for (uint32_t n = 0; n < N; n++) {
+        uint32_t this_m = indexes_for_samples_[k*N + n];
+        indexes[k2][n] = this_m;
+        combined_index += this_m * M_prod;
+        M_prod *= M;
+      }
+      combined_indexes[k2] = combined_index;
+    }
+  }
+
+
 
  private:
 
@@ -119,20 +115,20 @@ class CombinedSampler {
   uint32_t K_; // number of samples we require per softmax.
   uint32_t M_unique_;  // product of unique prime factors of M_
 
-  uint32_t M_reorder_[4];  // indexed [N], a pseudo-random numbers coprime to M_
-                           // that we use to reorder m indexes at input and
-                           // output.
-  uint64_t rand_source_;  // random source for generating samples.
+  // rand_source_ is the random source for reordering modulo M (lowest bits) and
+  // for generating samples (all bits).
+  uint64_t rand_source_;
 
   // number of bits used for storing index 0 <= m < M_ when sorting R_; require (1<<M_bits_) >= M_
   uint32_t M_bits_;
+
   // number of bits used for probabilities; require:
   //  (i) K*p_bits_ <= 54 [an arbitrary choice with 54 << 64,
   //       search for "headroom" to understand]
   //  (ii) (p_bits_*K_bits) <= 63 [1 less than 64 to allow for rounding error].
   //  (iii) also p_bits_ + M_bits_ + 1 <= 32 because of how we
-  //      sort [the +1 is in case some probs or sums of probs are slightly more than
-  //      1 due to rounding].
+  //      sort to find K-best probs [the +1 is in case some probs or sums of probs
+  //      are slightly more than 1 due to rounding.
   uint32_t p_bits_;
   // number of bits used for indexes 0 <= k < K;
   uint32_t K_bits_;
@@ -231,9 +227,11 @@ class CombinedSampler {
   uint64_t *shifted_samples_;
 
   /*
-    Indexed [K][N], contains the indexes in {0..M-1} for the samples in shifted_samples_.
+    Of size [K][N], indexed as indexes_for_samples[k*N + n], contains the indexes
+                    in {0..M-1} for the samples in shifted_samples_.
    */
   uint32_t *indexes_for_samples_;
+
 
 
   uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
@@ -438,13 +436,45 @@ class CombinedSampler {
 
   void GetIndexesForSamples() {
     for (uint32_t k2 = 0; k2 < K; k2++) {
+      uint64_t cur_sample = shifted_samples_[k2];
+
       // we'll parallelize over k2.  We have to do the n index sequentially.
+      for (uint32_t n = N-1; ; --n) {  // we break in the loop if n == 0.
 
+        uint64_t P_sum_cumprod = P_sum_cumprod_[n];
+        uint32_t this_sample = uint32_t(cur_sample / P_sum_cumprod);
 
+        uint32_t *P_cumsum_start = Pcumsum_ + n * (M+1);
+        uint32_t *cumsum_ptr = find_class(P_cumsum_start,
+                                          0, M, this_sample);
+        // This uses find_class() which implements a binary search.
+        uint32_t this_m_idx = uint32_t(find_class(cumsum_ptr - P_cumsum_start));
 
+        indexes_for_samples_[k*N  + n] = this_m_idx;
 
+        if (n == 0)
+          break;
+        uint32_t this_cumsum = cumsum_ptr[0],
+            next_cumsum = cumsum_ptr[1],
+            this_P = next_cumsum - this_cumsum;
 
+        uint64_t remainder = cur_sample - this_cumsum * P_sum_cumprod;
+        cur_sample = remainder / this_P;
+      }
     }
+  }
+
+  // returns a pseudo random number coprime to M_, as a function of n.
+  // this is deterministic within a batch.
+  inline uint32_t GetRandomCoprime(uint32_t n) {
+    return 1 + M_unique_ * (rand_source1_ >> (M_bits_ * n)) % (M_ / M_unique_);
+  }
+  // returns num_bits >= 1 such that (1 << num_bits) >= n.
+  inline uint32_t FindNumBitsFor(uint32_t n) {
+    num_bits = 1;
+    while ((1 << num_bits) < n)
+      num_bits++;
+    return num_bits;
   }
 
 };
@@ -476,30 +506,34 @@ class CombinedSampler {
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
 
-    Returns: (indexes, weights)
+    Returns: (indexes, combined_indexes, weights)
        indexes: of shape (B, K, N), for each of K samples from a distribution it contains
             an N-tuple of indexes saying which combination of indexes from the
             component distributions were sampled.
+       combined_indexes: of shape (B, K), contains the N-tuples in `indexes` combined
+           into a single integer in [0..(K**N)-1]
        weights: of shape (B, K), gives the weight associated with each sample,
             which will equal max(p, beta) for a beta specific to the batch element,
             i.e. to the product of the distributions (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
 */
-torch::Tensor sample_combined_cpu_forward(torch::Tensor probs, // [B][N]
-                                          torch::Tensor rand,   // [B][S]
-                                          int K) {
-  TORCH_CHECK(probs.dim() == 2, "probs must be 2-dimensional");
-  TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
-  auto int32_type = torch::kInt32,
+torch::Tensor sample_combined_cpu_forward(torch::Tensor probs, // [B][N][M]
+                                          torch::Tensor rand,   // [B]
+                                          int K, bool input_is_log) {
+  TORCH_CHECK(probs.dim() == 3, "probs must be 2-dimensional");
+  TORCH_CHECK(rand.dim() == 1, "rand must be 1-dimensional");
+  auto int64_type = torch::kInt64,
       float_type = torch::kFloat32;
-  TORCH_CHECK(probs.scalar_type() == float_type);
+  TORCH_CHECK(torch.probs.scalar_type() == float_type);
   TORCH_CHECK(rand.scalar_type() == int32_type);
 
   int B = probs.size(0),  // batch size
-      N = probs.size(1),  // num classes
-      S = rand.size(1);    // num sequences
+      N = probs.size(1),  // num distributions
+      M = probs.size(2),  // num classes
+  assert(rand.size(0) == B);
 
-  TORCH_CHECK(K > 0 && K < N);  // K is sequence length
+  TORCH_CHECK(K > 0 && K < N && ((K&(K-1))==0));  // K is sequence length
+  TORCH_CHECK(N >= 0 && N <= 4);
   TORCH_CHECK(rand.size(0) == B);
 
   TORCH_CHECK(probs.device().is_cpu() && rand.device().is_cpu(),
@@ -507,142 +541,33 @@ torch::Tensor sample_combined_cpu_forward(torch::Tensor probs, // [B][N]
 
   auto long_opts = torch::TensorOptions().dtype(torch::kInt64).device(probs.device());
 
+  auto real_opts = torch::TensorOptions().dtype(probs.dtype()).device(probs.device());
+
   // TODO: make empty
-  torch::Tensor indexes = torch::zeros({B, S, K}, long_opts);
+  torch::Tensor indexes = torch::empty({B, K, N}, long_opts),
+      combined_indexes = torch::empty({B, K}, long_opts);
+
+  torch::Tensor weights = torch::empty({B, K}, real_opts);
+
+  AT_DISPATCH_FLOATING_TYPES(probs.scalar_type(), "sample_combined_cpu_forward_dispatch", ([&] {
+        auto probs_a = probs.packed_accessor32<scalar_t, 3>();  // scalar_t comes from the macro.
+        auto weights_a = indexes.packed_accessor32<scalar_t, 2>();
+        auto rand_a = rand.packed_accessor32<int64_t, 1>();
+        auto indexes_a = indexes.packed_accessor32<int64_t, 3>();
+        auto combined_indexes_a = indexes.packed_accessor32<int64_t, 3>();
 
 
-  auto probs_a = probs.packed_accessor32<float, 2>();
-  auto rand_a = rand.packed_accessor32<int32_t, 2>();
-  auto indexes_a = indexes.packed_accessor32<int64_t, 3>();
+        CombinedSampler sampler(N, M, K);
 
-  // At iteration k, cur_classes[0] contains -1; cur_classes[1,2,..k]
-  // contains the previously chosen k classes (all distinct), in sorted
-  // order from least to greatest; and cur_classes[k+1] contains N.
-  std::vector<int32_t> cur_classes(K + 2);
-
-  // cumsum_row contains exclusive cumumulative sum of probabilities,
-  // multiplied by (1<<31) and turned to integer, with one extra element
-  // containing the total.
-  std::vector<uint32_t> cumsum_row(N + 1);
-
-  // At iteration k, cur_cumsum[c] for 0 <= c <= k contains cumulative
-  // probabilities after subtracting the probability mass due to the
-  // previously chosen classes (sorted by class-index, not iteration).
-  // Implicitly, cur_cumsum[k+1] (not present) contains remaining_prob.
-  //
-  // At iteration k we have already chosen k classes.  We break up the
-  // remaining probability mass (with those k classes removed) into k+1
-  // remaining intervals (some possibly empty).  Dwscribing how these
-  // remaining intervals are embedded in the interval [0,1], with
-  // gaps in between, interval i (with 0 <= i <= k) starts at
-  // cumsum[b][cur_classes[i]+1], and ends at
-  // cumsum[b][cur_classes[i+1]].
-  //
-  // In cur_cumsum, we store the cumulative sum *excluding* the intervals
-  // corresponding to the previously chosen classes.  On iteration k,
-  // cur_cumsum[0] will always contain 0 and cur_cumsum[i] for 0 < i <= k
-  // will contain the start of interval i, with the intervals belonging to
-  // previously chosen classes subtracted.
-  std::vector<uint32_t> cur_cumsum(K + 1);
-
-  for (int b = 0; b < B; ++b) {
-    auto this_probs_a = probs_a[b];
-
-    uint32_t tot = 0;
-    for (int n = 0; n < N; n++) {
-      cumsum_row[n] = tot;
-      // The + 1 is to ensure it's nonzero.  This is quite a bit smaller than
-      // the floating point epsilon, so we're not concerned about the bias from doing
-      // "+" instead of "max".
-      uint32_t this_prob = (uint32_t) ((((uint32_t)1) << 31) * this_probs_a[n]) + 1;
-      tot += this_prob;
-    }
-    cumsum_row[N] = tot;
-
-
-    for (int s = 0; s < S; ++s) {
-      auto this_indexes_a = indexes_a[b][s];
-      cur_classes[0] = -1;
-      cur_classes[1] = N;
-      cur_cumsum[0] = 0;
-
-      // at iteration k, remaining_prob contains the sum of the probabilities
-      // of classes that have not so far been chosen.
-      uint32_t remaining_prob = cumsum_row[N];
-
-      // r is a new random value on {0..1<<31-1}.   We only use one random input for
-      // each random sequence; we accomplish this by "zooming in" to each interval
-      // that we choose.
-      uint32_t r = rand_a[b][s],
-          r_orig = r;
-
-      r = zoom(r, r, (uint32_t)0, ((uint32_t)1) << 31, remaining_prob);
-
-      for (int k = 0; k < K; ++k) {
-        // Note: at this point, r is in the interval {0..remaining_prob-1}
-        int i = find_class(cur_cumsum, 0, k + 1, r);
-        // CAUTION: none of these asserts actually get compiled, you have to change them all to
-        // TORCH_CHECK if you really want to debug.
-        assert(i >= 0 && i <= k);
-        // i will now be some value 0 <= i <= k, satisfying
-        // cur_cumsum[i] <= r < cur_cumsum[i+1], where,
-        // implicitly, cur_cumsum[k+1] == remaining_prob, although
-        // actually we never access that element and it is not present.
-
-        // class_range_begin, class_range_end, are the (first,
-        // one-past-the-last) class indexes of the range of classes know
-        // the k'th randomly chosen class is in.  See the comment above
-        // about the k+1 intervals.
-        int class_range_begin = cur_classes[i] + 1,
-            class_range_end = cur_classes[i + 1];
-
-        assert(class_range_end > class_range_begin && class_range_end <= N);
-
-        // shift r by "adding back" the probability mass due to the subset
-        // of previously chosen classes that were numbered less than
-        // class_range_begin.  Now r can be compared to elements of
-        // `cumsum`.
-        uint32_t class_range_begin_cumsum = cumsum_row[class_range_begin];
-        r = r - cur_cumsum[i] + class_range_begin_cumsum;
-
-        int c = find_class(cumsum_row,
-                           class_range_begin,
-                           class_range_end, r);
-        assert(c >= class_range_begin && c < class_range_end);
-
-        // c is the class chosen, satisfying cumsum_row[c] <= r < cumsum_row[c +
-        // 1].  It will be distinct from all previously chosen classes.
-        this_indexes_a[k] = c;
-
-        uint32_t this_class_cumsum = (c == 0 ? 0 : cumsum_row[c]),
-            next_class_cumsum = cumsum_row[c + 1],
-            this_class_prob = next_class_cumsum - this_class_cumsum;
-
-        assert(r >= this_class_cumsum && r < next_class_cumsum);
-
-        remaining_prob -= this_class_prob;
-
-        r = zoom(r, r_orig, this_class_cumsum, next_class_cumsum, remaining_prob);
-
-        // Update cur_classes and cur_cumsum.
-        cur_classes[k + 2] = N;
-        // TODO: could unroll the next loop (the speed here is mostly an
-        // issue only if K is large).  We are inserting this class and its
-        // associated elements in cur_cumsum, in the appropriate place in
-        // the list, and shifting later elements to the right while
-        // subtracting this class's prob from later elements of
-        // cur_cumsum.
-        for (int k2 = k; k2 > i; --k2) {
-          cur_cumsum[k2 + 1] = cur_cumsum[k2] - this_class_prob;
-          cur_classes[k2 + 1] = cur_classes[k2];
+        for (int b = 0; b < B; b++) {
+          sampler.LoadP(rand_a[b], input_is_log, probs_a[b]);
+          sampler.Compute();
+          sampler.GetWeightsForSamples(weights_a[b]);
+          sampler.GetIndexesForSamples(indexes_a[b], combined_indexes_a[b]);
         }
-        cur_cumsum[i + 1] = cur_cumsum[i] + (this_class_cumsum -
-                                             class_range_begin_cumsum);
-        cur_classes[i + 1] = c;
-      }
-    }
-  }
-  return indexes;
+      }));
+
+  return std::vector<torch::Tensor>({indexes, combined_indexes, weights});
 }
 
 
