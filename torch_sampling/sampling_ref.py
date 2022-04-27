@@ -227,16 +227,16 @@ def compute_beta_prods(Psum, Ptop):
              that we do not materialize.
              What this condition amounts to in terms of args of this function,
              is that:
-                 Psum + delta_P.sum(-1) = B*K
+                 Psum - delta_P.sum(-1) = B*K
              [Caution: the exact equality in (eqn:b1) is only true
              once we subtract a small number in [0..K-1] from the next-largest
              element of P that is not >B, to correct for rounding error;
              this is accounted for in delta_P.
-          delta_P: of shape (*, K), this contains the change, if any, that we have
-             to make to the top-K elements of the distribution before sampling.
-             Satisfies delta_P <= 0.  This combines two things: the
-             differences (min(P[i], B) - P[i]); and the values in [-(K-1)..0]
-             that we add to the largest item that's less than P to account
+          delta_P: of shape (*, K), this contains the amount, if any, that we have
+             to subtract from the top-K elements of the distribution before sampling.
+             Satisfies delta_P >= 0.  This combines two things: the
+             differences max(0, P[i] - B); and the values in [-(K-1)..0]
+             that we subtract to the largest item that's less than P to account
              for rounding effects.
     """
     K = Ptop.shape[-1]
@@ -285,9 +285,9 @@ def compute_beta_prods(Psum, Ptop):
     # `indexes` are the values of k.
     B, indexes = torch.max(B_k * is_ok, dim=-1)  # shape: (*,)
 
-    delta_P = (torch.minimum(Ptop, B.unsqueeze(-1)) - Ptop) - (remainder_k * is_ok)
+    delta_P = (Ptop - torch.minimum(Ptop, B.unsqueeze(-1))) + (remainder_k * is_ok)
 
-    err = Psum + delta_P.sum(dim=-1) - B * K
+    err = Psum - delta_P.sum(dim=-1) - B * K
     assert torch.all(err == 0)
     assert torch.all(torch.sum(is_ok, dim=-1)[0] == 1)
 
@@ -306,8 +306,8 @@ def compute_shifted_samples(topK_cumsums_mod: Tensor,
                  "modified" are reduced to account for "disallowed regions" that
                  we cannot sample.  The shape is (*, K) where `*` is the batch dimension
                  and K is the maximum number of "disallowed regions"
-        delta_P: negative values that correspond to the amount of probability mass we
-                 removed for each "disallowed region", i.e. the size of those
+        delta_P: nonnegative values that correspond to the amount of probability mass we
+                 must remove from each "disallowed region", i.e. the size of those
                  regions, as a negative number.  The shape is (*, K).
         samples: The samples that we have to modify by adding values corresponding to
                  the widths of the appropriate disallowed regions.  The shape is (*, K);
@@ -323,7 +323,7 @@ def compute_shifted_samples(topK_cumsums_mod: Tensor,
     # meaning we need to add the corresponding delta_p.
     is_ge = (samples >= topK_cumsums_mod)
 
-    shifted_samples = samples - (is_ge * delta_P).sum(dim=-1, keepdim=True)
+    shifted_samples = samples + (is_ge * delta_P).sum(dim=-1, keepdim=True)
     shifted_samples = shifted_samples.squeeze(-1)
     return shifted_samples
 
@@ -337,7 +337,7 @@ def check_shifted_samples(topK_cumsums: Tensor,
 
     topK_cumsums: Cumulative sums which can be thought of as the start of
                  "disallowed regions" in probability space.  Shape is (*, K)
-             delta_P: the negative of the size of "disallowed regions".  Shape is (*, K)
+             delta_P: the sizes of "disallowed regions".  Shape is (*, K)
      shifted_samples: The samples as modified by `compute_shifted_samples`.  None
                  of these should be within the "disallowed regions".  Shape is (*, K);
                  but note, this K does not have a correpondence with the K in the
@@ -355,7 +355,7 @@ def check_shifted_samples(topK_cumsums: Tensor,
     delta_P = delta_P.unsqueeze(-2)
 
     disallowed_regions_start = topK_cumsums
-    disallowed_regions_end = topK_cumsums - delta_P  # delta_p is <= 0.
+    disallowed_regions_end = topK_cumsums + delta_P  # delta_p is <= 0.
 
     # in_disallowed_region is of shape (*, K, K)
     in_disallowed_region = torch.logical_and(shifted_samples >= disallowed_regions_start,
@@ -621,14 +621,14 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     delta_P_cumsum = torch.cumsum(delta_P, dim=-1)
     delta_P_exclusive = delta_P_cumsum - delta_P
 
-    # topK_cumsums_mod is topK_cumsums modified by adding the product
+    # topK_cumsums_mod is topK_cumsums modified by subtracting the sum
     # of previous delta_P's (which will be negative).  This compensates for
     # the fact that the random numbers in "sampled_values" are in a compressed
-    # space where we "skip over" regions of size -delta_P.
+    # space where we "skip over" regions of size delta_P.
     #
     # These are the cutoffs for subtracting the delta_P's
     # from sampled_values
-    topK_cumsums_mod = topK_cumsums + delta_P_exclusive
+    topK_cumsums_mod = topK_cumsums - delta_P_exclusive
 
 
     # CAUTION: if the product of sums is too large, this rand_values
@@ -919,7 +919,7 @@ def _test_combined():
 
     B, delta_P = compute_beta_prods(P_sum_product, topK_values)
 
-    assert torch.all(topK_values + delta_P > 0)
+    assert torch.all(topK_values - delta_P > 0)
 
 
     # reorder topK_cumsums from smallest to largest, which we'll require
@@ -941,10 +941,10 @@ def _test_combined():
     # topK_cumsums_mod is topK_cumsums modified by adding the product
     # of previous delta_P's (which will be negative).  This compensates for
     # the fact that the random numbers in "sampled_values" are in a compressed
-    # space where we "skip over" regions of size -delta_P.
+    # space where we "skip over" regions of size delta_P.
     #
-    # These are the cutoffs for subtracting the delta_P's
-    # from sampled_values
+    # These are the cutoffs for adding the delta_P's
+    # to sampled_values
     topK_cumsums_mod = topK_cumsums + delta_P_exclusive
     print("topK_cumsums_mod = ", topK_cumsums_mod)
 
