@@ -93,11 +93,11 @@ class CombinedSampler {
 
 
   template <typename Real>
-  void LoadP(torch::PackedTensorAccessor<int64_t, 1, torch::RestrictPtrTraits> &p,
+  void LoadP(torch::PackedTensorAccessor<int64_t, 1, torch::RestrictPtrTraits> &rand,
              bool input_is_log) {
     torch::PackedTensorAccessor<Real, 2, torch::RestrictPtrTraits> &p) {
     // loads P into internal buffer as integers, with reordering.
-    // Sets M_reorder_
+    // Sets M_reorder_, rand_source_.
 
     // TODO.
 
@@ -118,8 +118,11 @@ class CombinedSampler {
   uint32_t M_; // size of each softmax
   uint32_t K_; // number of samples we require per softmax.
   uint32_t M_unique_;  // product of unique prime factors of M_
-  uint32_t *M_reorder_; // [K].  pseudo-random numbers coprime to M_ that we use to reorder
-                        // m indexes at input and output.
+
+  uint32_t M_reorder_[4];  // indexed [N], a pseudo-random numbers coprime to M_
+                           // that we use to reorder m indexes at input and
+                           // output.
+  uint64_t rand_source_;  // random source for generating samples.
 
   // number of bits used for storing index 0 <= m < M_ when sorting R_; require (1<<M_bits_) >= M_
   uint32_t M_bits_;
@@ -172,6 +175,11 @@ class CombinedSampler {
     probability.
    */
   uint32_t *topK_indexes_;
+
+  /*
+    This contains the same info as topK_indexes_, but as a single index.
+   */
+  uint64_t *topK_indexes_combined_;
   /*
     of shape [K], contains from highest to lowest the top-K product probabilities;
     these are products of "P" values.
@@ -183,26 +191,49 @@ class CombinedSampler {
    */
   uint64_t B_;
   /*
-    of shape [K], accessed delta_P_[n*K + k], contains original un-reordered *negated* delta_P values as returned
+    of shape [K], accessed delta_P_[n*K + k], contains original un-reordered delta_P values as returned
     by compute_beta_prods() in the python version.  These are the amounts of probability mass we remove
-    for each of the top-K index-N-tuples.
-   */
-  uint64_t *neg_delta_P_;
-  /*
-    of shape [K], delta_p_reordered_ contains the delta_P_ values reordered by smallest to largest
-    index-tuples.
-   */
-  uint64_t *delta_P_reordered_;
-  /*
-    of shape [K+1], delta_p_reordered_cumsum_ contains the exclusive cumulative sum of delta_P_reordered_.
-   */
-  uint64_t *delta_P_reordered_cumsum_;
+    for each of the top-K index-N-tuples to when we assign sampling-probs.
 
+    Originally they are ordered from largest to smallest probs; after ReorderTopk() they are ordered
+    from smallest to largest index-tuple [i.e. by topK_indexes_].
+   */
+  uint64_t *topK_delta_P_;
+  /*
+    of shape [K+1], delta_p_cumsum_ contains the exclusive cumulative
+    sum of delta_P_.
+   */
+  uint64_t *topK_delta_P_cumsum_;
+  /*
+    Of shape [K], the top-K most likely N-tuples of indexes in [0,1,...,M-1].  They are
+    encoded by bit-wise shifting, as
+      (index0 + (index1 << M_bits_) + (index2 << (2*M_bits_))..
+   */
+  uint64_t topK_indexes_;
 
   /*
-    combined_cumsums_ is the
+    topK_cumsums_, of shape [K], contains the cumulative-sums of products of
+    probs [accumulated over all possible products.. we use a formula for this!],
+    evaluated at the indexes topK_indexes_.  these are the exclusive cum-sums,
+    so they correspond to the beginning of the probability interval, not the
+    end.
    */
-  uint64_t *combined_cumsums_;
+  uint64_t *topK_cumsums_;
+
+  /*
+    Contains the samples that have been shifted to the right by excluding
+    disallowed regions.
+    Shape: [K2].   K2 is numerically the same as K but refers to the indexes of
+        the samples, which are separate from the indexes of the top-K
+        index-tuples' probabilities.
+
+   */
+  uint64_t *shifted_samples_;
+
+  /*
+    Indexed [K][N], contains the indexes in {0..M-1} for the samples in shifted_samples_.
+   */
+  uint32_t *indexes_for_samples_;
 
 
   uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
@@ -318,15 +349,102 @@ class CombinedSampler {
     }
     B_ = B;
     assert(k < K);  // check that we broke from the loop.
-    uint64_t neg_delta_P_sum = 0;
+    uint64_t delta_P_sum = 0;
     for (uint32_t k = 0; k < K; i++) {
       uint64_t Ptop = Ptop_shifted[k+1];
-      neg_delta_P_[k] = remainder + Ptop - std::min<uint64_t>(Ptop, B);
-      neg_delta_P_sum += neg_delta_P_[k];
+      delta_P_[k] = remainder + Ptop - std::min<uint64_t>(Ptop, B);
+      delta_P_sum += delta_P_[k];
     }
-    err = Psum - neg_delta_P_sum - (B * K);
+    err = Psum - delta_P_sum - (B * K);
     assert(err == 0);
-    // outputs: B_, neg_delta_P_.
+    // outputs: B_, and the array delta_P_.
+  }
+
+  void ReorderTopK() {
+    // Reorders top-K index-tuples.
+    // Let:
+    //  sort_combinations_[k] = (topK_indexes_[k] << K_bits_ ) + k,  0 <= k < K.
+    // sort sort_combinations_.
+    // Set topK_indexes_[k] = sort_combinations_[k] >> K_bits_
+    // src_k_idx = sort_combinations_[k] & (K-1)
+    // p = topK_P_[src_k_idx]; sync;
+    // topK_P[src_k_idx] = p  // <---- Same for topK_delta_P_
+    //
+
+
+  }
+
+  void ComputeTopkCumsums() {
+    // Computes top-K cumulative sums; these are the cumulative sums of probabilities of
+    // all N-tuples of indexes that precede each of the top-K cumulative sums.
+
+    uint32_t M_bits = M_bits_, M_mask = (1 << M_bits)  - 1;
+    for (k = 0; k < K_; k++) {  // this will be separate kernels
+      uint64_t P_selected_laterprod = 1,
+          cumsum = 0;
+
+
+      // This involves summations over the N dimension but we do this sequentially
+      // as N will only be 2 or at most 3 in practice.
+
+      uint64_t index_combined = topK_indexes_[k];
+      for (int32_t n = int32_t(N) - 1; n >= 0; --n) {
+        // 0 <= this_m < M
+        uint32_t this_m = (index_combined >> (M_bits * n)) & M_mask,
+            this_P_cumsum_idx = (k*(M+1)) + this_m;
+
+        uint32_t this_P_cumsum = P_cumsum_[this_P_cumsum_idx],
+            next_P_cumsum = P_cumsum_[this_P_cumsum_idx + 1],
+            this_P = next_P_cumsum - this_P_cumsum;
+
+        uint64_t prev_Psum_cumprod = P_sum_cumprod_[n];
+
+        cumsum += prev_Psum_cumprod * P_selected_laterprod * uint64_t(this_P_cumsum);
+      }
+      topK_cumsums_[k] = cumsum;
+    }
+  }
+
+  void ComputeShiftedSamples() {
+    // will parallelize over (k2, k) pairs.  k2 corresponds to the output samples, k to the top-K probs.
+    for (uint32_t k2 = 0; k2 < K; k2++) {
+      uint64_t B = B_;
+      // each k2 has a different rand_k2.  Treat rand_k2 as "reduced" at this
+      // point, meaning it's in a space where disallowed regions have been
+      // removed.
+      uint64_t rand_k2 = (rand_source_ % B) + B * k;
+
+      // uint64_t *delta_P_buf_ = M_buf64_;
+      uint64_t delta_P_sum = 0;  // we'll compute this via a reduction in CUDA.
+                                 // assume K is power of 2.
+
+      // the following is compute_shifted_samples() in python.
+      for (uint32_t k = 0; k < K; k++) {
+        uint64_t topK_cumsum_reduced = topK_cumsums_[k] - topK_delta_P_cumsum_[k];
+        delta_P_sum += (rand_k2 >= topK_cumsum_reduced) * topK_delta_P_[k];
+      }
+      uint64_t rand_shifted = rand_k2 + delta_P_sum;
+      shifted_samples_[k2] = rand_shifted;
+
+      for (uint32_t k = 0; k < K; k++) { // check_shifted_samples()
+        uint64_t topK_disallowed_start = topK_cumsums_[k],
+            topK_disallowed_end = topK_disallowed_start + topK_delta_P_[k];
+        assert (!(rand_shifted >= topK_disallowed_start &&
+                  rand_shifted < topK_disallowed_end));
+        assert (rand_shifted < P_sum_cumprod_[N]);
+      }
+    }
+  }
+
+  void GetIndexesForSamples() {
+    for (uint32_t k2 = 0; k2 < K; k2++) {
+      // we'll parallelize over k2.  We have to do the n index sequentially.
+
+
+
+
+
+    }
   }
 
 };
