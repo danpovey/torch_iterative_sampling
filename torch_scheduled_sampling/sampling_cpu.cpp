@@ -71,7 +71,7 @@ class CombinedSampler {
         size64 * K; // unreduced_samples_
     // indexes_for_samples_, of size K*N, shares memory with sort_buf32_.
 
-    buffers_ = std::unique_ptr<uint32_t>(new uint32_t(tot_size + 100));
+    buffers_ = std::unique_ptr<uint32_t>(new uint32_t[tot_size]);
     uint32_t *p = buffers_.get();
     SetBuffer(P_cumsum_, p, (M+1) * N);
     sort_buf32_ = p;
@@ -610,7 +610,7 @@ class CombinedSampler {
         uint32_t this_m_idx = find_class(P_cumsum_start,
                                          (int)0, (int)M, this_sample);
 
-        std::cout << "Indexes-for-samples: k2=" << k2 << ", n=" << n << "=" << this_m_idx << "\n";
+        //std::cout << "Indexes-for-samples: k2=" << k2 << ", n=" << n << "=" << this_m_idx << "\n";
         indexes_for_samples_[k2 * N + n] = this_m_idx;
 
         if (n == 0)
@@ -726,7 +726,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
           sampler.GetIndexesForSamples(indexes_a[b], combined_indexes_a[b]);
         }
       }));
-  std::cout << "combined_indexes = " << combined_indexes;
+  //  std::cout << "combined_indexes = " << combined_indexes;
   return std::vector<torch::Tensor>({indexes, combined_indexes, weights});
 }
 
