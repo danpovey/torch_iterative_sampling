@@ -14,7 +14,7 @@ def _resolve(name):
 
 
 try:
-    import torch_sampling_cpu
+    import torch_scheduled_sampling_cpu
 except ImportError:
     if VERBOSE:
         print('Falling back to JIT compiling torch_sampling_cpu')
@@ -28,7 +28,7 @@ except ImportError:
 
 
 try:
-    import torch_sampling_cuda
+    import torch_scheduled_sampling_cuda
 except ImportError:
     if VERBOSE:
         print('Falling back to JIT compiling torch_sampling_cuda')
@@ -48,18 +48,18 @@ except ImportError:
 def _sample_combined_forward_dispatcher(
         probs: torch.Tensor,
         rand: torch.Tensor,
-        K: int, input_is_log: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        K: int, input_is_log: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Dispatcher for sample_combined_forward
     """
-    if cumsum.is_cuda:
+    if probs.is_cuda:
         if torch_sampling_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
-        return torch_sampling_cuda.sample_combined_cuda_forward(
-            cumsum, rand, seq_len)
+        return torch_scheduled_sampling_cuda.sample_combined_forward_cpu(
+            probs, rand, K, input_is_log)
     else:
-        return torch_sampling_cpu.sample_combind_cpu_forward(
-            cumsum, rand, seq_len)
+        return torch_scheduled_sampling_cpu.sample_combined_forward_cpu(
+            probs, rand, K, input_is_log)
 
 _max_bits = 54  # used in sample_combined_forward and sample_combined_backward,
                 # see comment in sample_combined_forward.
@@ -90,15 +90,15 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
             weights will sum to 1 along the K axis.
     """
     p = p.detach()  # call sample_combined() if you need derivatives.
+    N = p.shape[-2]
+    M = p.shape[-1]
     assert K & (K-1) == 0
     assert K > 0 and K < M
 
     pshape = p.shape
-    N = p.shape[-2]
-    M = p.shape[-1]
     p = p.reshape(-1, N, M)
     B = p.shape[0]
-    rand = torch.randn(B, 2)
+    rand = torch.randint(2**63 - 1, (B,), device=p.device, dtype=torch.int64)
     (indexes, indexes_combined, weights) = _sample_combined_forward_dispatcher(p, rand, K, input_is_log)
     star = p.shape[:-2]
     indexes = indexes.reshape(*star, K, N)
@@ -114,9 +114,9 @@ def _test_sample_combined_forward():
     M = 16
     K = 4
     l = 8.0 * torch.randn(B, N, M)
-    l = l.log_softmax()
-    print("p = ", p.exp())
-    (indexes, indexes_combined, weights) = sample_combined_forward(p, K, True)
+    l = l.log_softmax(dim=-1)
+    print("p = ", l.exp())
+    (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True)
     print("indexes = ", indexes)
     print("indexes_combined = ", indexes_combined)
     print("weights = ", indexes_combined)

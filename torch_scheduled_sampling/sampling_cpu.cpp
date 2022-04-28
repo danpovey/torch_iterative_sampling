@@ -33,6 +33,7 @@ class CombinedSampler {
   CombinedSampler(uint32_t N, uint32_t M, uint32_t K):
       N_(N), M_(M), K_(K),
       M_unique_(find_prod_unique_prime_factors(M)) {
+    std::cerr << "N="<<N <<",M="<<M<<",K="<<K<<std::endl;
     TORCH_CHECK(N < 5);
     TORCH_CHECK((K&(K-1)) == 0);  // require K is a power of 2.
     M_bits_ = FindNumBitsFor(N);
@@ -616,7 +617,7 @@ class CombinedSampler {
            we want a flat array rather than array of shape (B, N+1) is so that we
            can access it in a more memory-efficient way, avoiding scattered reads.
 
-         K: An integer, the number of samples required, with 0 < K < N
+         K: An integer, the number of samples required, with 0 < K < M
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
 
@@ -647,7 +648,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
       M = probs.size(2);  // num classes
   TORCH_CHECK(rand.size(0) == B);
 
-  TORCH_CHECK(K > 0 && K < N && ((K&(K-1))==0));  // K is sequence length
+  TORCH_CHECK(K > 0 && K < M && ((K&(K-1))==0));  // K is sequence length
   TORCH_CHECK(N >= 0 && N <= 4);
   TORCH_CHECK(rand.size(0) == B);
 
