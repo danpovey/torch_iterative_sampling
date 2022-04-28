@@ -57,7 +57,6 @@ class CombinedSampler {
         size64 * KpowN + // sort_buf64_, because double the element size
         size64 * (N+1) +  // P_sum_cumprod_
         (K*N) + // topK_indexes_
-        K + // topK_indexes_combined_
         size64 * K + // topK_P_
         size64 * K + // topK_P_exclusive_sum_
         size64 * K + // topK_delta_P_
@@ -79,7 +78,6 @@ class CombinedSampler {
     SetBuffer(sort_buf64_, p, KpowN);
     SetBuffer(P_sum_cumprod_, p, N+1);
     SetBuffer(topK_indexes_, p, K*N);
-    SetBuffer(topK_indexes_combined_, p, K);
     SetBuffer(topK_P_, p, K);
     SetBuffer(topK_P_exclusive_sum_, p, K);
     SetBuffer(topK_delta_P_, p, K);
@@ -411,16 +409,13 @@ class CombinedSampler {
       uint64_t combination = sort_combinations[k],
           P = combination >> KpowN_bits;
       topK_P_[k] = P;
-      uint32_t index_combined = 0;  // will be in [0..M**K-1]
       for (uint32_t n = 0; n < N ; n++) {
         // src_k is the k index among the top-K source items for this `n`.  We
         // need to look up the original 'm' index
         uint32_t src_k = (combination >> (n * K_bits)) & (K-1),
             src_m = sort_buf32_[K*n + src_k] & M_mask;
         topK_indexes_[k*N + n] = src_m;
-        index_combined += src_m << (n * M_bits_);
       }
-      topK_indexes_combined_[k] = index_combined;
     }
     uint64_t topK_P_sum = 0;
     for (uint32_t k = 0; k < K; k++) {  // this would be done using a cub exclusive-sum.
@@ -507,12 +502,10 @@ class CombinedSampler {
 
       // This involves summations over the N dimension but we do this sequentially
       // as N will only be 2 or at most 3 in practice.
-      uint64_t index_combined = topK_indexes_combined_[k];
       for (int32_t n = int32_t(N) - 1; n >= 0; --n) {
         // 0 <= this_m < M
-        uint32_t this_m = (index_combined >> (M_bits * n)) & M_mask,
+        uint32_t this_m = topK_indexes_[k*N + n],
             this_P_cumsum_idx = (n*(M+1)) + this_m;
-        TORCH_CHECK(this_m == topK_indexes_[k*N + n]);
 
         uint32_t this_P_cumsum = P_cumsum_[this_P_cumsum_idx],
             next_P_cumsum = P_cumsum_[this_P_cumsum_idx + 1],
