@@ -1,1 +1,1 @@
-from .sampling import sample, SamplingBottleneckModule, BottleneckPredictor
+from .sampling import sample_combined

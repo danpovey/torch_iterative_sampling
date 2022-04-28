@@ -2,6 +2,11 @@
 #include <torch/extension.h>
 
 
+template <typename Real> Real Exp(Real f);
+
+inline torch::Half Exp(torch::Half f) { return (torch::Half)expf((float)f); }
+inline float Exp(float f) { return expf(f); }
+inline double Exp(double f) { return exp(f); }
 
 /*
   Return the index i into cumsum, with begin <= i < end,
@@ -42,30 +47,59 @@ class CombinedSampler {
   }
 
 
+  // returns a pseudo random number coprime to M_, as a function of n.
+  // this is deterministic within a batch.
+  inline uint32_t GetRandomCoprime(uint32_t n) {
+    return 1 + M_unique_ * (rand_source_ >> (M_bits_ * n)) % (M_ / M_unique_);
+  }
 
   template <typename Real, typename AccessorT>
   void LoadP(uint64_t rand_source,
              bool input_is_log,
              AccessorT p) { // p: [N][M]
-    // torch::PackedTensorAccessor32<Real, 2, torch::DefaultPtrTraits> p) {
-
-    // TODO: maybe in future, use torch::RestrictPtrTraits
     rand_source_ = rand_source;
 
+    uint32_t N = N_, M = M_;
+    for (uint32_t n = 0; n < N; n++) {
+      auto p_n = p[n];
 
-    // loads P into internal buffer as integers, with reordering.
-    // Sets M_reorder_, rand_source_.
+      uint32_t multiple = GetRandomCoprime(n);
+      // Here we do the reordering as 1 operation.  For the CUDA code we'll
+      // probably load from main memory to shared memory without reordering, and
+      // then reorder as a separate operation, because we want to keep main
+      // memory access linear.
 
-    // TODO.
+      uint32_t *this_P_cumsum = P_cumsum_ + n * (M+1);
+      this_P_cumsum[0] = 0;
+      uint32_t p_multiple = 1 << (p_bits_);
+      for (uint32_t m = 0; m < M; m++) {
+        uint32_t src_m = (m * multiple) % M;
+        Real src_p = p_n[src_m];
+        if (input_is_log)
+          src_p = Exp(src_p);
 
-    // TODO: write zero, one past the end.
+        // add 1 because if we allow zero probabilities, we get nasty edge cases.
+        uint32_t P = uint32_t(1) + uint32_t(p_multiple * src_p);
+
+        // the index is m + 1 because we shift it right by 1, this will be convenient when
+        // creating the exclusive-sum.
+        // The shifting left by M_bits and adding m is a temporary thing so that we
+        // can later sort these probabilities but retain the associated indexes.
+        this_P_cumsum[m + 1] = P;
+      }
+    }
   }
 
 
   void Compute() {
     ComputeKLargest();
-
-
+    ComputePCumsum();
+    ComputeBeta();
+    ComputeTopkCumsums();  // also re-sorts top-K
+    ComputeShiftedSamples();
+    ComputeIndexesForSamples();
+    // next is GetWeightsForSamples; this is called by the user.
+    // then GetIndexesForSamples; this is called by the user.
   }
 
   /*
@@ -100,15 +134,16 @@ class CombinedSampler {
       uint64_t combined_index = 0;
       uint32_t M_prod = 1;
       for (uint32_t n = 0; n < N; n++) {
+        uint32_t multiple = GetRandomCoprime(n);  // same multiple we used in LoadP().
         uint32_t this_m = indexes_for_samples_[k2*N + n];
-        indexes[k2][n] = this_m;
-        combined_index += this_m * M_prod;
+        uint32_t orig_m = (this_m * multiple) % M;
+        indexes[k2][n] = orig_m;
+        combined_index += orig_m * M_prod;
         M_prod *= M;
       }
       combined_indexes[k2] = combined_index;
     }
   }
-
 
 
  private:
@@ -142,31 +177,28 @@ class CombinedSampler {
      elements with m==0 are zero, and the last column contains the sums of P. */
   uint32_t *P_cumsum_;
 
+
+  /*
+    Of shape [M + (N-1)*K], this buffer is used to sort the K-best probabilities per
+    input distribution. [The +(N-1)*K is because we shift right by K each time we
+    use it.
+   */
+  uint32_t *sort_buf32_;
+
+
+  /*
+    Of shape [K**N], this buffer is used to sort the K-best tuples of probabilities
+    per input distribution.  It does not overlap with the first (N*K) items of
+    sort_buf32_.
+   */
+  uint64_t *sort_buf64_;
+
+
   /*
     Of shape [N+1], P_sum_cumprod_ is the exclusive cumulative product of P_cumsum_[n][M],
     i.e. the cumulative product of the total sum of P which is the last column of P_cumsum_.
    */
   uint64_t *P_sum_cumprod_;
-
-  /*
-    of shape [N][M], this is a temporary buffer used to store things we're sorting, in particular
-    it is used to store the sorted probability values which we call R, shifted up by  M_bits_,
-    plus the corresponding indexes.
-    [Note: we can eventually share the space for this with P_cumsum_, since we need them at different
-    times.  Although the sorting process would overwrite P_cumsum_, because we store the indexes with
-    the probs we have enough information to recover the order; a load, __syncthreads__, recover-indexes,
-    and write would do it.
-   */
-  uint32_t *M_buf1_;  // R_and_indexes_buf_;   k_largest_values_and_indexes_
-
-  /*
-    second misc. temporary buffer of shape [max(M, K**N)].
-   */
-  uint32_t *M_buf2_;
-  /*
-    buffer of uint64_t of size [K**M], may overlap with some other buffers.
-   */
-  uint64_t *M_buf64_;
 
   /*
     of shape [K][N], indexed [k*N + n], topK_indexes_ contains the N-tuples of indexes
@@ -176,21 +208,27 @@ class CombinedSampler {
   uint32_t *topK_indexes_;
 
   /*
-    This contains the same info as topK_indexes_, but as a single index.
+    This contains the same info as topK_indexes_, but as a single index, also
+    combined with the k value; this is used in sorting the topK indexes numerically
+    by index.
+    Specifically, before we sort it, it contains:
+      sum_{n=0}^{N-1}:
+         topK_indexes_[k][n] << (M_bits_*(n+1))
+       + k  [this only works because we know that K < M.]
    */
-  uint64_t *topK_indexes_combined_;
+  uint32_t *topK_indexes_combined_;
   /*
-    of shape [K], contains from highest to lowest the top-K product probabilities;
+    of shape [K], contains, from highest to lowest, the top-K product probabilities;
     these are products of "P" values.
    */
   uint64_t *topK_P_;
+  /*
+    of shape [K], contains the exclusive cumulative sum of topK_P_.
+   */
+  uint64_t *topK_P_exclusive_sum_;
 
   /*
-    Contains B_ which is the integerized beta value.
-   */
-  uint64_t B_;
-  /*
-    of shape [K], accessed delta_P_[n*K + k], contains original un-reordered delta_P values as returned
+    of shape [K], contains the delta_P values as returned
     by compute_beta_prods() in the python version.  These are the amounts of probability mass we remove
     for each of the top-K index-N-tuples to when we assign sampling-probs.
 
@@ -198,34 +236,71 @@ class CombinedSampler {
     from smallest to largest index-tuple [i.e. by topK_indexes_].
    */
   uint64_t *topK_delta_P_;
-  /*
-    of shape [K+1], delta_p_cumsum_ contains the exclusive cumulative
-    sum of delta_P_.
-   */
-  uint64_t *topK_delta_P_cumsum_;
+
 
   /*
-    topK_cumsums_, of shape [K], contains the cumulative-sums of products of
-    probs [accumulated over all possible products.. we use a formula for this!],
-    evaluated at the indexes topK_indexes_.  these are the exclusive cum-sums,
-    so they correspond to the beginning of the probability interval, not the
-    end.
-   */
+    topK_cumsums_, of shape [K], contains the exclusive cumulative-sums of products of
+    all probs.   Note: this is the cumulative-sum over the N-tuples of indexes in [0..M-1],
+    NOT the cumulative sum over the K index.  We compute this using a formula
+    because it would be slow to manually compute that exclusive sum.
+
+    Caution: also contains the k index.  TODO, document this.
+  */
   uint64_t *topK_cumsums_;
 
+
+
+  // the same as topK_P_, but sorted by the N-tuple of indexes.
+  // in CUDA version can just make this the same address as topK_P_.
+  uint64_t *sorted_topK_P_;
+
+  // the same as topK_delta_P_, but sorted by the N-tuple of indexes.
+  // in CUDA version can just make this the same address as topK_delta_P_.
+  uint64_t *sorted_topK_delta_P_;
+
   /*
-    Contains the samples that have been shifted to the right by excluding
-    disallowed regions.
+    of shape [K+1], sorted_topK_delta_P_cumsum_ contains the exclusive cumulative
+    sum of sorted_topK_delta_P_.
+   */
+  uint64_t *sorted_topK_delta_P_cumsum_;
+
+  /*
+    sorted_topK_cumsums_, of shape [K], contains the exclusive cumulative-sums
+    of products of all probs.  Note: this is the cumulative-sum over the
+    N-tuples of indexes in [0..M-1], NOT the cumulative sum over the K index.
+    We compute this using a formula because it would be slow to manually compute
+    that exclusive sum.
+  */
+  uint64_t *sorted_topK_cumsums_;
+
+  /*
+    Of shape [K], equals sorted_topK_cumsums_ - sorted_topK_delta_P_, i.e. it
+    contains the current cumsum minus the sum of preceding delta_P's.
+   */
+  uint64_t *sorted_topK_cumsums_reduced_;
+
+
+  /*
+    Contains which is the integerized beta value.
+   */
+  uint64_t B_;
+
+
+  /*
+    Contains the K random samples [these are not independent, they were separated by
+    B when generated]that have been un-reduced by excluding disallowed regions.
     Shape: [K2].   K2 is numerically the same as K but refers to the indexes of
         the samples, which are separate from the indexes of the top-K
         index-tuples' probabilities.
 
    */
-  uint64_t *shifted_samples_;
+  uint64_t *unreduced_samples_;
 
   /*
     Of size [K][N], indexed as indexes_for_samples[k*N + n], contains the indexes
-                    in {0..M-1} for the samples in shifted_samples_.
+                    in {0..M-1} for the samples in unreduced_samples_.  These are
+                    pseudo-random-reordered indexes, as are m indexes in P_cumsum_,
+                    search for GetRandomCoprime().
    */
   uint32_t *indexes_for_samples_;
 
@@ -251,62 +326,88 @@ class CombinedSampler {
     // [2] sort the [K**N] products of the K largest probabilities, remembering their
     //     original indexes in 0..K-1.
     // [3] note the original [K][N] indexes of these products (in [0..M-1],
-    //     and the corresponding [K] probabilities, ordered from largest to smallest.
+    //     and the corresponding [K] products of probabilities, ordered from
+    //     largest to smallest.
 
-    uint32_t *sort_P = M_buf1_,
-        *P = P_cumsum_;  // currently stores integerized probs P.
+    // in CUDA we'll do this sequentially over n (to save memory) and
+    // via a parallel sorting algorithm from cub over k.
+
     uint32_t M_bits = M_bits_, M = M_, N = N_, K = K_;
+
     for (uint32_t n = 0; n < N; n++) {
-      uint32_t *this_sort_P = sort_P + (n * (M+1)),
-          *this_P = P + (n * (M+1));
+      uint32_t *this_P_buf = P_cumsum_ + (n * (M+1)) + 1;
+      // Each time we access this buffer we shift right by
+      // K, because we need to remember the top-K items for each n.
+      uint32_t *sort_buf = sort_buf32_ + (K * n);
       for (uint32_t m = 0; m < M; m++) {
-        uint32_t p = this_P[m];
-        this_sort_P[m] = m + (p << M_bits);
+        uint32_t p = this_P_buf[m];
+        sort_buf[m] = m + (p << M_bits); // keep track of indexes.
       }
-      this_sort_P[M] = 0;
-      // note: we are only actually interested in the K-best here.  In principle we could
-      // use std::nth_element and then std::sort.  We'll probably just sort when we do it in
-      // CUDA though.
-      std::nth_element(this_sort_P, this_sort_P + K, this_sort_P + M, std::greater<>());
-      std::sort(this_sort_P, this_sort_P + K, std::greater<>());
+      sort_buf[M] = 0;
+      // in CUDA we'll just sort the entire array.  Note, we don't need the
+      // sorting algorithm to sort the indexes because we include them manually.
+      std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<>());
+      std::sort(sort_buf, sort_buf + K, std::greater<>());
     }
-    uint32_t KpowN = K;  // K ** N
-    for (uint32_t i = 1; i < N; i++)
-      KpowN *= N;
-    uint64_t *sort_combinations = M_buf64_;
-    uint32_t K_bits = K_bits_, K_bits_mask = (K-1), KpowN_bits = K_bits_ * N;
-    for (uint32_t i = 0; i < KpowN; i++) {
+    uint64_t *sort_combinations = sort_buf64_;
+    uint32_t K_bits = K_bits_, K_bits_mask = (K-1),
+        KpowN_bits = K_bits_ * N,
+        KpowN = 1 << KpowN_bits;
+    for (uint32_t i = 0; i < KpowN; i++) {  // we'll parallelize over i on GPU.
       // product of probabilities.  This index i represents an n-tuple of e.g. k1,k2,k3, which are all indexes in [0..K-1] specifying a
       uint64_t P_prod = 1;
       for (uint32_t n = 0; n < N; n++) {
-        uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K
-        uint32_t this_p = sort_P[(n * M) + k]; // one of the k-best for the n'th softmax
+        uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K into K-best.
+        uint32_t this_p = (sort_buf32_[K*n + k] >> M_bits); // one of the k-best probs for the n'th softmax
         P_prod *= this_p;
       }
       sort_combinations[i] = (P_prod << KpowN_bits) + i;
     }
-    // we'll probably just sort, when we do this on GPU.   But only need top-K.
+    // we'll just sort the entire array, when we do this on GPU.
     std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + KpowN,
                      std::greater<>());
+    // work out the K-best combinations.
     std::sort(sort_combinations, sort_combinations + K, std::greater<>());
-    // OK, now top-K combinations are in `sort_combinations`.
 
-    // TODO: set topK_indexes_, topK_P_.
+    uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
+    for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
+      uint64_t combination = sort_combinations[k],
+          P = combination >> KpowN_bits;
+      topK_P_[k] = P;
+      uint32_t index_combined = 0;  // will be in [0..M**K-1]
+      for (uint32_t n = 0; n < N ; n++) {
+        // src_k is the k index among the top-K source items for this `n`.  We
+        // need to look up the original 'm' index
+        uint32_t src_k = (combination >> (n * K_bits)) & (K-1),
+            src_m = sort_buf32_[K*n + src_k] & M_mask;
+        topK_indexes_[k*N + n] = src_m;
+        index_combined += src_m << ((n+1) * M_bits_);
+      }
+      topK_indexes_combined_[k] = index_combined + k;
+    }
+    uint64_t topK_P_sum = 0;
+    for (uint32_t k = 0; k < K; k++) {  // this would be done using a cub exclusive-sum.
+      topK_P_exclusive_sum_[k] = topK_P_sum;
+      topK_P_sum = topK_P_[k];
+    }
   }
 
-  void ComputePsum() {
-    // P_cumsum_ currently stores integerized probs P, we'll make it store the cumulative sum.
+  void ComputePCumsum() {
+    // Compute P_cumsum_, P_sum_cumprod_.
+
+    // P_cumsum_ currently stores integerized probs P, preceded by a zero; after
+    // this function it will store the [exclusive] cumulative sum, of size M+1.
     uint32_t *P = P_cumsum_;
     uint32_t M = M_, N = N_;
     uint64_t P_sum_cumprod = 1;
     for (uint32_t n = 0; n < N; n++) {
-      // compute exclusive cumulative sum
-      uint32_t *this_P = P + (M+1) * N;
+      // Compute inclusive cumulative sum of size M; we already padded on the
+      // left with 0, so the effect is the same as exclusive sum.
+      uint32_t *this_P = P + (M+1) * N + 1; // + 1: skip the 0.
       uint32_t sum = 0;
-      for (uint32_t m = 0; m <= M; m++) {  // note, we wrote 0 at one past the end.
-        uint32_t next_sum = sum + this_P[m];
-        this_P[m] = next_sum;
-        sum = next_sum;
+      for (uint32_t m = 0; m < M; m++) {  // note, we wrote 0 at one past the end.
+        sum += this_P[m];
+        this_P[m] = sum;
       }
       P_sum_cumprod *= sum;
       P_sum_cumprod_[n] = P_sum_cumprod;
@@ -315,75 +416,59 @@ class CombinedSampler {
   }
 
   void ComputeBeta() {
-    // see compute_beta_prods() in sampling_ref.py
+    // see compute_beta_prods() in sampling_ref.py.  Computes B which
+    // is integerized beta.
     uint32_t N = N_, K = K_;
-    uint64_t Psum = P_sum_cumprod_[N];
+    uint64_t Psum = P_sum_cumprod_[N];   // This is the total probability mass.
     // Ptop corresponds to topK_P_[0..K-1]
 
-    uint64_t *Ptop_shifted = 0 ; // TODO. topK_P_, with large values placed first
-
-    uint64_t *Ptop_exclusive_sum = 0 ; // TODO. dim = K + 1, contains [0,.. and exclusive-sum...]
-    // ?from sort_combinations_, create Ptop_exclusive_sum_
-
-    uint64_t B, remainder;
+    uint64_t B = 0,  // suppress warning
+        remainder;
     uint32_t k;
-    for (k = 0; k < K; k++) {
+    for (k = 0; k < K; k++) {  // We can parallelize over k.
       // We are trying out to see whether we get an admissible B (i.e.,
       // integerized beta) value with exactly k top probabilities exceeding B.  Exactly
-      // one such k index will "work".
-
-      uint64_t this_Ptop_shifted = Ptop_shifted[k],
-          this_Ptop = Ptop_shifted[k+1];
-      uint64_t S1 = Psum - Ptop_exclusive_sum[k];  // corresponds to 1-s_k in the math.
-      uint64_t B_k = S1 / (K-k),
-          remainder_k = S1 % (K-k);
-      bool is_ok = this_Ptop_shifted > B_k && this_Ptop <= B_k;
-      if (is_ok) { // should happen exactly once!!
+      // one such k index will "work".  We can parallelize over this "k".
+      uint64_t prev_P = (k == 0 ? (~((uint64_t)0)) : // infinity
+                         topK_P_[k-1]),
+          this_P = topK_P_[k];
+      uint64_t S1 = Psum - topK_P_exclusive_sum_[k];  // corresponds to 1-s_k in the math.
+      uint64_t B_k = S1 / (K-k);
+      uint32_t remainder_k = S1 % (K-k);
+      bool is_ok = prev_P > B_k && this_P <= B_k;
+      if (is_ok) { // should happen for exactly onc k!!
         B = B_k;
         remainder = remainder_k;
         break;
       }
     }
+    assert(B != 0);
     B_ = B;
     TORCH_CHECK(k < K);  // check that we broke from the loop.
-    uint64_t delta_P_sum = 0;
-    for (uint32_t k = 0; k < K; k++) {
-      uint64_t Ptop = Ptop_shifted[k+1];
-      topK_delta_P_[k] = remainder + Ptop - std::min<uint64_t>(Ptop, B);
+
+    uint64_t delta_P_sum = 0;  // only needed for checking.
+    for (uint32_t k = 0; k < K; k++) { // parallelize over k.
+      uint64_t P = topK_P_[k];
+      topK_delta_P_[k] = remainder + P - std::min<uint64_t>(P, B);
       delta_P_sum += topK_delta_P_[k];
     }
     uint64_t err = Psum - delta_P_sum - (B * K);
     TORCH_CHECK(err == 0);
-    // outputs: B_, and the array delta_P_.
+    // outputs: B_, and the arrays delta_P_ and topK_delta_P.
   }
 
-  void ReorderTopK() {
-    // Reorders top-K index-tuples.
-    // Let:
-    //  sort_combinations_[k] = (topK_indexes_[k] << K_bits_ ) + k,  0 <= k < K.
-    // sort sort_combinations_.
-    // Set topK_indexes_[k] = sort_combinations_[k] >> K_bits_
-    // src_k_idx = sort_combinations_[k] & (K-1)
-    // p = topK_P_[src_k_idx]; sync;
-    // topK_P[src_k_idx] = p  // <---- Same for topK_delta_P_
-    //
-
-
-  }
 
   void ComputeTopkCumsums() {
     // Computes top-K cumulative sums; these are the cumulative sums of probabilities of
     // all N-tuples of indexes that precede each of the top-K cumulative sums.
+    uint32_t M = M_, M_bits = M_bits_, M_mask = (1 << M_bits)  - 1, K = K_;
 
-    uint32_t M = M_, M_bits = M_bits_, M_mask = (1 << M_bits)  - 1;
     for (uint32_t k = 0; k < K_; k++) {  // this will be separate kernels
       uint64_t P_selected_laterprod = 1,
           cumsum = 0;
 
-
       // This involves summations over the N dimension but we do this sequentially
       // as N will only be 2 or at most 3 in practice.
-
       uint64_t index_combined = topK_indexes_[k];
       for (int32_t n = int32_t(N_) - 1; n >= 0; --n) {
         // 0 <= this_m < M
@@ -399,7 +484,37 @@ class CombinedSampler {
         cumsum += prev_Psum_cumprod * P_selected_laterprod * uint64_t(this_P_cumsum);
         P_selected_laterprod *= this_P;
       }
-      topK_cumsums_[k] = cumsum;
+      // we're about to sort on k, and we want to remember the original k index,
+      // so include the k-index as the lowest order bits.  there is some "headroom"
+      // on top of the 54 bits, so there's room for this.
+      topK_cumsums_[k] = (cumsum << K_bits_) + k;
+    }
+    std::sort(topK_cumsums_, topK_cumsums_ + K);
+
+    uint32_t K_bits = K_bits_;
+
+    for (uint32_t k = 0; k < K; k++) {
+      uint64_t cumsum_with_k = topK_cumsums_[k];
+      uint32_t k_orig = cumsum_with_k & (K-1);
+      uint64_t cumsum = cumsum_with_k << K_bits;
+      sorted_topK_cumsums_[k] = cumsum;  // remove the index.
+
+      sorted_topK_P_[k] = topK_P_[k_orig];
+      uint64_t delta_P = topK_delta_P_[k_orig];
+      sorted_topK_delta_P_[k] = delta_P;
+    }
+    uint64_t topK_delta_P_cumsum = 0;
+    sorted_topK_delta_P_cumsum_[0] = 0;
+    for (uint32_t k = 0; k < K; k++) {
+      uint32_t delta_P = sorted_topK_delta_P_[k];
+      topK_delta_P_cumsum += delta_P;
+      sorted_topK_delta_P_cumsum_[k+1] = topK_delta_P_cumsum;
+    }
+
+    // TODO: could delete this?
+    for (uint32_t k = 0; k < K; k++) {
+      sorted_topK_cumsums_reduced_[k] = (sorted_topK_cumsums_[k] -
+                                         sorted_topK_delta_P_cumsum_[k]);
     }
   }
 
@@ -417,17 +532,20 @@ class CombinedSampler {
       uint64_t delta_P_sum = 0;  // we'll compute this via a reduction in CUDA.
                                  // assume K is power of 2.
 
-      // the following is compute_shifted_samples() in python.
+      // the following is compute_unreduced_samples() in python.
+      // Note: we should be able to parallelize over (k2, k) pairs, summing
+      // within
       for (uint32_t k = 0; k < K; k++) {
-        uint64_t topK_cumsum_reduced = topK_cumsums_[k] - topK_delta_P_cumsum_[k];
-        delta_P_sum += (rand >= topK_cumsum_reduced) * topK_delta_P_[k];
+        uint64_t reduced_cumsum_k = sorted_topK_cumsums_reduced_[k],
+            delta_P =  sorted_topK_delta_P_[k];
+        delta_P_sum += (rand >= reduced_cumsum_k) * delta_P;
       }
       uint64_t rand_shifted = rand + delta_P_sum;
-      shifted_samples_[k2] = rand_shifted;
+      unreduced_samples_[k2] = rand_shifted;
 
-      for (uint32_t k = 0; k < K; k++) { // check_shifted_samples()
-        uint64_t topK_disallowed_start = topK_cumsums_[k],
-            topK_disallowed_end = topK_disallowed_start + topK_delta_P_[k];
+      for (uint32_t k = 0; k < K; k++) { // check_unreduced_samples()
+        uint64_t topK_disallowed_start = sorted_topK_cumsums_[k],
+            topK_disallowed_end = topK_disallowed_start + sorted_topK_delta_P_[k];
         TORCH_CHECK(!(rand_shifted >= topK_disallowed_start &&
                   rand_shifted < topK_disallowed_end));
         TORCH_CHECK(rand_shifted < P_sum_cumprod_[N]);
@@ -438,12 +556,12 @@ class CombinedSampler {
   void ComputeIndexesForSamples() {
     uint32_t K = K_, N = N_, M = M_;
     for (uint32_t k2 = 0; k2 < K; k2++) {
-      uint64_t cur_sample = shifted_samples_[k2];
+      uint64_t cur_sample = unreduced_samples_[k2];
 
       // we'll parallelize over k2.  We have to do the n index sequentially.
       for (uint32_t n = N-1; ; --n) {  // we break in the loop if n == 0.
 
-        uint64_t P_sum_cumprod = P_sum_cumprod_[n];
+        uint64_t P_sum_cumprod = P_sum_cumprod_[n];  // product of previous Psum's.
         uint32_t this_sample = uint32_t(cur_sample / P_sum_cumprod);
 
         uint32_t *P_cumsum_start = P_cumsum_ + n * (M+1);
@@ -465,11 +583,6 @@ class CombinedSampler {
     }
   }
 
-  // returns a pseudo random number coprime to M_, as a function of n.
-  // this is deterministic within a batch.
-  inline uint32_t GetRandomCoprime(uint32_t n) {
-    return 1 + M_unique_ * (rand_source_ >> (M_bits_ * n)) % (M_ / M_unique_);
-  }
   // returns num_bits >= 1 such that (1 << num_bits) >= n.
   inline uint32_t FindNumBitsFor(uint32_t n) {
     uint32_t num_bits = 1;
@@ -519,7 +632,7 @@ class CombinedSampler {
             weights will sum to 1 along the K axis.
 */
 std::vector<torch::Tensor>
-sample_combined_cpu_forward(torch::Tensor probs, // [B][N][M]
+sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
                             torch::Tensor rand,   // [B]
                             int K, bool input_is_log) {
   TORCH_CHECK(probs.dim() == 3, "probs must be 2-dimensional");
@@ -580,6 +693,6 @@ sample_combined_cpu_forward(torch::Tensor probs, // [B][N][M]
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("sample_cpu", &sample_combined_cpu_forward,
+  m.def("sample_combined_forward_cpu", &sample_combined_forward_cpu,
         "Multi-softmax sampling function (CPU)");
 }

@@ -293,7 +293,7 @@ def compute_beta_prods(Psum, Ptop):
 
     return B, topK_delta_P
 
-def compute_shifted_samples(topK_cumsums_reduced: Tensor,
+def compute_unreduced_samples(topK_cumsums_reduced: Tensor,
                             topK_delta_P: Tensor,
                             samples: Tensor) -> Tensor:
     """
@@ -312,8 +312,8 @@ def compute_shifted_samples(topK_cumsums_reduced: Tensor,
         samples: The samples that we have to modify by adding values corresponding to
                  the widths of the appropriate disallowed regions.  The shape is (*, K);
                  but this K is not the "same K"
-     Returns: shifted_samples, which will be the same shape as `samples`, but possibly
-                 with larger values, i.e. shifted_samples >= samples
+     Returns: unreduced_samples, which will be the same shape as `samples`, but possibly
+                 with larger values, i.e. unreduced_samples >= samples
     """
     samples = samples.unsqueeze(-1)
     topK_cumsums_reduced = topK_cumsums_reduced.unsqueeze(-2)
@@ -323,34 +323,34 @@ def compute_shifted_samples(topK_cumsums_reduced: Tensor,
     # meaning we need to add the corresponding delta_p.
     is_ge = (samples >= topK_cumsums_reduced)
 
-    shifted_samples = samples + (is_ge * topK_delta_P).sum(dim=-1, keepdim=True)
-    shifted_samples = shifted_samples.squeeze(-1)
-    return shifted_samples
+    unreduced_samples = samples + (is_ge * topK_delta_P).sum(dim=-1, keepdim=True)
+    unreduced_samples = unreduced_samples.squeeze(-1)
+    return unreduced_samples
 
-def check_shifted_samples(topK_cumsums: Tensor,
+def check_unreduced_samples(topK_cumsums: Tensor,
                           topK_delta_P: Tensor,
-                          shifted_samples: Tensor,
+                          unreduced_samples: Tensor,
                           prod_cumsum: Tensor):
     """
-    Checks samples as modified by `compute_shifted_samples`: specifically, checks
+    Checks samples as modified by `compute_unreduced_samples`: specifically, checks
     that they are not in the "disallowed regions" that we are supposed to skip over.
 
     topK_cumsums: Cumulative sums which can be thought of as the start of
                  "disallowed regions" in probability space.  Shape is (*, K)
              topK_delta_P: the sizes of "disallowed regions".  Shape is (*, K)
-     shifted_samples: The samples as modified by `compute_shifted_samples`.  None
+     unreduced_samples: The samples as modified by `compute_unreduced_samples`.  None
                  of these should be within the "disallowed regions".  Shape is (*, K);
                  but note, this K does not have a correpondence with the K in the
                  other two args' shapes.
        prod_cumsum:  The product of sums/normalizers of the different softmaxes, of
                  shape (*,); this can be thought of as the total size of the probability
                  space, including "disallowed regions".    This is to check that
-                 `shifted_samples` are less than this value.
+                 `unreduced_samples` are less than this value.
     """
-    assert torch.all(torch.logical_and(shifted_samples >= 0,
-                                       shifted_samples < prod_cumsum.unsqueeze(-1)))
+    assert torch.all(torch.logical_and(unreduced_samples >= 0,
+                                       unreduced_samples < prod_cumsum.unsqueeze(-1)))
 
-    shifted_samples = shifted_samples.unsqueeze(-1)
+    unreduced_samples = unreduced_samples.unsqueeze(-1)
     topK_cumsums = topK_cumsums.unsqueeze(-2)
     topK_delta_P = topK_delta_P.unsqueeze(-2)
 
@@ -358,8 +358,8 @@ def check_shifted_samples(topK_cumsums: Tensor,
     disallowed_regions_end = topK_cumsums + topK_delta_P  # delta_p is <= 0.
 
     # in_disallowed_region is of shape (*, K, K)
-    in_disallowed_region = torch.logical_and(shifted_samples >= disallowed_regions_start,
-                                             shifted_samples < disallowed_regions_end)
+    in_disallowed_region = torch.logical_and(unreduced_samples >= disallowed_regions_start,
+                                             unreduced_samples < disallowed_regions_end)
     assert torch.all(torch.logical_not(in_disallowed_region))
 
 
@@ -368,9 +368,9 @@ def get_indexes_for_samples(P: Tensor,
                             P_cumsum: Tensor,
                             P_cumsum_exclusive: Tensor,
                             P_sum_cumprod: Tensor,
-                            shifted_samples: Tensor) -> Tensor:
+                            unreduced_samples: Tensor) -> Tensor:
     """
-    From K `shifted_samples` which are in the joint probability-space of N softmaxes
+    From K `unreduced_samples` which are in the joint probability-space of N softmaxes
     of size M, figure out which sample indexes they correspond to.
     Args:
       P:  of shape (*, N, M), the original integerized probabilities we
@@ -385,11 +385,11 @@ def get_indexes_for_samples(P: Tensor,
           P_cumsum, equivalent to P_cumsum - P.
       P_sum_cumprod: Of shape (*, N), the (inclusive) cumulative product of the last
           element of P_cumsum, which is the total probability of each softmax.
-      shifted_samples:  Of shape (*, K), contains the random samples we want
+      unreduced_samples:  Of shape (*, K), contains the random samples we want
           to find indexes for, "shifted" means we have skipped over "disallowed regions"
           corresponding to combinations of indexes that had too much probability mass.
           Will satisfy:
-          0 <= shifted_samples < P_cumsum[...,-1].prod(dim=-1, keepdim=True)
+          0 <= unreduced_samples < P_cumsum[...,-1].prod(dim=-1, keepdim=True)
     Returns:
         indexes: Of shape (*, K, N), the N-tuples of indexes in {0,1...M-1}
           corresponding to each of the K samples.
@@ -398,11 +398,11 @@ def get_indexes_for_samples(P: Tensor,
     M = P.shape[-1]
     N = P.shape[-2]
 
-    ans_indexes_shape = list(shifted_samples.shape) + [N]  # (*, K, N)
+    ans_indexes_shape = list(unreduced_samples.shape) + [N]  # (*, K, N)
     ans_indexes = torch.empty(*ans_indexes_shape, dtype=P.dtype,
                               device=P.device)
 
-    cur_samples = shifted_samples  # (*, K)
+    cur_samples = unreduced_samples  # (*, K)
     for n in range(N-1, -1, -1): # [N-1, N-2, ..., 0]
         this_samples = cur_samples  # (*, K)
         if n > 0:
@@ -640,18 +640,18 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     # rand, rand + B, rand + 2B, ...., rand + (K-1)B
     samples = rand.unsqueeze(-1) + B.unsqueeze(-1) * torch.arange(K, device=B.device)
 
-    shifted_samples = compute_shifted_samples(topK_cumsums_reduced,
+    unreduced_samples = compute_unreduced_samples(topK_cumsums_reduced,
                                               topK_delta_P,
                                               samples)
 
     # TODO: could remove the next call
-    check_shifted_samples(topK_cumsums, topK_delta_P,
-                          shifted_samples, P_sum_product)
+    check_unreduced_samples(topK_cumsums, topK_delta_P,
+                          unreduced_samples, P_sum_product)
 
     indexes = get_indexes_for_samples(P, P_cumsum,
                                       P_cumsum_exclusive,
                                       P_sum_cumprod,
-                                      shifted_samples)
+                                      unreduced_samples)
 
     weights = get_weights_for_samples(P, P_sum_product, B, indexes,
                                       dtype=p.dtype)
@@ -945,8 +945,7 @@ def _test_combined():
     # the fact that the random numbers in "sampled_values" are in a compressed
     # space where we "skip over" regions of size topK_delta_P.
     #
-    # These are the cutoffs for adding the topK_delta_P's
-    # to sampled_values
+    # These are the cutoffs for adding the topK_delta_P's to sampled_values.
     topK_cumsums_reduced = topK_cumsums + topK_delta_P_exclusive
     print("topK_cumsums_reduced = ", topK_cumsums_reduced)
 
@@ -961,22 +960,22 @@ def _test_combined():
     print("rand = ", rand)
     print("sampled = ", samples)
 
-    shifted_samples = compute_shifted_samples(topK_cumsums_reduced,
+    unreduced_samples = compute_unreduced_samples(topK_cumsums_reduced,
                                               topK_delta_P,
                                               samples)
-    print("shifted_samples = ", shifted_samples)
+    print("unreduced_samples = ", unreduced_samples)
 
     # TODO: can remove this
     if random.random() < 0.01:
-        check_shifted_samples(topK_cumsums,
+        check_unreduced_samples(topK_cumsums,
                               topK_delta_P,
-                              shifted_samples,
+                              unreduced_samples,
                               P_sum_product)
 
     indexes = get_indexes_for_samples(P, P_cumsum,
                                       P_cumsum_exclusive,
                                       P_sum_cumprod,
-                                      shifted_samples)
+                                      unreduced_samples)
 
     weights = get_weights_for_samples(P, P_sum_product, B, indexes,
                                       dtype=torch.float32)

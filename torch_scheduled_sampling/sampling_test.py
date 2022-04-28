@@ -2,7 +2,7 @@ import math
 import random
 import torch
 from torch import nn
-from torch_sampling import SamplingBottleneckModule, BottleneckPredictor
+from torch_scheduled_sampling import sample_combined
 from typing import List
 
 
