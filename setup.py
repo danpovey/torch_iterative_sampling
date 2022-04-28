@@ -28,6 +28,7 @@ def configure_extensions():
             [
                 os.path.join('torch_scheduled_sampling', 'sampling_cpu.cpp'),
             ],
+            extra_compile_args=['-g', '-O0'],
         )
     ]
     try:

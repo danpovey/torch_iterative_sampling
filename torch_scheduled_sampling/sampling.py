@@ -113,13 +113,14 @@ def _test_sample_combined_forward():
     N = 2
     M = 16
     K = 4
-    l = 8.0 * torch.randn(B, N, M)
+    l = 3.0 * torch.randn(B, N, M)
     l = l.log_softmax(dim=-1)
     print("p = ", l.exp())
     (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True)
     print("indexes = ", indexes)
     print("indexes_combined = ", indexes_combined)
-    print("weights = ", indexes_combined)
+    print("weights = ", weights)
+    assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
 
 
 if __name__ == '__main__':
