@@ -33,21 +33,20 @@ class CombinedSampler {
   CombinedSampler(uint32_t N, uint32_t M, uint32_t K):
       N_(N), M_(M), K_(K),
       M_unique_(find_prod_unique_prime_factors(M)) {
-    std::cerr << "N="<<N <<",M="<<M<<",K="<<K<<std::endl;
     TORCH_CHECK(N < 5);
     TORCH_CHECK((K&(K-1)) == 0);  // require K is a power of 2.
     M_bits_ = FindNumBitsFor(M);
     K_bits_ = FindNumBitsFor(K);
 
 
-    p_bits_ = std::min(uint32_t(54) / K, // so product of N of these is
+    p_bits_ = std::min(uint32_t(54) / N, // so product of N of these is
                                          // comfortably less than 64, search for
                                          // "headroom"
-                       std::min(uint32_t(63) - (K_bits_ * N) / K, // for when we sort `this_sort_P`
-                                uint32_t(31) - M_bits_)); // for when we sort `sort_combinations`.
+                       std::min((uint32_t(63)/N) - K_bits_,  // for when we sort `sort_combinations`.
+                                uint32_t(31) - M_bits_)); // for when we sort `sort_buf` in ComputeKLargest()
 
     // TEMP.
-    p_bits_ = 8;
+    // p_bits_ = 15;
 
     // TODO: allocate buffers..
     uint32_t KpowN = uint32_t(1) << (K_bits_ * N),
@@ -93,7 +92,6 @@ class CombinedSampler {
     SetBuffer(unreduced_samples_, p, K);     // ??
 
     uint32_t size = p - buffers_.get();
-    std::cout << "size = " << size << ", tot_size=" << tot_size;
   }
 
   void SetBuffer(uint32_t* &buffer, uint32_t* &p, uint32_t size) {
@@ -220,10 +218,10 @@ class CombinedSampler {
   uint32_t M_bits_;
 
   // number of bits used for probabilities; require:
-  //  (i) K*p_bits_ <= 54 [an arbitrary choice with 54 << 64,
-  //       search for "headroom" to understand]
-  //  (ii) (p_bits_*K_bits) <= 63 [1 less than 64 to allow for rounding error].
-  //  (iii) also p_bits_ + M_bits_ + 1 <= 32 because of how we
+  //  (i) N*p_bits_ <= 54 [an arbitrary choice with 54 << 64,
+  //       search for "headroom" in sampling_ref.py to understand]
+  //  (ii) (p_bits_+K_bits)*N < 64 [strictly less than 64 to allow for rounding error].
+  //  (iii) also p_bits_ + M_bits_ + 1 < 32 because of how we
   //      sort to find K-best probs [the +1 is in case some probs or sums of probs
   //      are slightly more than 1 due to rounding.
   uint32_t p_bits_;
@@ -547,7 +545,7 @@ class CombinedSampler {
     uint64_t topK_delta_P_cumsum = 0;
     sorted_topK_delta_P_cumsum_[0] = 0;
     for (uint32_t k = 0; k < K; k++) {
-      uint32_t delta_P = sorted_topK_delta_P_[k];
+      uint64_t delta_P = sorted_topK_delta_P_[k];
       topK_delta_P_cumsum += delta_P;
       sorted_topK_delta_P_cumsum_[k+1] = topK_delta_P_cumsum;
       // TODO: may not need the last element.
@@ -575,7 +573,7 @@ class CombinedSampler {
 
       // the following is compute_unreduced_samples() in python.
       // Note: we should be able to parallelize over (k2, k) pairs, summing
-      // within
+      // using some kind of logarithmic reduction.
       for (uint32_t k = 0; k < K; k++) {
         uint64_t reduced_cumsum_k = sorted_topK_cumsums_reduced_[k],
             delta_P =  sorted_topK_delta_P_[k];
@@ -588,7 +586,7 @@ class CombinedSampler {
         uint64_t topK_disallowed_start = sorted_topK_cumsums_[k],
             topK_disallowed_end = topK_disallowed_start + sorted_topK_delta_P_[k];
         TORCH_CHECK(!(rand_shifted >= topK_disallowed_start &&
-                  rand_shifted < topK_disallowed_end));
+                      rand_shifted < topK_disallowed_end));
         TORCH_CHECK(rand_shifted < P_sum_cumprod_[N]);
       }
     }

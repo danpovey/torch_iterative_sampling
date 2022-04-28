@@ -122,6 +122,34 @@ def _test_sample_combined_forward():
     print("weights = ", weights)
     assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
 
+def _test_sample_combined_forward_average():
+    B = 2
+    N = 2
+    M = 32
+    K = 8
+    l = 3.0 * torch.randn(B, N, M)
+    l = l.log_softmax(dim=-1)
+    print("p = ", l.exp())
+
+
+    avg_p = torch.zeros_like(l)
+    num_samples = 900
+    for _ in range(num_samples):
+        # weights: (B, K)
+        # indexes: (B, K, N)
+        indexes, indexes_combined, weights = sample_combined_forward(l, K, True)
+
+        sampled_p = torch.zeros_like(l)
+        weights_expanded = weights.unsqueeze(-2).expand(*weights.shape[:-1], N, K)
+        sampled_p.scatter_add_(dim=-1, index=indexes.transpose(-2, -1),
+                               src=weights_expanded)
+        avg_p += sampled_p * (1.0/num_samples)
+    print("sample_combined_mean(): N = ", N, ", p = ", l.exp())
+    print("avg_p = ", avg_p)
+    print("max-diff = ", (l.exp() - avg_p).abs().max())
+
+
 
 if __name__ == '__main__':
     _test_sample_combined_forward()
+    _test_sample_combined_forward_average()
