@@ -51,45 +51,49 @@ class CombinedSampler {
     // TODO: allocate buffers..
     uint32_t KpowN = uint32_t(1) << (K_bits_ * N),
         size64 = sizeof(uint64_t) / sizeof(uint32_t);
-    int tot_size = (M+1) * N + // P_cumsum_
-        std::max<uint32_t>((M+(N-1)*K), // sort_buf32_,
-                           K*N) + // indexes_for_samples_
-        size64 * KpowN + // sort_buf64_, because double the element size
-        size64 * (N+1) +  // P_sum_cumprod_
-        (K*N) + // topK_indexes_
-        size64 * K + // topK_P_
+    // the order in which we list these buffers differs from their declaration ordere,
+    // because we are trying to keep the expressions for working out addresses, generally
+    // as simple as possible (since the CUDA code would have to do this).
+    int tot_size = size64 * K + // topK_P_
         size64 * K + // topK_P_exclusive_sum_
         size64 * K + // topK_delta_P_
         size64 * K + // topK_cumsums_
         size64 * K + // sorted_topK_P_
         size64 * K + // sorted_topK_delta_P_
-        size64 * (K+1) + // sorted_topK_delta_P_cumsum_, TODO: check size!
+        size64 * K + // sorted_topK_delta_P_cumsum_
         size64 * K + // sorted_topK_cumsums_
         size64 * K + // sorted_topK_cumsums_reduced_
-        size64 * K; // unreduced_samples_
+        size64 * K + // unreduced_samples_
+        (K*N) + // topK_indexes_
+        (M+1) * N + // P_cumsum_
+        size64 * KpowN + // sort_buf64_, because double the element size
+        size64 * (N+1) +  // P_sum_cumprod_
+        std::max<uint32_t>((M+(N-1)*K), // sort_buf32_,
+                           K*N); // indexes_for_samples_
+
     // indexes_for_samples_, of size K*N, shares memory with sort_buf32_.
 
     buffers_ = std::unique_ptr<uint32_t>(new uint32_t[tot_size]);
     uint32_t *p = buffers_.get();
-    SetBuffer(P_cumsum_, p, (M+1) * N);
-    sort_buf32_ = p;
-    indexes_for_samples_ = p;
-    p += std::max<uint32_t>((M+(N-1)*K), K*N);  // indexes_for_samples_
-    SetBuffer(sort_buf64_, p, KpowN);
-    SetBuffer(P_sum_cumprod_, p, N+1);
-    SetBuffer(topK_indexes_, p, K*N);
     SetBuffer(topK_P_, p, K);
     SetBuffer(topK_P_exclusive_sum_, p, K);
     SetBuffer(topK_delta_P_, p, K);
     SetBuffer(topK_cumsums_, p, K);
     SetBuffer(sorted_topK_P_, p, K);
     SetBuffer(sorted_topK_delta_P_, p, K);
-    SetBuffer(sorted_topK_delta_P_cumsum_, p, K+1);     // ??
-    SetBuffer(sorted_topK_cumsums_, p, K);     // ??
-    SetBuffer(sorted_topK_cumsums_reduced_, p, K);     // ??
-    SetBuffer(unreduced_samples_, p, K);     // ??
-
-    uint32_t size = p - buffers_.get();
+    SetBuffer(sorted_topK_delta_P_cumsum_, p, K);
+    SetBuffer(sorted_topK_cumsums_, p, K);
+    SetBuffer(sorted_topK_cumsums_reduced_, p, K);
+    SetBuffer(unreduced_samples_, p, K);
+    SetBuffer(topK_indexes_, p, K*N);
+    SetBuffer(P_cumsum_, p, (M+1) * N);
+    SetBuffer(sort_buf64_, p, KpowN);
+    SetBuffer(P_sum_cumprod_, p, N+1);
+    sort_buf32_ = p;
+    indexes_for_samples_ = p;
+    p += std::max<uint32_t>((M+(N-1)*K), K*N);  // indexes_for_samples_
+    int size = p - buffers_.get();
+    TORCH_CHECK(size == tot_size);
   }
 
   void SetBuffer(uint32_t* &buffer, uint32_t* &p, uint32_t size) {
@@ -494,7 +498,7 @@ class CombinedSampler {
   void ComputeTopkCumsums() {
     // Computes top-K cumulative sums; these are the cumulative sums of probabilities of
     // all N-tuples of indexes that precede each of the top-K cumulative sums.
-    uint32_t M = M_, N = N_, M_bits = M_bits_, M_mask = (1 << M_bits)  - 1, K = K_;
+    uint32_t M = M_, N = N_, K = K_;
 
     for (uint32_t k = 0; k < K_; k++) {  // this will be separate kernels
       uint64_t P_selected_laterprod = 1,
@@ -536,11 +540,10 @@ class CombinedSampler {
       sorted_topK_delta_P_[k] = delta_P;
     }
     uint64_t topK_delta_P_cumsum = 0;
-    sorted_topK_delta_P_cumsum_[0] = 0;
     for (uint32_t k = 0; k < K; k++) {
       uint64_t delta_P = sorted_topK_delta_P_[k];
+      sorted_topK_delta_P_cumsum_[k] = topK_delta_P_cumsum;
       topK_delta_P_cumsum += delta_P;
-      sorted_topK_delta_P_cumsum_[k+1] = topK_delta_P_cumsum;
       // TODO: may not need the last element.
     }
 
@@ -670,9 +673,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
                             int K, bool input_is_log) {
   TORCH_CHECK(probs.dim() == 3, "probs must be 2-dimensional");
   TORCH_CHECK(rand.dim() == 1, "rand must be 1-dimensional");
-  auto int64_type = torch::kInt64,
-      float_type = torch::kFloat32;
-  TORCH_CHECK(probs.scalar_type() == float_type);
+  auto int64_type = torch::kInt64;
   TORCH_CHECK(rand.scalar_type() == int64_type);
 
   int B = probs.size(0),  // batch size
@@ -688,7 +689,6 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
               "inputs must be CPU tensors");
 
   auto long_opts = torch::TensorOptions().dtype(torch::kInt64).device(probs.device());
-
   auto real_opts = torch::TensorOptions().dtype(probs.dtype()).device(probs.device());
 
   // TODO: make empty
@@ -727,5 +727,5 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sample_combined_forward_cpu", &sample_combined_forward_cpu,
-        "Multi-softmax sampling function (CPU)");
+        "Multi-softmax sampling function forward (CPU)");
 }

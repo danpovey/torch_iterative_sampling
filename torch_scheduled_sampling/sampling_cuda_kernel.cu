@@ -433,49 +433,48 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
             to the differences between `cumsum` elements, but always excluding
             previously drawn classes within the current sequence.
 */
-torch::Tensor sample_cuda(torch::Tensor probs,
-                                    torch::Tensor rand,
-                                    int K) {
-  TORCH_CHECK(probs.dim() == 2, "probs must be 2-dimensional");
-  TORCH_CHECK(rand.dim() == 2, "rand must be 2-dimensional");
-  auto int32_type = torch::kInt32,
-      float_type = torch::kFloat32;
-  TORCH_CHECK(probs.scalar_type() == float_type);
-  TORCH_CHECK(rand.scalar_type() == int32_type);
+
+std::vector<torch::Tensor>
+sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
+                             torch::Tensor rand,   // [B]
+                             int K, bool input_is_log) {
+  TORCH_CHECK(probs.dim() == 3, "probs must be 3-dimensional");
+  TORCH_CHECK(rand.dim() == 1, "rand must be 1-dimensional");
+
+  auto int64_type = torch::kInt64;
+  TORCH_CHECK(rand.scalar_type() == int64_type);
 
   int B = probs.size(0),  // batch size
-      N = probs.size(1),  // num classes
-      S = rand.size(1);    // num sequences
+      N = probs.size(1),  // num distributions
+      M = probs.size(2);  // num classes
+  TORCH_CHECK(rand.size(0) == B);
 
-
-  int32_t grid_dim_x = std::min<int>(B, 256),
-      block_dim_x = 32;
-
-  // actually block_dim_x must be 32 because for now cooperative_groups
-  // does not support tiles with size more than 32.
-  /*
-  while (block_dim_x * S < 256 && block_dim_x < N)
-    block_dim_x *= 2;
-  */
-
-
-  TORCH_CHECK(K > 0 && K < N);  // K is sequence length
+  TORCH_CHECK(K > 0 && K < M && ((K&(K-1))==0));  // K is sequence length
+  TORCH_CHECK(N >= 0 && N <= 4);
   TORCH_CHECK(rand.size(0) == B);
 
   TORCH_CHECK(probs.device().is_cuda() && rand.device().is_cuda(),
-              "inputs must be CUDA tensors");
+              "inputs must be CPU tensors");
 
-  auto opts = torch::TensorOptions().dtype(int32_type).device(probs.device()),
-      long_opts = torch::TensorOptions().dtype(torch::kInt64).device(probs.device());
+  auto long_opts = torch::TensorOptions().dtype(torch::kInt64).device(probs.device());
+  auto real_opts = torch::TensorOptions().dtype(probs.dtype()).device(probs.device());
 
-  torch::Tensor indexes = torch::empty({B, S, K}, long_opts);
+  // TODO: make empty
+  torch::Tensor indexes = torch::empty({B, K, N}, long_opts),
+      combined_indexes = torch::empty({B, K}, long_opts);
+
+  torch::Tensor weights = torch::empty({B, K}, real_opts);
 
 
-  int block_dim_y = (S <= 2 ? 2 : (S <= 4 ? 4 : 8));
+  int KpowN = K;
+  for (int n = 1; n < N; n++)
+    KpowN *= K;
 
-  dim3 blockDim(block_dim_x, block_dim_y, 1),
-        gridDim(grid_dim_x, 1, 1);
+  int32_t grid_dim_x = std::min<int>(B, 256),
+      block_dim_x = std::max(M, KpowN);  // M will normally be larger.
 
+  /*
+  // HERE
   int extern_memory_bytes = ((N + 1) * sizeof(int32_t) +
                              (K + 2) * block_dim_y * sizeof(int32_t) +
                              (K + 2) * block_dim_y * sizeof(int32_t) +
@@ -499,6 +498,6 @@ torch::Tensor sample_cuda(torch::Tensor probs,
   }
   cudaDeviceSynchronize();  // TEMP
   gpuErrchk(cudaGetLastError())
-
-  return indexes;
+  */
+  return std::vector<torch::Tensor>({indexes, combined_indexes, weights});
 }
