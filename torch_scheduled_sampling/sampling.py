@@ -18,8 +18,8 @@ try:
     import torch_scheduled_sampling_cpu
 except ImportError:
     if VERBOSE:
-        print('Falling back to JIT compiling torch_sampling_cpu')
-    torch_sampling_cpu = load(
+        print('Falling back to JIT compiling torch_scheduled_sampling_cpu')
+    torch_scheduled_sampling_cpu = load(
         name='sample_combined_forward_cpu',
         sources=[
             _resolve('sampling_cpu.cpp'),
@@ -32,10 +32,10 @@ try:
     import torch_scheduled_sampling_cuda
 except ImportError:
     if VERBOSE:
-        print('Falling back to JIT compiling torch_sampling_cuda')
-    torch_sampling_cuda = None
+        print('Falling back to JIT compiling torch_scheduled_sampling_cuda')
+    torch_scheduled_sampling_cuda = None
     if torch.cuda.is_available():
-        torch_sampling_cuda = load(
+        torch_scheduled_sampling_cuda = load(
             name='sample_combined_forward_cuda',
             sources=[
                 _resolve('sampling_cuda.cpp'),
@@ -54,9 +54,9 @@ def _sample_combined_forward_dispatcher(
     Dispatcher for sample_combined_forward
     """
     if probs.is_cuda:
-        if torch_sampling_cuda is None:
+        if torch_scheduled_sampling_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
-        return torch_scheduled_sampling_cuda.sample_combined_forward_cpu(
+        return torch_scheduled_sampling_cuda.sample_combined_forward_cuda(
             probs, rand, K, input_is_log)
     else:
         return torch_scheduled_sampling_cpu.sample_combined_forward_cpu(
@@ -223,18 +223,19 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
 
 
 def _test_sample_combined_forward():
-    B = 2
-    N = 2
-    M = 16
-    K = 4
-    l = 3.0 * torch.randn(B, N, M)
-    l = l.log_softmax(dim=-1)
-    print("p = ", l.exp())
-    (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True)
-    print("indexes = ", indexes)
-    print("indexes_combined = ", indexes_combined)
-    print("weights = ", weights)
-    assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
+    for device in [torch.device('cpu'), torch.device('cuda')]:
+        B = 2
+        N = 2
+        M = 16
+        K = 4
+        l = 3.0 * torch.randn(B, N, M, device=device)
+        l = l.log_softmax(dim=-1)
+        print("p = ", l.exp())
+        (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True)
+        print("indexes = ", indexes)
+        print("indexes_combined = ", indexes_combined)
+        print("weights = ", weights)
+        assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
 
 def _test_sample_combined_forward_average():
     B = 2
@@ -288,6 +289,6 @@ def _test_sample_combined_mean():
 
 
 if __name__ == '__main__':
-    _test_sample_combined_forward()
     _test_sample_combined_forward_average()
     _test_sample_combined_mean()
+    _test_sample_combined_forward()

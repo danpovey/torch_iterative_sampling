@@ -38,7 +38,6 @@ class CombinedSampler {
     M_bits_ = FindNumBitsFor(M);
     K_bits_ = FindNumBitsFor(K);
 
-
     p_bits_ = std::min(uint32_t(54) / N, // so product of N of these is
                                          // comfortably less than 64, search for
                                          // "headroom"
