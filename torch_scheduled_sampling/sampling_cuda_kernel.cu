@@ -108,6 +108,29 @@ __forceinline__ __device__ int find_class(
   return begin;
 }
 
+inline __device__ double Exp(double f) { return exp(f); }
+template<typename Real>
+inline __device__ Real Exp(Real f) { return Real(expf(float(f))); }
+
+/*
+  Return the index i into cumsum, with begin <= i < end,
+  such that cumsum[i] <= r < cumsum[i + 1].
+  We assume that cumsum[begin] <= r < cumsum[end], and we do not
+  access cumsum[begin] or cumsum[end].
+*/
+template <typename IterType> __device__ int find_class_1thread(
+    IterType cumsum, int begin, int end, uint32_t r) {
+  TORCH_CHECK(end > begin);
+  while (end > begin + 1) {
+    int mid = begin + (end - begin) / 2;
+    if (((uint32_t)cumsum[mid]) <= r)
+      begin = mid;
+    else
+      end = mid;
+  }
+  return begin;
+}
+
 
 
 template<typename Real>
@@ -116,7 +139,7 @@ void sample_combined_forward_kernel(
     torch::PackedTensorAccessor32<Real, 3> probs,   // B, N, M
     torch::PackedTensorAccessor32<int64_t, 1> rand,     // B
     uint32_t K, bool input_is_log, uint32_t p_bits,
-    uint32_t M_bits, uint32_t K_bits) {
+    uint32_t M_bits, uint32_t K_bits, uint32_t M_unique) {
   //__shared__ typename BlockScan::TempStorage temp_storage;
   int B = probs.size(0);  // batch size
   uint32_t N = probs.size(1),  // num distributions
@@ -150,6 +173,34 @@ void sample_combined_forward_kernel(
       // for now do everything in 1 thread, we'll gradually move to doing more
       // things in parallel to ease debugging.
 
+      uint64_t rand_source = rand[b];
+
+
+      { // LoadP()
+        for (uint32_t n = 0; n < N; n++) {
+          uint32_t multiple = 1 + M_unique * (rand_source >> (M_bits * n)) % (M / M_unique);
+
+          uint32_t *this_P_cumsum = P_cumsum_ + n * (M+1);
+          this_P_cumsum[0] = 0;
+          uint32_t p_multiple = 1 << (p_bits);
+          for (uint32_t m = 0; m < M; m++) {
+            uint32_t src_m = (m * multiple) % M;
+            Real src_p = probs[b][n][src_m];
+            if (input_is_log)
+              src_p = Exp(src_p);
+
+            // add 1 because if we allow zero probabilities, we get nasty edge cases.
+            uint32_t P = uint32_t(1) + uint32_t(p_multiple * src_p);
+
+            // the index is m + 1 because we shift it right by 1, this will be convenient when
+            // creating the exclusive-sum.
+            // The shifting left by M_bits and adding m is a temporary thing so that we
+            // can later sort these probabilities but retain the associated indexes.
+            this_P_cumsum[m + 1] = P;
+          }
+        }
+      }
+
 
     }
   }
@@ -174,6 +225,22 @@ inline int FindNumBitsFor(int n) {
     num_bits++;
   return num_bits;
 }
+
+
+uint32_t FindProdUniquePrimeFactors(uint32_t i) { // returns smallest number coprime to
+  TORCH_CHECK(i != 0);
+  uint32_t ans = 1;
+  for (uint32_t p = 2; i != 1; p++) {
+    if (i % p == 0) {
+      ans *= p;
+      i /= p;
+      while (i % p == 0)
+        i /= p;  // divide by duplicates of this factor.
+    }
+  }
+  return ans;  // product of unique prime factors of i, e.g. 4 -> 2, 18 -> 6.
+}
+
 
 /*
   sample function, CUDA version.
@@ -234,7 +301,8 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
                                          // comfortably less than 64, search for
                                          // "headroom"
                         std::min((63/N) - K_bits,  // for when we sort `sort_combinations`.
-                                 31 - M_bits)); // for when we sort `sort_buf` in ComputeKLargest()
+                                 31 - M_bits)), // for when we sort `sort_buf` in ComputeKLargest()
+      M_unique(FindProdUniquePrimeFactors(M));
 
 
   // TODO: allocate buffers..
@@ -243,6 +311,7 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       size32 = sizeof(uint32_t);
   int grid_dim_x = std::min<int>(B, 256),
       block_dim_x = std::max(M, KpowN);  // M will normally be larger.
+
 
 
   // the order in which we list these buffers differs from their declaration ordere,
@@ -272,7 +341,7 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
         sample_combined_forward_kernel<scalar_t><<<grid_dim_x, block_dim_x, extern_memory_bytes>>>(
             probs.packed_accessor32<scalar_t, 3>(),
             rand.packed_accessor32<int64_t, 1>(),
-            K, input_is_log, p_bits, M_bits, K_bits);
+            K, input_is_log, p_bits, M_bits, K_bits, M_unique);
       }));
   gpuErrchk(cudaGetLastError());
 

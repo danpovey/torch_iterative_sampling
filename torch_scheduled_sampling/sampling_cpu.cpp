@@ -2,7 +2,6 @@
 #include <torch/extension.h>
 
 
-template <typename Real> Real Exp(Real f);
 
 inline torch::Half Exp(torch::Half f) { return (torch::Half)expf((float)f); }
 inline float Exp(float f) { return expf(f); }
@@ -32,7 +31,7 @@ class CombinedSampler {
  public:
   CombinedSampler(uint32_t N, uint32_t M, uint32_t K):
       N_(N), M_(M), K_(K),
-      M_unique_(find_prod_unique_prime_factors(M)) {
+      M_unique_(FindProdUniquePrimeFactors(M)) {
     TORCH_CHECK(N < 5);
     TORCH_CHECK((K&(K-1)) == 0);  // require K is a power of 2.
     M_bits_ = FindNumBitsFor(M);
@@ -344,7 +343,7 @@ class CombinedSampler {
    */
   uint32_t *indexes_for_samples_;
 
-  uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
+  uint32_t FindProdUniquePrimeFactors(uint32_t i) { // returns smallest number coprime to
     TORCH_CHECK(i != 0);
     uint32_t ans = 1;
     for (uint32_t p = 2; i != 1; p++) {
