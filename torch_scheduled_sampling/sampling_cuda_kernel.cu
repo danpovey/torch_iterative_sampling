@@ -201,7 +201,59 @@ void sample_combined_forward_kernel(
         }
       }
 
+      { // ComputeKLargest() in sampling_cpu.cpp.
+        for (uint32_t n = 0; n < N; n++) {
+          uint32_t *this_P_buf = P_cumsum_ + (n * (M+1)) + 1;
+          // Each time we access this buffer we shift right by
+          // K, because we need to remember the top-K items for each n.
+          uint32_t *sort_buf = sort_buf32_ + (K * n);
+          for (uint32_t m = 0; m < M; m++) {
+            uint32_t p = this_P_buf[m];
+            sort_buf[m] = m + (p << M_bits); // keep track of indexes.
+          }
+          sort_buf[M] = 0;
+          // in CUDA we'll just sort the entire array.  Note, we don't need the
+          // sorting algorithm to sort the indexes because we include them manually.
+          std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<>());
+          std::sort(sort_buf, sort_buf + K, std::greater<>());
+        }
+        uint64_t *sort_combinations = sort_buf64_;
+        uint32_t K_bits_mask = (K-1);
+        for (uint32_t i = 0; i < KpowN; i++) {  // we'll parallelize over i on GPU.
+          // product of probabilities.  This index i represents an n-tuple of e.g. k1,k2,k3, which are all indexes in [0..K-1] specifying a
+          uint64_t P_prod = 1;
+          for (uint32_t n = 0; n < N; n++) {
+            uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K into K-best.
+            uint32_t this_p = (sort_buf32_[K*n + k] >> M_bits); // one of the k-best probs for the n'th softmax
+            P_prod *= this_p;
+          }
+          sort_combinations[i] = (P_prod << (K_bits * N)) + i;
+        }
+        // we'll just sort the entire array, when we do this on GPU.
+        std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + KpowN,
+                         std::greater<>());
+        // work out the K-best combinations.
+        std::sort(sort_combinations, sort_combinations + K, std::greater<>());
 
+        uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
+        for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
+          uint64_t combination = sort_combinations[k],
+              P = combination >> (K_bits * N);
+          topK_P_[k] = P;
+          for (uint32_t n = 0; n < N ; n++) {
+            // src_k is the k index among the top-K source items for this `n`.  We
+            // need to look up the original 'm' index
+            uint32_t src_k = (combination >> (n * K_bits)) & (K-1),
+                src_m = sort_buf32_[K*n + src_k] & M_mask;
+            topK_indexes_[k*N + n] = src_m;
+          }
+        }
+        uint64_t topK_P_sum = 0;
+        for (uint32_t k = 0; k < K; k++) {  // this would be done using a cub exclusive-sum.
+          topK_P_exclusive_sum_[k] = topK_P_sum;
+          topK_P_sum += topK_P_[k];
+        }
+      }
     }
   }
 }
