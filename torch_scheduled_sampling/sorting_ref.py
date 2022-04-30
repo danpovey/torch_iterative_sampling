@@ -21,6 +21,16 @@ def swap_plus_mod(mod: int,
                 x[i + delta] = a
 
 
+def sort_unique(x: List[int]):
+    assert len(set(x)) == len(x)
+    x_old = list(x)
+    for i in range(len(x)):
+        total_lt_x = 0
+        for j in range(len(x)):
+            if x_old[j] < x_old[i]:
+                total_lt_x += 1
+        x[total_lt_x] = x_old[i]
+    return x
 
 def merge_lists(new_sublist_size: int,
                 max_elements_needed: int,
@@ -111,7 +121,17 @@ def _test_merge():
                 size = min(max_elements_needed, list_size)
                 assert x[i:i+size] == list(sorted(x_copy[i:i+list_size]))[:size]
 
+def _test_sort_unique():
+    for i in range(1000):
+        N = 16
+        x = [ random.randint(0, 100) for _ in range(N) ]
+        if len(set(x)) == len(x):  # if unique..
+            print("x = ", x)
+            print("sort_unique(x) = ", sort_unique(x))
+            assert sort_unique(x) == sorted(x)
 
 if __name__ == '__main__':
+    _test_sort_unique()
     _test_merge()
+
     #_test1()
