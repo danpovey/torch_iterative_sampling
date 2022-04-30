@@ -47,7 +47,7 @@ class CombinedSampler {
     // p_bits_ = 15;
 
     // TODO: allocate buffers..
-    uint32_t KpowN = uint32_t(1) << (K_bits_ * N),
+    uint32_t Kpow2 = (N > 1 ? (K*K) : K),
         size64 = sizeof(uint64_t) / sizeof(uint32_t);
     // the order in which we list these buffers differs from their declaration ordere,
     // because we are trying to keep the expressions for working out addresses, generally
@@ -64,7 +64,7 @@ class CombinedSampler {
         size64 * K + // unreduced_samples_
         (K*N) + // topK_indexes_
         (M+1) * N + // P_cumsum_
-        size64 * KpowN + // sort_buf64_, because double the element size
+        size64 * Kpow2 + // sort_buf64_, because double the element size
         size64 * (N+1) +  // P_sum_cumprod_
         std::max<uint32_t>((M+(N-1)*K), // sort_buf32_,
                            K*N); // indexes_for_samples_
@@ -85,7 +85,7 @@ class CombinedSampler {
     SetBuffer(unreduced_samples_, p, K);
     SetBuffer(topK_indexes_, p, K*N);
     SetBuffer(P_cumsum_, p, (M+1) * N);
-    SetBuffer(sort_buf64_, p, KpowN);
+    SetBuffer(sort_buf64_, p, Kpow2);
     SetBuffer(P_sum_cumprod_, p, N+1);
     sort_buf32_ = p;
     indexes_for_samples_ = p;
@@ -387,29 +387,42 @@ class CombinedSampler {
       std::sort(sort_buf, sort_buf + K, std::greater<>());
     }
     uint64_t *sort_combinations = sort_buf64_;
-    uint32_t K_bits = K_bits_, K_bits_mask = (K-1),
-        KpowN_bits = K_bits_ * N,
-        KpowN = 1 << KpowN_bits;
-    for (uint32_t i = 0; i < KpowN; i++) {  // we'll parallelize over i on GPU.
-      // product of probabilities.  This index i represents an n-tuple of e.g. k1,k2,k3, which are all indexes in [0..K-1] specifying a
-      uint64_t P_prod = 1;
-      for (uint32_t n = 0; n < N; n++) {
-        uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K into K-best.
-        uint32_t this_p = (sort_buf32_[K*n + k] >> M_bits); // one of the k-best probs for the n'th softmax
-        P_prod *= this_p;
-      }
-      sort_combinations[i] = (P_prod << KpowN_bits) + i;
+    uint32_t K_bits = K_bits_;
+
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < K; k++) {
+      uint32_t this_p = (sort_buf32_[K*n + k] >> M_bits); // one of the k-best probs for the n'th softmax
+      sort_combinations[k] = (((uint64_t)this_p) << (N * K_bits)) | k;
     }
-    // we'll just sort the entire array, when we do this on GPU.
-    std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + KpowN,
-                     std::greater<>());
-    // work out the K-best combinations.
+    for (n = 1; n < N; n++) {
+      uint64_t K_mask = (uint64_t(1) << uint64_t(n * K_bits)) - 1;
+      // best_k is an index into the 1st K elements of array `sort_combinations`
+      for (uint32_t best_k = 0; best_k < K; best_k++) {
+        uint64_t S = sort_combinations[best_k],
+            P = S & ~K_mask,
+            prev_ks = S & K_mask;
+
+        for (uint64_t new_k = 0; new_k < K; new_k++) {
+          uint64_t combined_k = prev_ks | (new_k << (n * K_bits));
+          // one of the k-best probs for the n'th softmax
+          uint32_t this_p = (sort_buf32_[K*n + new_k] >> M_bits);
+          uint64_t new_S = (P * this_p) | combined_k;
+          sort_combinations[best_k + (K * new_k)] = new_S;
+        }
+      }
+      if (n > 1) {
+        // work out the K-best combinations so far.
+        // if n == 1 no need to, since we already have the K best.
+        std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + (K*K),
+                         std::greater<>());
+      }
+    }
     std::sort(sort_combinations, sort_combinations + K, std::greater<>());
 
     uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
     for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
       uint64_t combination = sort_combinations[k],
-          P = combination >> KpowN_bits;
+          P = combination >> (K_bits * N);
       topK_P_[k] = P;
       for (uint32_t n = 0; n < N ; n++) {
         // src_k is the k index among the top-K source items for this `n`.  We

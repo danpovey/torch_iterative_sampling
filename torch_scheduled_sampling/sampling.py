@@ -264,7 +264,8 @@ def _test_sample_combined_forward_average():
     print("max-diff = ", (l.exp() - avg_p).abs().max())
 
 def _test_sample_combined_mean():
-    for N in [2, 3]:
+    for N in [2, 3, 1]:
+        print("N = ", N)
         K = 4
         M = 8
 
@@ -286,6 +287,7 @@ def _test_sample_combined_mean():
         print("avg_p = ", avg_p)
 
         print("max err = ", (p.exp()-avg_p).abs().max())
+
 
 
 if __name__ == '__main__':
