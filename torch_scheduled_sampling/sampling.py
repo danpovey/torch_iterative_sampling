@@ -269,7 +269,7 @@ def _test_sample_combined_mean():
         K = 4
         M = 8
 
-        p = torch.randn(1, 2, N, M).log_softmax(dim=-1)
+        p = (5.0 * torch.randn(1, 2, N, M)).log_softmax(dim=-1)
 
         avg_p = torch.zeros_like(p)
         num_samples = 1000

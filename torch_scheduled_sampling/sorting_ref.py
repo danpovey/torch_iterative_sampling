@@ -42,8 +42,8 @@ def merge_lists(new_sublist_size: int,
         search_begin = 0
         search_end = min(max_elements_needed, old_sublist_size) + 1
 
-        # x_val_mod is about >= vs >.  For stable sort, we treat rhs values
-        # as larger than LHS values.  We need the final position of values to be
+        # For stable sort, we treat rhs values as being larger than LHS values
+        # when there is a tie.  We need the final position of values to be
         # deterministic and in agreement between lhs and rhs.
         #
         # This assumes integer inputs.
@@ -66,10 +66,10 @@ def merge_lists(new_sublist_size: int,
 def _test_merge():
     for _ in range(1000):
         max_elements_needed = 8
-        N = 16
+        N = 32
         x = [ random.randint(0, 100) for _ in range(N) ]
 
-        for list_size in [2,4,8,16]:
+        for list_size in [2,4,8,16,32]:
             print("list_size=", list_size)
             x_copy = list(x)
             merge_lists(list_size, 16, x)

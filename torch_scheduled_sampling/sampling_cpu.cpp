@@ -27,6 +27,64 @@ template <typename IterType> int find_class(
 }
 
 
+/*
+  This is a prototype for some CUDA code.  It does a partial sort of an array,
+  in reverse order, so that it's as if the array `start..start+input_size-1` is
+  sorted, but we only care about the `start..start+num_keep-1` elements.
+
+  see test_merge() in sorting_ref.py for the original Python code that this was
+  based on.  This is not very elegant but is probably enough for now.
+
+  Caution: this only works correctly if the elements x to be sorted satisfy
+  x > (x-1) [not true, for example, for 0 in unsigned arithmetic];
+  this is due to the subtraction of 1 in "x_val_mod" below.
+ */
+template <typename IntT> void merge_based_partial_sort_reverse(
+    IntT* start, uint32_t num_keep, uint32_t input_size) {
+  // num_keep == max_elements_needed in python.
+  std::vector<IntT> sorted(start, start + input_size);
+  std::sort(sorted.begin(), sorted.end(), std::greater<IntT>());
+  std::vector<IntT> temp(input_size);
+  for (uint32_t new_sublist_size = 2;
+       new_sublist_size <= input_size;
+       new_sublist_size *= 2) {
+    uint32_t old_sublist_size = new_sublist_size / 2;
+    for (uint32_t i = 0; i < input_size; i++) {
+      IntT x_val = start[i];
+      uint32_t offset_in_old = i & (old_sublist_size - 1);
+      if (offset_in_old >= num_keep)
+        continue;
+      uint32_t new_sublist_start = i & ~(new_sublist_size - 1),
+          is_rhs = (i & old_sublist_size), // equals old_sublist_size for right
+                                           // half of input
+          other_list_start = new_sublist_start | (is_rhs ^ old_sublist_size),
+          search_offset = other_list_start,
+          search_begin = 0,
+          search_end = std::min<uint32_t>(uint32_t(num_keep),
+                                          old_sublist_size) + 1;
+
+      IntT x_val_mod = x_val - (is_rhs != 0);
+      while (search_begin + 1 < search_end) {
+        uint32_t mid = (search_begin + search_end) / 2;
+        // we are implementing reversed sorting, so replace the ">" in the
+        // Python with "<".
+        if (x_val_mod < start[search_offset + mid - 1]) search_begin = mid;
+        else search_end= mid;
+      }
+      uint32_t new_pos = new_sublist_start + offset_in_old + search_begin;
+      temp[new_pos] = x_val;
+    }
+    for (uint32_t i = 0; i < input_size; i++) {
+      start[i] = temp[i];
+    }
+  }
+  for (uint32_t i = 0; i < uint32_t(std::min<int>(input_size, num_keep)); i++) {
+    TORCH_CHECK(start[i] == sorted[i]);
+  }
+}
+
+
+
 class CombinedSampler {
  public:
   CombinedSampler(uint32_t N, uint32_t M, uint32_t K):
@@ -383,8 +441,8 @@ class CombinedSampler {
       sort_buf[M] = 0;
       // in CUDA we'll just sort the entire array.  Note, we don't need the
       // sorting algorithm to sort the indexes because we include them manually.
-      std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<>());
-      std::sort(sort_buf, sort_buf + K, std::greater<>());
+      std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<uint32_t>());
+      std::sort(sort_buf, sort_buf + K, std::greater<uint32_t>());
     }
     uint64_t *sort_combinations = sort_buf64_;
     uint32_t K_bits = K_bits_;
@@ -410,14 +468,15 @@ class CombinedSampler {
           sort_combinations[best_k + (K * new_k)] = new_S;
         }
       }
-      if (n > 1) {
-        // work out the K-best combinations so far.
-        // if n == 1 no need to, since we already have the K best.
-        std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + (K*K),
-                         std::greater<>());
-      }
+      // work out the K-best combinations so far.
+      //std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + (K*K),
+      //                 std::greater<uint64_t>());
+      merge_based_partial_sort_reverse(sort_combinations, K, K*K);
     }
-    std::sort(sort_combinations, sort_combinations + K, std::greater<>());
+    if (N == 1) {
+      merge_based_partial_sort_reverse(sort_combinations, K, K);
+    }
+    //std::sort(sort_combinations, sort_combinations + K, std::greater<uint64_t>());
 
     uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
     for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
