@@ -371,23 +371,32 @@ void sample_combined_forward_kernel(
       print_array(sort_combinations, K, "sort-combinations-n=N");
 
       uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
-      for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
+      if (threadIdx.x < K) {
+        uint32_t k = threadIdx.x;
         uint64_t combination = sort_combinations[k],
             P = combination >> (K_bits * N);
         topK_P_[k] = P;
-        for (uint32_t n = 0; n < N ; n++) {
-          // src_k is the k index among the top-K source items for this `n`.  We
-          // need to look up the original 'm' index
-          uint32_t src_k = (combination >> (n * K_bits)) & (K-1),
-              src_m = sort_buf32_[K*n + src_k] & M_mask;
-          topK_indexes_[k*N + n] = src_m;
-        }
       }
-      uint64_t topK_P_sum = 0;
-      for (uint32_t k = 0; k < K; k++) {  // this would be done using a cub exclusive-sum.
-        topK_P_exclusive_sum_[k] = topK_P_sum;
-        topK_P_sum += topK_P_[k];
+      if (threadIdx.x < (K*N)) {
+        uint32_t k = threadIdx.x % K,
+            n = threadIdx.x / K;
+        uint64_t combination = sort_combinations[k];
+        // src_k is the k index among the top-K source items for this `n`.  We
+        // need to look up the original 'm' index
+        uint32_t src_k = (combination >> (n * K_bits)) & (K-1),
+            src_m = sort_buf32_[K*n + src_k] & M_mask;
+        topK_indexes_[k*N + n] = src_m;
       }
+
+      if (threadIdx.x < K) {
+        uint32_t k = threadIdx.x;
+        topK_P_exclusive_sum_[k] = (k == 0 ? 0 : topK_P_[k-1]);
+      }
+      simple_inclusive_scan(topK_P_exclusive_sum_, K);
+
+      print_array(topK_indexes_, K, "topK_indexes");
+      print_array(topK_P_exclusive_sum_, K, "topK_P_exclusive_sum");
+      print_array(topK_P_, K, "topK_P_");
     }
   }
 }

@@ -515,6 +515,10 @@ class CombinedSampler {
       topK_P_exclusive_sum_[k] = topK_P_sum;
       topK_P_sum += topK_P_[k];
     }
+
+    print_array(topK_indexes_, K, "topK_indexes");
+    print_array(topK_P_exclusive_sum_, K, "topK_P_exclusive_sum");
+    print_array(topK_P_, K, "topK_P_");
   }
 
   void ComputePCumsum() {
