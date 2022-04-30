@@ -339,6 +339,7 @@ void sample_combined_forward_kernel(
         // we include the index k, but leave space for N such indexes.
         sort_combinations[k] = (((uint64_t)this_P) << (N * K_bits)) | k;
       }
+      print_array(sort_combinations, K, "sort-combinations-n=0");
       for (n = 1; n < N; n++) {
         __syncthreads();
 
@@ -367,6 +368,7 @@ void sample_combined_forward_kernel(
         merge_based_partial_sort_reverse(sort_combinations, K, K);
       }
 
+      print_array(sort_combinations, K, "sort-combinations-n=N");
 
       uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
       for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.

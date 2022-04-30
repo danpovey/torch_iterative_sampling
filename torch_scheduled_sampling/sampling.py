@@ -222,6 +222,27 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
     return SampleCombinedFunction.apply(p, K, input_is_log)
 
 
+def _test_sample_combined_forward_compare():
+    B = 1  # so only 1 is printed
+    N = 2
+    M = 16
+    K = 4
+    l = 3.0 * torch.randn(B, N, M)
+    l = l.log_softmax(dim=-1)
+    print("p = ", l.exp())
+    l_cuda = l.to(device='cuda')
+    (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True)
+    (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, True)
+
+    print("indexes = ", indexes)
+    print("indexes_combined = ", indexes_combined)
+    print("weights = ", weights)
+    assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
+    print("indexes_cuda = ", indexes_cuda)
+    print("indexes_combined_cuda = ", indexes_combined_cuda)
+    print("weights_cuda = ", weights_cuda)
+    assert torch.all((weights_cuda.sum(dim=-1) - 1.0).abs() < 0.1)
+
 def _test_sample_combined_forward():
     for device in [torch.device('cpu'), torch.device('cuda')]:
         B = 2
@@ -236,6 +257,7 @@ def _test_sample_combined_forward():
         print("indexes_combined = ", indexes_combined)
         print("weights = ", weights)
         assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
+
 
 def _test_sample_combined_forward_average():
     B = 2
@@ -291,6 +313,7 @@ def _test_sample_combined_mean():
 
 
 if __name__ == '__main__':
-    _test_sample_combined_forward_average()
-    _test_sample_combined_mean()
-    _test_sample_combined_forward()
+    _test_sample_combined_forward_compare()
+    #_test_sample_combined_forward()
+    #_test_sample_combined_forward_average()
+    #_test_sample_combined_mean()
