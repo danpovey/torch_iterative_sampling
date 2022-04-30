@@ -278,7 +278,7 @@ void sample_combined_forward_kernel(
     { // LoadP()
       for (uint32_t n = 0; n < N; n++) {
         uint32_t multiple = 1 + M_unique * (rand_source >> (M_bits * n)) % (M / M_unique);
-
+        // First load P linearly from global memory to shared memory.
         uint32_t m = threadIdx.x;
         if (m < M) {
           Real p = probs[b][n][m];
@@ -288,6 +288,7 @@ void sample_combined_forward_kernel(
           uint32_t P = uint32_t(1) + uint32_t((1 << p_bits) * p);
           P_cumsum_[n * (M+1) + m] = P;
         }
+        // .. then pseudo-randomly reorder/shuffle P based on "multiple".
         __syncthreads();
         int32_t P;
         if (m < M) {
@@ -306,6 +307,8 @@ void sample_combined_forward_kernel(
     }
 
     { // ComputeKLargest() in sampling_cpu.cpp.
+      // This next loop populates sort_buf32_ with the top-K probabilities
+      // for each source distribution.
       for (uint32_t n = 0; n < N; n++) {
         __syncthreads();
 
@@ -323,23 +326,47 @@ void sample_combined_forward_kernel(
         //std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<>());
         //std::sort(sort_buf, sort_buf + K, std::greater<>());
       }
+
+      // Now we will iteratively compute the top-K *combined* probabilities,
+      // starting by combining n=0 with n=1 and then including n=2 and so on one by one
+      // if N>2.
       uint64_t *sort_combinations = sort_buf64_;
-      uint32_t K_bits_mask = (K-1);
-      for (uint32_t i = 0; i < KpowN; i++) {  // we'll parallelize over i on GPU.
-        // product of probabilities.  This index i represents an n-tuple of e.g. k1,k2,k3, which are all indexes in [0..K-1] specifying a
-        uint64_t P_prod = 1;
-        for (uint32_t n = 0; n < N; n++) {
-          uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K into K-best.
-          uint32_t this_p = (sort_buf32_[K*n + k] >> M_bits); // one of the k-best probs for the n'th softmax
-          P_prod *= this_p;
-        }
-        sort_combinations[i] = (P_prod << (K_bits * N)) + i;
+      uint32_t n = 0;
+      __syncthreads();
+      if (threadIdx.x < K) {
+        uint32_t k = threadIdx.x,
+            this_P = (sort_buf32_[K*n + k] >> M_bits); // one of the k-best probs for the n'th softmax
+        // we include the index k, but leave space for N such indexes.
+        sort_combinations[k] = (((uint64_t)this_P) << (N * K_bits)) | k;
       }
-      // we'll just sort the entire array, when we do this on GPU.
-      //std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + KpowN,
-      //                 std::greater<>());
-      // work out the K-best combinations.
-      //std::sort(sort_combinations, sort_combinations + K, std::greater<>());
+      for (n = 1; n < N; n++) {
+        __syncthreads();
+
+        uint64_t K_mask = (uint64_t(1) << uint64_t(n * K_bits)) - 1;
+        uint64_t new_S;
+        if (threadIdx.x < K * K) {
+          uint32_t best_k = threadIdx.x % K,
+              new_k = threadIdx.x / K;
+          // best_k is an index into the 1st K elements of array
+          // `sort_combinations`
+          uint64_t S = sort_combinations[best_k],
+              P = S & ~K_mask,
+              prev_ks = S & K_mask;
+          uint64_t combined_k = prev_ks | (new_k << (n * K_bits));
+          // one of the k-best probs for the n'th softmax
+          uint32_t this_P = (sort_buf32_[K*n + new_k] >> M_bits);
+          new_S = (P * this_P) | combined_k;
+        }
+        __syncthreads();
+        if (threadIdx.x < K * K) {
+          sort_combinations[threadIdx.x] = new_S;
+        }
+        merge_based_partial_sort_reverse(sort_combinations, K, K*K);
+      }
+      if (N == 1) {
+        merge_based_partial_sort_reverse(sort_combinations, K, K);
+      }
+
 
       uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
       for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
