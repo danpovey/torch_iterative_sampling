@@ -20,6 +20,102 @@
 extern __shared__ char extern_buf[];
 // `extern_buf` is general-purpose shared memory.
 
+template <typename IntT>
+__device__ void print_array(IntT *buf, int num_items, const char *name) {
+  if (threadIdx.x == 0) {
+    printf("%s = [", name);
+    for (int i = 0; i < num_items; i++) {
+      printf("%f ",  (double)buf[i]);
+    }
+    printf("]\n");
+  }
+}
+
+
+// c.f. https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf
+// A simple inclusive scan algorithm.  Require num_items <= blockDim.x.
+template <typename IntT>
+__device__ void simple_inclusive_scan(IntT *buf, int num_items) {
+  print_array(buf, num_items, "simple-exclusive-scan-at-entry");
+  for (int offset = 1; offset < num_items; offset *= 2) {
+    IntT src_prev, src_cur;
+    __syncthreads();
+    if (threadIdx.x < num_items) {
+      src_prev = (threadIdx.x >= offset ? buf[threadIdx.x - offset] : 0);
+      src_cur = buf[threadIdx.x];
+    }
+    __syncthreads();
+    if (threadIdx.x < num_items) {
+      buf[threadIdx.x] = src_prev + src_cur;
+    }
+  }
+  __syncthreads();
+  print_array(buf, num_items, "simple-exclusive-scan-at-exit");
+  if (threadIdx.x < num_items && threadIdx.x > 0) {
+    assert(buf[threadIdx.x-1] <= buf[threadIdx.x]);  //TEMP
+  }
+}
+
+
+
+
+/*
+  This function does a partial sort of an array, in reverse order, so that it's
+  as if the array `start..start+input_size-1` is sorted, but we only care about
+  the `start..start+num_keep-1` elements.
+
+  see test_merge() in sorting_ref.py for the original Python code that this was
+  based on.  This is not very elegant but is probably enough for now.
+
+  Caution: this only works correctly if the elements x to be sorted satisfy
+  x > (x-1) [not true, for example, for 0 in unsigned arithmetic];
+  this is due to the subtraction of 1 in "x_val_mod" below.
+ */
+template <typename IntT>
+__device__ void merge_based_partial_sort_reverse(
+    IntT *buf, uint32_t num_keep, uint32_t num_items) {
+  // num_keep == max_elements_needed in python.
+  print_array(buf, num_items, "merge-sort-at-entry");
+  __syncthreads();
+  for (uint32_t new_sublist_size = 2;
+       new_sublist_size <= num_items;
+       new_sublist_size *= 2) {
+    uint32_t old_sublist_size = new_sublist_size / 2;
+    __syncthreads();
+    uint32_t i = threadIdx.x,
+        new_pos;
+    IntT x_val;
+    if (i < num_items) {
+      x_val = buf[i];
+      uint32_t offset_in_old = i & (old_sublist_size - 1);
+
+      uint32_t new_sublist_start = i & ~(new_sublist_size - 1),
+          is_rhs = (i & old_sublist_size), // equals old_sublist_size for right
+                                                     // half of input
+          other_list_start = new_sublist_start | (is_rhs ^ old_sublist_size),
+          search_offset = other_list_start,
+          search_begin = 0,
+          search_end = std::min<uint32_t>(uint32_t(num_keep),
+                                          old_sublist_size) + 1;
+
+      IntT x_val_mod = x_val - (is_rhs != 0);
+      while (search_begin + 1 < search_end) {
+        uint32_t mid = (search_begin + search_end) / 2;
+        // we are implementing reversed sorting, so replace the ">" in the
+        // Python with "<".
+        if (x_val_mod < buf[search_offset + mid - 1]) search_begin = mid;
+        else search_end= mid;
+      }
+      new_pos = new_sublist_start + offset_in_old + search_begin;
+    }
+    __syncthreads();
+    if (i < num_items) {
+      buf[new_pos] = x_val;
+    }
+  }
+  print_array(buf, num_items, "merge-sort-at-exit");
+}
+
 
 
 
@@ -168,91 +264,100 @@ void sample_combined_forward_kernel(
   uint32_t *indexes_for_samples_ = reinterpret_cast<uint32_t*>(B_ptr_ + 1), // [K*N]
       *sort_buf32_ = indexes_for_samples_;  // [M+(N-1)*K], shares memory with indexes_for_samples
 
+  if (threadIdx.x < N) {
+    P_cumsum_[(M+1) * threadIdx.x] = 0;
+  }
+
   for (int b = blockIdx.x; b < B; b += gridDim.x) {
-    if (threadIdx.x == 0) {
-      // for now do everything in 1 thread, we'll gradually move to doing more
-      // things in parallel to ease debugging.
+    // for now do everything in 1 thread, we'll gradually move to doing more
+    // things in parallel to ease debugging.
 
-      uint64_t rand_source = rand[b];
+    uint64_t rand_source = rand[b];
 
 
-      { // LoadP()
-        for (uint32_t n = 0; n < N; n++) {
-          uint32_t multiple = 1 + M_unique * (rand_source >> (M_bits * n)) % (M / M_unique);
+    { // LoadP()
+      for (uint32_t n = 0; n < N; n++) {
+        uint32_t multiple = 1 + M_unique * (rand_source >> (M_bits * n)) % (M / M_unique);
 
-          uint32_t *this_P_cumsum = P_cumsum_ + n * (M+1);
-          this_P_cumsum[0] = 0;
-          uint32_t p_multiple = 1 << (p_bits);
-          for (uint32_t m = 0; m < M; m++) {
-            uint32_t src_m = (m * multiple) % M;
-            Real src_p = probs[b][n][src_m];
-            if (input_is_log)
-              src_p = Exp(src_p);
-
-            // add 1 because if we allow zero probabilities, we get nasty edge cases.
-            uint32_t P = uint32_t(1) + uint32_t(p_multiple * src_p);
-
-            // the index is m + 1 because we shift it right by 1, this will be convenient when
-            // creating the exclusive-sum.
-            // The shifting left by M_bits and adding m is a temporary thing so that we
-            // can later sort these probabilities but retain the associated indexes.
-            this_P_cumsum[m + 1] = P;
-          }
+        uint32_t m = threadIdx.x;
+        if (m < M) {
+          Real p = probs[b][n][m];
+          if (input_is_log)
+            p = Exp(p);
+          // add 1 because if we allow zero probabilities, we get nasty edge cases.
+          uint32_t P = uint32_t(1) + uint32_t((1 << p_bits) * p);
+          P_cumsum_[n * (M+1) + m] = P;
+        }
+        __syncthreads();
+        int32_t P;
+        if (m < M) {
+          uint32_t src_m = (m * multiple) % M;
+          P = P_cumsum_[n * (M+1) + src_m];
+        }
+        __syncthreads();
+        if (m < M) {
+          P_cumsum_[n * (M+1) + m] = P;
         }
       }
+    }
 
-      { // ComputeKLargest() in sampling_cpu.cpp.
+    for (uint32_t n = 0; n < N; n++) {
+      print_array(P_cumsum_ + n*(M+1), M+1, "P_cumsum, prior to cumsum");
+    }
+
+    { // ComputeKLargest() in sampling_cpu.cpp.
+      for (uint32_t n = 0; n < N; n++) {
+        __syncthreads();
+
+        uint32_t m = threadIdx.x;
+        uint32_t P = P_cumsum_[n*(M+1) + m + 1];
+
+        uint32_t *sort_buf = sort_buf32_ + (K*n);
+
+        sort_buf[m] = (P << M_bits) + m;
+
+        merge_based_partial_sort_reverse(sort_buf, K, M);
+
+        // in CUDA we'll just sort the entire array.  Note, we don't need the
+        // sorting algorithm to sort the indexes because we include them manually.
+        //std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<>());
+        //std::sort(sort_buf, sort_buf + K, std::greater<>());
+      }
+      uint64_t *sort_combinations = sort_buf64_;
+      uint32_t K_bits_mask = (K-1);
+      for (uint32_t i = 0; i < KpowN; i++) {  // we'll parallelize over i on GPU.
+        // product of probabilities.  This index i represents an n-tuple of e.g. k1,k2,k3, which are all indexes in [0..K-1] specifying a
+        uint64_t P_prod = 1;
         for (uint32_t n = 0; n < N; n++) {
-          uint32_t *this_P_buf = P_cumsum_ + (n * (M+1)) + 1;
-          // Each time we access this buffer we shift right by
-          // K, because we need to remember the top-K items for each n.
-          uint32_t *sort_buf = sort_buf32_ + (K * n);
-          for (uint32_t m = 0; m < M; m++) {
-            uint32_t p = this_P_buf[m];
-            sort_buf[m] = m + (p << M_bits); // keep track of indexes.
-          }
-          sort_buf[M] = 0;
-          // in CUDA we'll just sort the entire array.  Note, we don't need the
-          // sorting algorithm to sort the indexes because we include them manually.
-          //std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<>());
-          //std::sort(sort_buf, sort_buf + K, std::greater<>());
+          uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K into K-best.
+          uint32_t this_p = (sort_buf32_[K*n + k] >> M_bits); // one of the k-best probs for the n'th softmax
+          P_prod *= this_p;
         }
-        uint64_t *sort_combinations = sort_buf64_;
-        uint32_t K_bits_mask = (K-1);
-        for (uint32_t i = 0; i < KpowN; i++) {  // we'll parallelize over i on GPU.
-          // product of probabilities.  This index i represents an n-tuple of e.g. k1,k2,k3, which are all indexes in [0..K-1] specifying a
-          uint64_t P_prod = 1;
-          for (uint32_t n = 0; n < N; n++) {
-            uint32_t k = (i >> (n * K_bits)) & K_bits_mask;  // the n'th index 0 <= k < K into K-best.
-            uint32_t this_p = (sort_buf32_[K*n + k] >> M_bits); // one of the k-best probs for the n'th softmax
-            P_prod *= this_p;
-          }
-          sort_combinations[i] = (P_prod << (K_bits * N)) + i;
-        }
-        // we'll just sort the entire array, when we do this on GPU.
-        //std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + KpowN,
-        //                 std::greater<>());
-        // work out the K-best combinations.
-        //std::sort(sort_combinations, sort_combinations + K, std::greater<>());
+        sort_combinations[i] = (P_prod << (K_bits * N)) + i;
+      }
+      // we'll just sort the entire array, when we do this on GPU.
+      //std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + KpowN,
+      //                 std::greater<>());
+      // work out the K-best combinations.
+      //std::sort(sort_combinations, sort_combinations + K, std::greater<>());
 
-        uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
-        for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
-          uint64_t combination = sort_combinations[k],
-              P = combination >> (K_bits * N);
-          topK_P_[k] = P;
-          for (uint32_t n = 0; n < N ; n++) {
-            // src_k is the k index among the top-K source items for this `n`.  We
-            // need to look up the original 'm' index
-            uint32_t src_k = (combination >> (n * K_bits)) & (K-1),
-                src_m = sort_buf32_[K*n + src_k] & M_mask;
-            topK_indexes_[k*N + n] = src_m;
-          }
+      uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
+      for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
+        uint64_t combination = sort_combinations[k],
+            P = combination >> (K_bits * N);
+        topK_P_[k] = P;
+        for (uint32_t n = 0; n < N ; n++) {
+          // src_k is the k index among the top-K source items for this `n`.  We
+          // need to look up the original 'm' index
+          uint32_t src_k = (combination >> (n * K_bits)) & (K-1),
+              src_m = sort_buf32_[K*n + src_k] & M_mask;
+          topK_indexes_[k*N + n] = src_m;
         }
-        uint64_t topK_P_sum = 0;
-        for (uint32_t k = 0; k < K; k++) {  // this would be done using a cub exclusive-sum.
-          topK_P_exclusive_sum_[k] = topK_P_sum;
-          topK_P_sum += topK_P_[k];
-        }
+      }
+      uint64_t topK_P_sum = 0;
+      for (uint32_t k = 0; k < K; k++) {  // this would be done using a cub exclusive-sum.
+        topK_P_exclusive_sum_[k] = topK_P_sum;
+        topK_P_sum += topK_P_[k];
       }
     }
   }
