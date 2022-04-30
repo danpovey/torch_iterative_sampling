@@ -8,19 +8,6 @@ def is_sorted(x: List[int]):
     return x == sorted(x)
 
 
-def swap_plus_mod(mod: int,
-                  delta: int,
-                  x: List[int]):
-    for i in range(len(x)):
-        m = i % mod
-        if m < mod // 2 and m + delta >= mod // 2:
-            a = x[i]
-            b = x[i + delta]
-            if b < a:
-                x[i] = b
-                x[i + delta] = a
-
-
 def sort_unique(x: List[int]):
     assert len(set(x)) == len(x)
     x_old = list(x)
@@ -74,37 +61,6 @@ def merge_lists(new_sublist_size: int,
         x[new_pos] = x_val
 
 
-def test_swap_plus_mod(mod: int,
-                        delta: int,
-                        x: List[int]):
-    for i in range(len(x)):
-        m = i % mod
-        if m < mod // 2 and m + delta >= mod // 2:
-            a = x[i]
-            b = x[i + delta]
-            if b < a:
-                return False
-    return True
-
-def _test1():
-    for _ in range(1000):
-        N = 16
-        x = [ random.randint(0, 1000) for _ in range(N) ]
-
-        pairs = [ (2,1), (4,2), (8,4), (16,8),
-                  (4, 1) ]
-
-        for i in range(len(pairs)):
-            swap_plus_mod(*pairs[i], x)
-            if not test_swap_plus_mod(*pairs[i], x):
-                print(f"Failed property {pairs[i]}")
-            for j in range(i+1):
-                if not test_swap_plus_mod(*pairs[j], x):
-                    print(f"Failed property {pairs[j]} after ensuring property {pairs[i]} at i={i}")
-
-        print("x = ", x)
-        assert is_sorted(x)
-        print("OK")
 
 
 def _test_merge():
@@ -133,5 +89,3 @@ def _test_sort_unique():
 if __name__ == '__main__':
     _test_sort_unique()
     _test_merge()
-
-    #_test1()
