@@ -191,6 +191,8 @@ class CombinedSampler {
       auto p_n = p[n];
 
       uint32_t multiple = GetRandomCoprime(n);
+      printf("multiple = %ld", (long int) multiple);
+
       // Here we do the reordering as 1 operation.  For the CUDA code we'll
       // probably load from main memory to shared memory without reordering, and
       // then reorder as a separate operation, because we want to keep main
@@ -538,10 +540,12 @@ class CombinedSampler {
         sum += this_P[m];
         this_P[m] = sum;
       }
+      print_array(this_P-1, M+1, "this_P");
       P_sum_cumprod_[n] = P_sum_cumprod;
       P_sum_cumprod *= sum;
     }
     P_sum_cumprod_[N] = P_sum_cumprod;
+    print_array(P_sum_cumprod_, (N+1), "P_sum_cumprod_");
   }
 
   void ComputeBeta() {

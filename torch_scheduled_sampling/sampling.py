@@ -65,7 +65,8 @@ def _sample_combined_forward_dispatcher(
 _max_bits = 54  # used in sample_combined_forward and sample_combined_backward,
                 # see comment in sample_combined_forward.
 
-def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
+def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
+                            rand: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
     """
     Sample from a distribution that is the product of softmaxes.  We will sample
     K *distinct* samples.  This entails using sampling weights of the form min(1, p/beta)
@@ -89,6 +90,8 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
             which will equal max(p, beta) for a beta specific to the batch element,
             i.e. to the product of the distributions (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
+        rand: this is provided for testing purposes, you will not normally need
+           to pass this in.
     """
     p = p.detach()  # call sample_combined() if you need derivatives.
     N = p.shape[-2]
@@ -99,7 +102,8 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     pshape = p.shape
     p = p.reshape(-1, N, M)
     B = p.shape[0]
-    rand = torch.randint(2**63 - 1, (B,), device=p.device, dtype=torch.int64)
+    if rand is None:
+        rand = torch.randint(2**63 - 1, (B,), device=p.device, dtype=torch.int64)
     (indexes, indexes_combined, weights) = _sample_combined_forward_dispatcher(p, rand, K, input_is_log)
     star = pshape[:-2]
     indexes = indexes.reshape(*star, K, N)
@@ -231,8 +235,11 @@ def _test_sample_combined_forward_compare():
     l = l.log_softmax(dim=-1)
     print("p = ", l.exp())
     l_cuda = l.to(device='cuda')
-    (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True)
-    (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, True)
+    rand = torch.randint(2**63 - 1, (B,), device=l.device, dtype=torch.int64)
+    rand_cuda = rand.to(l_cuda.device)
+
+    (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True, rand)
+    (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, True, rand_cuda)
 
     print("indexes = ", indexes)
     print("indexes_combined = ", indexes_combined)

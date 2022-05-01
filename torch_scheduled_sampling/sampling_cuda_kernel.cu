@@ -278,6 +278,9 @@ void sample_combined_forward_kernel(
     { // LoadP()
       for (uint32_t n = 0; n < N; n++) {
         uint32_t multiple = 1 + M_unique * (rand_source >> (M_bits * n)) % (M / M_unique);
+        if(threadIdx.x == 0) {
+          printf("multiple = %ld", (long int) multiple);
+        }
         // First load P linearly from global memory to shared memory.
         uint32_t m = threadIdx.x;
         if (m < M) {
@@ -286,23 +289,24 @@ void sample_combined_forward_kernel(
             p = Exp(p);
           // add 1 because if we allow zero probabilities, we get nasty edge cases.
           uint32_t P = uint32_t(1) + uint32_t((1 << p_bits) * p);
-          P_cumsum_[n * (M+1) + m] = P;
+          P_cumsum_[n * (M+1) + 1 + m] = P;
         }
         // .. then pseudo-randomly reorder/shuffle P based on "multiple".
         __syncthreads();
         int32_t P;
         if (m < M) {
           uint32_t src_m = (m * multiple) % M;
-          P = P_cumsum_[n * (M+1) + src_m];
+          P = P_cumsum_[n * (M+1) + 1 + src_m];
         }
         __syncthreads();
         if (m < M) {
-          P_cumsum_[n * (M+1) + m] = P;
+          P_cumsum_[n * (M+1) + 1 + m] = P;
         }
       }
     }
 
     for (uint32_t n = 0; n < N; n++) {
+      __syncthreads();
       print_array(P_cumsum_ + n*(M+1), M+1, "P_cumsum, prior to cumsum");
     }
 
@@ -397,6 +401,29 @@ void sample_combined_forward_kernel(
       print_array(topK_indexes_, K, "topK_indexes");
       print_array(topK_P_exclusive_sum_, K, "topK_P_exclusive_sum");
       print_array(topK_P_, K, "topK_P_");
+    }
+
+    {  // This next block corresponds to ComputePCumsum() in sampling_cpu.cpp.
+      // P_cumsum_ currently stores integerized probs P, preceded by a zero; after
+      // this function it will store the [exclusive] cumulative sum, of size M+1.
+      for (uint32_t n = 0; n < N; n++) {
+        // Compute inclusive cumulative sum of size M; we already padded on the
+        // left with 0, so the effect is the same as exclusive sum.
+        uint32_t *this_P = P_cumsum_ + (M+1) * n + 1; // + 1: skip the 0.
+        simple_inclusive_scan(this_P, M);
+
+        print_array(this_P-1, M+1, "this_P");
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        uint64_t P_sum_cumprod = 1;
+        for (int n = 0; n < N; n++) {
+          P_sum_cumprod_[n] = P_sum_cumprod;
+          P_sum_cumprod *= P_cumsum_[(M+1)*n + M];
+        }
+        P_sum_cumprod_[N] = P_sum_cumprod;
+      }
+      print_array(P_sum_cumprod_, (N+1), "P_sum_cumprod_");
     }
   }
 }
