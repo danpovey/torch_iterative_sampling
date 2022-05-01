@@ -25,7 +25,7 @@ __device__ void print_array(IntT *buf, int num_items, const char *name) {
   if (threadIdx.x == 0) {
     printf("%s = [", name);
     for (int i = 0; i < num_items; i++) {
-      printf("%f ",  (double)buf[i]);
+      printf("%ld ",  (long int)buf[i]);
     }
     printf("]\n");
   }
@@ -204,9 +204,9 @@ __forceinline__ __device__ int find_class(
   return begin;
 }
 
-inline __device__ double Exp(double f) { return exp(f); }
+inline __device__ double exp_wrapper(double f) { return exp(f); }
 template<typename Real>
-inline __device__ Real Exp(Real f) { return Real(expf(float(f))); }
+inline __device__ Real exp_wrapper(Real f) { return Real(expf(float(f))); }
 
 /*
   Return the index i into cumsum, with begin <= i < end,
@@ -286,7 +286,7 @@ void sample_combined_forward_kernel(
         if (m < M) {
           Real p = probs[b][n][m];
           if (input_is_log)
-            p = Exp(p);
+            p = exp_wrapper(p);
           // add 1 because if we allow zero probabilities, we get nasty edge cases.
           uint32_t P = uint32_t(1) + uint32_t((1 << p_bits) * p);
           P_cumsum_[n * (M+1) + 1 + m] = P;
@@ -441,15 +441,21 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 
 // returns num_bits >= 1 such that (1 << num_bits) >= n.
-inline int FindNumBitsFor(int n) {
+inline int find_num_bits_for(int n) {
   int num_bits = 1;
   while ((int(1) << num_bits) < n)
     num_bits++;
   return num_bits;
 }
 
+inline int round_up_to_power_of_two(int n) {
+  int ans = 1;
+  while (ans < n)
+    ans *= 2;
+  return ans;
+}
 
-uint32_t FindProdUniquePrimeFactors(uint32_t i) { // returns smallest number coprime to
+uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
   TORCH_CHECK(i != 0);
   uint32_t ans = 1;
   for (uint32_t p = 2; i != 1; p++) {
@@ -517,15 +523,15 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
 
 
   // work out p_bits, etc., on the CPU as it's a slightly complicated formula
-  int M_bits = FindNumBitsFor(M),
-      K_bits = FindNumBitsFor(K),
+  int M_bits = find_num_bits_for(M),
+      K_bits = find_num_bits_for(K),
       p_bits = std::min(54 / N, // so product of N of these is
                                          // comfortably less than 64, search for
                                          // "headroom"
                         std::min((63/N) - K_bits,  // for when we sort `sort_combinations`.
                                  31 - M_bits)), // for when we sort `sort_buf` in ComputeKLargest()
-      M_unique(FindProdUniquePrimeFactors(M));
-
+      M_unique = find_prod_unique_prime_factors(M),
+      M_round = round_up_to_power_of_two(N);
 
   // TODO: allocate buffers..
   int KpowN = 1 << (K_bits * N),

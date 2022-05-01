@@ -232,14 +232,14 @@ def _test_sample_combined_forward_compare():
     M = 16
     K = 4
     l = 3.0 * torch.randn(B, N, M)
-    l = l.log_softmax(dim=-1)
-    print("p = ", l.exp())
+    l = l.softmax(dim=-1)
+    print("p = ", l)
     l_cuda = l.to(device='cuda')
     rand = torch.randint(2**63 - 1, (B,), device=l.device, dtype=torch.int64)
     rand_cuda = rand.to(l_cuda.device)
 
-    (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True, rand)
-    (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, True, rand_cuda)
+    (indexes, indexes_combined, weights) = sample_combined_forward(l, K, False, rand)
+    (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
 
     print("indexes = ", indexes)
     print("indexes_combined = ", indexes_combined)

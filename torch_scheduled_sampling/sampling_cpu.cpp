@@ -3,9 +3,9 @@
 
 
 
-inline torch::Half Exp(torch::Half f) { return (torch::Half)expf((float)f); }
-inline float Exp(float f) { return expf(f); }
-inline double Exp(double f) { return exp(f); }
+inline torch::Half exp_wrapper(torch::Half f) { return (torch::Half)expf((float)f); }
+inline float exp_wrapper(float f) { return expf(f); }
+inline double exp_wrapper(double f) { return exp(f); }
 
 /*
   Return the index i into cumsum, with begin <= i < end,
@@ -101,7 +101,7 @@ class CombinedSampler {
  public:
   CombinedSampler(uint32_t N, uint32_t M, uint32_t K):
       N_(N), M_(M), K_(K),
-      M_unique_(FindProdUniquePrimeFactors(M)) {
+      M_unique_(find_prod_unique_prime_factors(M)) {
     TORCH_CHECK(N < 5);
     TORCH_CHECK((K&(K-1)) == 0);  // require K is a power of 2.
     M_bits_ = FindNumBitsFor(M);
@@ -143,20 +143,20 @@ class CombinedSampler {
 
     buffers_ = std::unique_ptr<uint32_t>(new uint32_t[tot_size]);
     uint32_t *p = buffers_.get();
-    SetBuffer(topK_P_, p, K);
-    SetBuffer(topK_P_exclusive_sum_, p, K);
-    SetBuffer(topK_delta_P_, p, K);
-    SetBuffer(topK_cumsums_, p, K);
-    SetBuffer(sorted_topK_P_, p, K);
-    SetBuffer(sorted_topK_delta_P_, p, K);
-    SetBuffer(sorted_topK_delta_P_cumsum_, p, K);
-    SetBuffer(sorted_topK_cumsums_, p, K);
-    SetBuffer(sorted_topK_cumsums_reduced_, p, K);
-    SetBuffer(unreduced_samples_, p, K);
-    SetBuffer(topK_indexes_, p, K*N);
-    SetBuffer(P_cumsum_, p, (M+1) * N);
-    SetBuffer(sort_buf64_, p, Kpow2);
-    SetBuffer(P_sum_cumprod_, p, N+1);
+    set_buffer(topK_P_, p, K);
+    set_buffer(topK_P_exclusive_sum_, p, K);
+    set_buffer(topK_delta_P_, p, K);
+    set_buffer(topK_cumsums_, p, K);
+    set_buffer(sorted_topK_P_, p, K);
+    set_buffer(sorted_topK_delta_P_, p, K);
+    set_buffer(sorted_topK_delta_P_cumsum_, p, K);
+    set_buffer(sorted_topK_cumsums_, p, K);
+    set_buffer(sorted_topK_cumsums_reduced_, p, K);
+    set_buffer(unreduced_samples_, p, K);
+    set_buffer(topK_indexes_, p, K*N);
+    set_buffer(P_cumsum_, p, (M+1) * N);
+    set_buffer(sort_buf64_, p, Kpow2);
+    set_buffer(P_sum_cumprod_, p, N+1);
     sort_buf32_ = p;
     indexes_for_samples_ = p;
     p += std::max<uint32_t>((M+(N-1)*K), K*N);  // indexes_for_samples_
@@ -164,11 +164,11 @@ class CombinedSampler {
     TORCH_CHECK(size == tot_size);
   }
 
-  void SetBuffer(uint32_t* &buffer, uint32_t* &p, uint32_t size) {
+  void set_buffer(uint32_t* &buffer, uint32_t* &p, uint32_t size) {
     buffer = p;
     p += size;
   }
-  void SetBuffer(uint64_t* &buffer, uint32_t* &p, uint32_t size) {
+  void set_buffer(uint64_t* &buffer, uint32_t* &p, uint32_t size) {
     buffer = reinterpret_cast<uint64_t*>(p);
     p += 2 * size;
   }
@@ -176,12 +176,12 @@ class CombinedSampler {
 
   // returns a pseudo random number coprime to M_, as a function of n.
   // this is deterministic within a batch.
-  inline uint32_t GetRandomCoprime(uint32_t n) {
+  inline uint32_t get_random_coprime(uint32_t n) {
     return 1 + M_unique_ * (rand_source_ >> (M_bits_ * n)) % (M_ / M_unique_);
   }
 
   template <typename Real, typename AccessorT>
-  void LoadP(uint64_t rand_source,
+  void load_p(uint64_t rand_source,
              bool input_is_log,
              AccessorT p) { // p: [N][M]
     rand_source_ = rand_source;
@@ -190,7 +190,7 @@ class CombinedSampler {
     for (uint32_t n = 0; n < N; n++) {
       auto p_n = p[n];
 
-      uint32_t multiple = GetRandomCoprime(n);
+      uint32_t multiple = get_random_coprime(n);
       printf("multiple = %ld", (long int) multiple);
 
       // Here we do the reordering as 1 operation.  For the CUDA code we'll
@@ -205,7 +205,7 @@ class CombinedSampler {
         uint32_t src_m = (m * multiple) % M;
         Real src_p = p_n[src_m];
         if (input_is_log)
-          src_p = Exp(src_p);
+          src_p = exp_wrapper(src_p);
 
         // add 1 because if we allow zero probabilities, we get nasty edge cases.
         uint32_t P = uint32_t(1) + uint32_t(p_multiple * src_p);
@@ -220,25 +220,25 @@ class CombinedSampler {
   }
 
 
-  void  __attribute__ ((noinline))  Compute() {
+  void  __attribute__ ((noinline))  compute() {
     for (uint32_t n = 0; n < N_; n++) {
       print_array(P_cumsum_ + n*(M_+1), M_+1, "P_cumsum, prior to cumsum");
     }
-    ComputeKLargest();
-    ComputePCumsum();
-    ComputeBeta();
-    ComputeTopkCumsums();  // also re-sorts top-K
-    ComputeUnreducedSamples();
-    ComputeIndexesForSamples();
-    // next is GetWeightsForSamples; this is called by the user.
-    // then GetIndexesForSamples; this is called by the user.
+    compute_k_largest();
+    compute_p_cumsum();
+    compute_beta();
+    compute_topk_cumsums();  // also re-sorts top-K
+    compute_unreduced_samples();
+    compute_indexes_for_samples();
+    // next is get_weights_for_samples(); this is called by the user,
+    // then get_indexes_for_samples(); this is called by the user.
   }
 
   /*
     `weights` is of shape [K].  We write the samples' weights to here.
    */
   template <typename Real, typename AccessorT>
-  void GetWeightsForSamples(
+  void get_weights_for_samples(
       AccessorT weights) {
     uint32_t N = N_, M = M_, K = K_;
     float denom = (float)P_sum_cumprod_[N];
@@ -258,7 +258,7 @@ class CombinedSampler {
 
 
   template <typename Accessor1, typename Accessor2>
-  void GetIndexesForSamples(
+  void get_indexes_for_samples(
       Accessor1 indexes,  // torch::TensorAccessor32<int64_t, 2>
       Accessor2 combined_indexes) {  // torch::TensorAccessor32<int64_t, 1>
     uint32_t N = N_, M = M_, K = K_;
@@ -266,7 +266,7 @@ class CombinedSampler {
       uint64_t combined_index = 0;
       uint32_t M_prod = 1;
       for (uint32_t n = 0; n < N; n++) {
-        uint32_t multiple = GetRandomCoprime(n);  // same multiple we used in LoadP().
+        uint32_t multiple = get_random_coprime(n);  // same multiple we used in LoadP().
         uint32_t this_m = indexes_for_samples_[k2 * N + n];
         uint32_t orig_m = (this_m * multiple) % M;
         indexes[k2][n] = orig_m;
@@ -414,11 +414,11 @@ class CombinedSampler {
     Of size [K][N], indexed as indexes_for_samples[k*N + n], contains the indexes
                     in {0..M-1} for the samples in unreduced_samples_.  These are
                     pseudo-random-reordered indexes, as are m indexes in P_cumsum_,
-                    search for GetRandomCoprime().
+                    search for get_random_coprime().
    */
   uint32_t *indexes_for_samples_;
 
-  uint32_t FindProdUniquePrimeFactors(uint32_t i) { // returns smallest number coprime to
+  uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
     TORCH_CHECK(i != 0);
     uint32_t ans = 1;
     for (uint32_t p = 2; i != 1; p++) {
@@ -433,7 +433,7 @@ class CombinedSampler {
   }
 
 
-  void ComputeKLargest() {
+  void compute_k_largest() {
     // [1] compute K largest probabilities P and their corresponding indexes.
     // [2] sort the [K**N] products of the K largest probabilities, remembering their
     //     original indexes in 0..K-1.
@@ -523,7 +523,7 @@ class CombinedSampler {
     print_array(topK_P_, K, "topK_P_");
   }
 
-  void ComputePCumsum() {
+  void compute_p_cumsum() {
     // Compute P_cumsum_, P_sum_cumprod_.
 
     // P_cumsum_ currently stores integerized probs P, preceded by a zero; after
@@ -548,7 +548,7 @@ class CombinedSampler {
     print_array(P_sum_cumprod_, (N+1), "P_sum_cumprod_");
   }
 
-  void ComputeBeta() {
+  void compute_beta() {
     // see compute_beta_prods() in sampling_ref.py.  Computes B which
     // is integerized beta.
     uint32_t N = N_, K = K_;
@@ -592,7 +592,7 @@ class CombinedSampler {
   }
 
 
-  void ComputeTopkCumsums() {
+  void compute_topk_cumsums() {
     // Computes top-K cumulative sums; these are the cumulative sums of probabilities of
     // all N-tuples of indexes that precede each of the top-K cumulative sums.
     uint32_t M = M_, N = N_, K = K_;
@@ -650,7 +650,7 @@ class CombinedSampler {
     }
   }
 
-  void ComputeUnreducedSamples() {
+  void compute_unreduced_samples() {
     // will parallelize over (k2, k) pairs.  k2 corresponds to the output samples, k to the top-K probs
     uint32_t K = K_, N = N_;
     for (uint32_t k2 = 0; k2 < K; k2++) {
@@ -685,7 +685,7 @@ class CombinedSampler {
     }
   }
 
-  void ComputeIndexesForSamples() {
+  void compute_indexes_for_samples() {
     uint32_t K = K_, N = N_, M = M_;
     for (uint32_t k2 = 0; k2 < K; k2++) {
       uint64_t cur_sample = unreduced_samples_[k2];
@@ -806,12 +806,11 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
         for (int b = 0; b < B; b++) {
           uint64_t rand = uint64_t(rand_a[b]);
           //          torch_scheduled_sampling/sampling_cpu.cpp:563:55: error: no matching function for call to 'CombinedSampler::LoadP(uint64_t&, bool&, at::TensorAccessor<double, 2, at::DefaultPtrTraits, int>)'
-          sampler.LoadP<scalar_t>(rand, input_is_log, probs_a[b]);
-          sampler.Compute();
-          // torch_scheduled_sampling/sampling_cpu.cpp:565:52: error: no matching function for call to 'CombinedSampler::GetWeightsForSamples(at::TensorAccessor<double, 1, at::DefaultPtrTraits, int>)'
-          sampler.GetWeightsForSamples<scalar_t>(weights_a[b]);
+          sampler.load_p<scalar_t>(rand, input_is_log, probs_a[b]);
+          sampler.compute();
+          sampler.get_weights_for_samples<scalar_t>(weights_a[b]);
           // torch_scheduled_sampling/sampling_cpu.cpp:565:52: note:   'at::TensorAccessor<double, 1, at::DefaultPtrTraits, int>' is not derived from 'at::PackedTensorAccessor32<Real, 1>'
-          sampler.GetIndexesForSamples(indexes_a[b], combined_indexes_a[b]);
+          sampler.get_indexes_for_samples(indexes_a[b], combined_indexes_a[b]);
         }
       }));
   //  std::cout << "combined_indexes = " << combined_indexes;
