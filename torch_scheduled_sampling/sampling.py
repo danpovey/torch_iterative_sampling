@@ -229,7 +229,7 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
 def _test_sample_combined_forward_compare():
     B = 1000
     N = 4
-    M = 24
+    M = 256
     K = 16
     l = 6.0 * torch.randn(B, N, M)
     l = l.softmax(dim=-1)

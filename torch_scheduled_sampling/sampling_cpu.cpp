@@ -197,8 +197,6 @@ class CombinedSampler {
       auto p_n = p[n];
 
       uint32_t multiple = get_random_coprime(n);
-      printf("M_unique_ = %ld\n", (long int) M_unique_);
-      printf("multiple = %ld\n", (long int) multiple);
 
       // Here we do the reordering as 1 operation.  For the CUDA code we'll
       // probably load from main memory to shared memory without reordering, and
@@ -213,7 +211,6 @@ class CombinedSampler {
         Real src_p = p_n[src_m];
         if (input_is_log)
           src_p = exp_wrapper(src_p);
-        printf("%f ", src_p);
         // add 1 because if we allow zero probabilities, we get nasty edge cases.
         uint32_t P = uint32_t(1) + uint32_t(p_multiple * src_p);
 

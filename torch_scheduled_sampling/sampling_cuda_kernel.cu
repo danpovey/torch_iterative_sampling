@@ -317,9 +317,7 @@ void sample_combined_forward_kernel(
     { // load_p() in sampling_cpu.cpp
       for (uint32_t n = 0; n < N; n++) {
         uint32_t multiple = 1 + M_unique * ((rand_source >> (M_bits * n)) % (M / M_unique));
-        if(threadIdx.x == 0) {
-          printf("multiple = %ld\n", (long int) multiple);
-        }
+        //if(threadIdx.x == 0)  printf("multiple = %ld\n", (long int) multiple);
         // First load P linearly from global memory to shared memory.
         uint32_t m = threadIdx.x;
         if (m < M) {
