@@ -182,10 +182,8 @@ __forceinline__ __device__ int find_class(
         block_end = block_start + block_size;
     if (block_start < end &&
         r >= cumsum[block_start] && (
-#if 0  // if we removed this, we could prevent the function accessing cumsum[end].
-            block_end >= end ||
-#endif
-            r < cumsum[block_end])) {
+            (block_end >= end ||
+             r < cumsum[block_end]))) {
       // Exactly one thread will reach this point.
       *shared_int = block_start;
     }
@@ -214,9 +212,10 @@ __forceinline__ __device__ int find_class(
            cumsum[begin], r, cumsum[begin + 1]);
   }
 #endif
-  if (!(r >= cumsum[begin] && (begin + 1 == orig_end || r < cumsum[begin + 1]))) {
-    uint32_t y = (begin + 1 < orig_end ? cumsum[begin + 1] : 300000);
-    printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, search error:  begin,end=%d,%d, returning begin=%d, x,r,y=%d,%d,%d\n", blockIdx.x, threadIdx.x, threadIdx.y,
+  if (!(r >= cumsum[begin] && r < cumsum[begin + 1])) {
+    uint32_t y = cumsum[begin + 1]; // (begin + 1 < orig_end ? cumsum[begin + 1] : 300000);
+    printf("blockIdx.x=%d, threadIdx.{x,y}=%d,%d, search error:  orig_begin,orig_end=%u,%u, returning begin=%u, x,r,y=%u,%u,%u\n",
+           blockIdx.x, threadIdx.x, threadIdx.y,
            orig_begin, orig_end, begin, cumsum[begin], r, y);
   }
 
@@ -274,7 +273,7 @@ void sample_combined_forward_kernel(
                                    // comparison with CPu code.
       *topK_P_exclusive_sum_ = sorted_topK_P_ + K, // [K]
       *topK_delta_P_ = topK_P_exclusive_sum_ + K, // [K]
-      *sorted_topK_delta_P_ = topK_delta_P_, // [K], share with topK_cumsums,
+      *sorted_topK_delta_P_ = topK_delta_P_, // [K], share with topK_delta_P_,
                                              // but dont change name for easier
                                              // comparison with CPu code.
       *topK_cumsums_ = sorted_topK_delta_P_ + K, // [K]
@@ -287,8 +286,8 @@ void sample_combined_forward_kernel(
       *P_sum_cumprod_ = unreduced_samples_ + K, // [N+1]
       *B_ = P_sum_cumprod_ + (N+1);  // [1]
   uint32_t *topK_indexes_ = reinterpret_cast<uint32_t*>(B_ + 1), // [K*N]
-      *P_cumsum_ = topK_indexes_ + (K*N), // [(M+1) * N]
-      *indexes_for_samples_ = P_cumsum_ + ((M+1) * N);  // [K*N]
+      *P_cumsum_ = topK_indexes_ + (K*N); // [(M+1) * N]
+  uint32_t *indexes_for_samples_ = P_cumsum_ + ((M+1) * N);  // [K*N]
   // sort_buf32_ shares memory with indexes_for_samples_.  It is of length [M_round+K*(N-1)].
   uint32_t *sort_buf32_ = indexes_for_samples_;
   // sort_buf64_ is of size (K*K).  It
@@ -631,6 +630,11 @@ void sample_combined_forward_kernel(
           unreduced_samples_[k2] = rand_shifted;
         uint64_t topK_disallowed_start = sorted_topK_cumsums_[k],
             topK_disallowed_end = topK_disallowed_start + sorted_topK_delta_P_[k];
+        if (rand_shifted >= topK_disallowed_start &&
+            rand_shifted < topK_disallowed_end) {
+          printf("In disallowed region: topK_disallowed_start=%ul, rand_shifted=%ul, topK_disallowed_end=%ul, k=%d k2=%d\n",
+                 topK_disallowed_start, rand_shifted, topK_disallowed_end, k, k2);
+        }
         assert(!(rand_shifted >= topK_disallowed_start &&
                       rand_shifted < topK_disallowed_end));
         assert(rand_shifted < P_sum_cumprod_[N]);
@@ -698,6 +702,9 @@ void sample_combined_forward_kernel(
         }
         float p = (float)prod_P / denom;
         weights[b][k2] = (Real)std::max(p, beta);
+        if (p < 0 || p > 1) {
+          printf("k2=%d, denom=%f, beta=%f, prod_P=%ul, p=%f", k2, denom, beta, prod_P, p);
+        }
       }
     }
     { // this block corresponds to get_indexes_for_samples() in sampling_cpu.cpp.
@@ -820,8 +827,7 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       M_unique = find_prod_unique_prime_factors(M),
       M_round = 1 << M_bits;
 
-  int Kpow1or2 = (N > 1 ? (K*K) : K),
-      size64 = sizeof(uint64_t),
+  int size64 = sizeof(uint64_t),
       size32 = sizeof(uint32_t);
   int grid_dim_x = std::min<int>(B, 256),
       block_dim_x = std::max(M_round, K*K);
@@ -839,12 +845,11 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       size64 * K + // unreduced_samples_
       size64 * (N+1) +  // P_sum_cumprod_
       size64 * 1 + // B_.
-
       size32 * (K*N) + // topK_indexes_
-      size32 * (M_round+1) * N + // P_cumsum_
-      size64 * Kpow1or2 + // sort_buf64_, because double the element size
+      size32 * (M+1) * N + // P_cumsum_
       std::max<int>(size32 * ((K-1)*N + M_round),  // sort_buf32_
-                    size32 * (K*N + 1) + size64 * K*K); // indexes_for_samples_+sort_buf64_. [
+                    size32 * (K*N + 1) + size64 * K*K); // [(indexes_for_samples_ or alternatively the 1st
+                                                        // K*N elements of sort_buf32_), and then+sort_buf64_. [
                                                         // the +1 is for int64
                                                         // alignment issues.]
 

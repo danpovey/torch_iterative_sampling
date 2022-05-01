@@ -90,8 +90,8 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
             which will equal max(p, beta) for a beta specific to the batch element,
             i.e. to the product of the distributions (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
-        rand: this is provided for testing purposes, you will not normally need
-           to pass this in.
+        rand: of shape (*,), containing random numbers in 0..2**63-1, this is provided
+           for testing purposes, you will not normally need to pass this in.
     """
     p = p.detach()  # call sample_combined() if you need derivatives.
     N = p.shape[-2]
@@ -104,6 +104,8 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
     B = p.shape[0]
     if rand is None:
         rand = torch.randint(2**63 - 1, (B,), device=p.device, dtype=torch.int64)
+    else:
+        rand = rand.flatten()
     (indexes, indexes_combined, weights) = _sample_combined_forward_dispatcher(p, rand, K, input_is_log)
     star = pshape[:-2]
     indexes = indexes.reshape(*star, K, N)
@@ -227,33 +229,37 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
 
 
 def _test_sample_combined_forward_compare():
-    B = 1000
-    N = 4
-    M = 256
-    K = 16
-    l = 6.0 * torch.randn(B, N, M)
-    l = l.softmax(dim=-1)
-    print("p = ", l)
-    rand = torch.randint(2**63 - 1, (B,), device=l.device, dtype=torch.int64)
-    (indexes, indexes_combined, weights) = sample_combined_forward(l, K, False, rand)
+    for _ in range(1000):
+        B = random.randint(1, 1000)
+        N = random.randint(1, 4)
+        M = random.randint(16, 256)
+        T = random.randint(1, 2)
+        while True:
+            K = 2 ** (random.randint(0, 4))
+            if K < M:
+                break
+        l = 6.0 * torch.randn(B, T, N, M)
+        l = l.softmax(dim=-1)
+        rand = torch.randint(2**63 - 1, (B, T), device=l.device, dtype=torch.int64)
+        (indexes, indexes_combined, weights) = sample_combined_forward(l, K, False, rand)
+        print(f"B={B}, T={T}, N={N}, M={M}, K={K}")
 
-    l_cuda = l.to(device='cuda')
-    rand_cuda = rand.to(l_cuda.device)
-    (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
-
-    print("indexes = ", indexes)
-    print("indexes_combined = ", indexes_combined)
-    print("weights = ", weights)
-    assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
-    print("indexes_cuda = ", indexes_cuda)
-    print("indexes_combined_cuda = ", indexes_combined_cuda)
-    print("weights_cuda = ", weights_cuda)
-    #assert torch.all((weights_cuda.sum(dim=-1) - 1.0).abs() < 0.1)
-
-    assert torch.all(indexes == indexes_cuda.to('cpu'))
-    assert torch.all(indexes_combined == indexes_combined_cuda.to('cpu'))
-    print("weights diff = ", weights - weights_cuda.to('cpu'))
-    assert torch.all((weights - weights_cuda.to('cpu')).abs() < 0.01)
+        l_cuda = l.to(device='cuda')
+        rand_cuda = rand.to(l_cuda.device)
+        try:
+            (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
+            assert torch.all((weights - weights_cuda.to('cpu')).abs() < 0.01)
+            assert torch.all(indexes == indexes_cuda.to('cpu'))
+            assert torch.all(indexes_combined == indexes_combined_cuda.to('cpu'))
+        except:
+            print("indexes = ", indexes)
+            print("indexes_combined = ", indexes_combined)
+            print("weights = ", weights)
+            assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
+            print("indexes_cuda = ", indexes_cuda)
+            print("indexes_combined_cuda = ", indexes_combined_cuda)
+            print("weights_cuda = ", weights_cuda)
+            print("weights diff = ", weights - weights_cuda.to('cpu'))
 
 def _test_sample_combined_forward():
     for device in [torch.device('cpu'), torch.device('cuda')]:
