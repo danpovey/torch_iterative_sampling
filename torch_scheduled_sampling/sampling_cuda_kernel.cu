@@ -308,6 +308,7 @@ void sample_combined_forward_kernel(
   }
 
   for (int b = blockIdx.x; b < B; b += gridDim.x) {
+    __syncthreads();  // So we don't overwrite things the previous block 'b' is doing.
     // for now do everything in 1 thread, we'll gradually move to doing more
     // things in parallel to ease debugging.
 

@@ -248,10 +248,11 @@ def _test_sample_combined_forward_compare():
     print("indexes_cuda = ", indexes_cuda)
     print("indexes_combined_cuda = ", indexes_combined_cuda)
     print("weights_cuda = ", weights_cuda)
-    assert torch.all((weights_cuda.sum(dim=-1) - 1.0).abs() < 0.1)
+    #assert torch.all((weights_cuda.sum(dim=-1) - 1.0).abs() < 0.1)
 
     assert torch.all(indexes == indexes_cuda.to('cpu'))
     assert torch.all(indexes_combined == indexes_combined_cuda.to('cpu'))
+    print("weights diff = ", weights - weights_cuda.to('cpu'))
     assert torch.all((weights - weights_cuda.to('cpu')).abs() < 0.01)
 
 def _test_sample_combined_forward():
