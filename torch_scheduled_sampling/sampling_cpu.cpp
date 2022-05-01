@@ -141,8 +141,8 @@ class CombinedSampler {
 
     // indexes_for_samples_, of size K*N, shares memory with sort_buf32_.
     // allocate as uint64_t for alignment reasons.
-    buffers_ = std::unique_ptr<uint64_t>(new uint64_t[(tot_size+1)/2]);
-    uint64_t *p = buffers_.get();
+    buffers_.resize((tot_size+1)/2);
+    uint64_t *p = buffers_.data();
     set_buffer(topK_P_, p, K);
     set_buffer(topK_P_exclusive_sum_, p, K);
     set_buffer(topK_delta_P_, p, K);
@@ -162,7 +162,7 @@ class CombinedSampler {
     sort_buf32_ = p32;
     indexes_for_samples_ = p32;
     p32 += std::max<uint32_t>((M+(N-1)*K), K*N);  // indexes_for_samples_
-    int size = p32 - reinterpret_cast<uint32_t*>(buffers_.get());
+    int size = p32 - reinterpret_cast<uint32_t*>(buffers_.data());
     TORCH_CHECK(size == tot_size);
   }
 
@@ -307,7 +307,7 @@ class CombinedSampler {
   uint32_t K_bits_;
 
 
-  std::unique_ptr<uint64_t> buffers_;
+  std::vector<uint64_t> buffers_;
 
   /* of shape [N][M+1], indexed P_cumsum_[n*(M+1) + m], P_cumsum_ is used
      to store the exclusive cumulative sums of the integerized input probabilities P;
@@ -458,7 +458,6 @@ class CombinedSampler {
         uint32_t p = this_P_buf[m];
         sort_buf[m] = m + (p << M_bits); // keep track of indexes.
       }
-      sort_buf[M] = 0;
       // in CUDA we'll just sort the entire array.  Note, we don't need the
       // sorting algorithm to sort the indexes because we include them manually.
 

@@ -228,17 +228,17 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
 
 def _test_sample_combined_forward_compare():
     B = 1
-    N = 3
+    N = 4
     M = 24
     K = 4
     l = 6.0 * torch.randn(B, N, M)
     l = l.softmax(dim=-1)
     print("p = ", l)
-    l_cuda = l.to(device='cuda')
     rand = torch.randint(2**63 - 1, (B,), device=l.device, dtype=torch.int64)
-    rand_cuda = rand.to(l_cuda.device)
-
     (indexes, indexes_combined, weights) = sample_combined_forward(l, K, False, rand)
+
+    l_cuda = l.to(device='cuda')
+    rand_cuda = rand.to(l_cuda.device)
     (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
 
     print("indexes = ", indexes)
