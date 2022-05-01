@@ -117,7 +117,7 @@ class CombinedSampler {
     // p_bits_ = 15;
 
     // TODO: allocate buffers..
-    uint32_t Kpow2 = (N > 1 ? (K*K) : K),
+    uint32_t Kpow1or2 = (N > 1 ? (K*K) : K),
         size64 = sizeof(uint64_t) / sizeof(uint32_t);
     // the order in which we list these buffers differs from their declaration ordere,
     // because we are trying to keep the expressions for working out addresses, generally
@@ -134,7 +134,7 @@ class CombinedSampler {
         size64 * K + // unreduced_samples_
         (K*N) + // topK_indexes_
         (M+1) * N + // P_cumsum_
-        size64 * Kpow2 + // sort_buf64_, because double the element size
+        size64 * Kpow1or2 + // sort_buf64_, because double the element size
         size64 * (N+1) +  // P_sum_cumprod_
         std::max<uint32_t>((M+(N-1)*K), // sort_buf32_,
                            K*N); // indexes_for_samples_
@@ -155,7 +155,7 @@ class CombinedSampler {
     set_buffer(unreduced_samples_, p, K);
     set_buffer(topK_indexes_, p, K*N);
     set_buffer(P_cumsum_, p, (M+1) * N);
-    set_buffer(sort_buf64_, p, Kpow2);
+    set_buffer(sort_buf64_, p, Kpow1or2);
     set_buffer(P_sum_cumprod_, p, N+1);
     sort_buf32_ = p;
     indexes_for_samples_ = p;
@@ -459,9 +459,9 @@ class CombinedSampler {
       // in CUDA we'll just sort the entire array.  Note, we don't need the
       // sorting algorithm to sort the indexes because we include them manually.
 
-      merge_based_partial_sort_reverse(sort_buf, K, M);
-      //std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<uint32_t>());
-      //std::sort(sort_buf, sort_buf + K, std::greater<uint32_t>());
+      //merge_based_partial_sort_reverse(sort_buf, K, M);
+      std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<uint32_t>());
+      std::sort(sort_buf, sort_buf + K, std::greater<uint32_t>());
     }
     uint64_t *sort_combinations = sort_buf64_;
     uint32_t K_bits = K_bits_;

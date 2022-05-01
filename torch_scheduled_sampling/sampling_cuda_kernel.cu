@@ -32,8 +32,11 @@ __device__ void print_array(IntT *buf, int num_items, const char *name) {
 }
 
 
-// c.f. https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf
-// A simple inclusive scan algorithm.  Require num_items <= blockDim.x.
+/*
+  c.f. https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf
+  A simple inclusive scan algorithm.  Require num_items <= blockDim.x,
+  and num_items must be a power of 2.
+*/
 template <typename IntT>
 __device__ void simple_inclusive_scan(IntT *buf, int num_items) {
   print_array(buf, num_items, "simple-exclusive-scan-at-entry");
@@ -61,8 +64,9 @@ __device__ void simple_inclusive_scan(IntT *buf, int num_items) {
 
 /*
   This function does a partial sort of an array, in reverse order, so that it's
-  as if the array `start..start+input_size-1` is sorted, but we only care about
-  the `start..start+num_keep-1` elements.
+  as if the array `start..start+input_size-1` is sorted, but only
+  the elements numbered `start..start+num_keep-1` will necessarily be
+  correct at the output.
 
   see test_merge() in sorting_ref.py for the original Python code that this was
   based on.  This is not very elegant but is probably enough for now.
@@ -70,6 +74,13 @@ __device__ void simple_inclusive_scan(IntT *buf, int num_items) {
   Caution: this only works correctly if the elements x to be sorted satisfy
   x > (x-1) [not true, for example, for 0 in unsigned arithmetic];
   this is due to the subtraction of 1 in "x_val_mod" below.
+
+  Args:
+        buf: pointer to start of buffer
+        num_keep: number of items we need to be correct at output,
+           must be a power of 2.
+        num_items: number of items in the array, must be a power of 2
+           and >= num_keep.
  */
 template <typename IntT>
 __device__ void merge_based_partial_sort_reverse(
@@ -240,7 +251,8 @@ void sample_combined_forward_kernel(
   int B = probs.size(0);  // batch size
   uint32_t N = probs.size(1),  // num distributions
       M = probs.size(2),  // num classes
-      KpowN = 1 << (K_bits * N);
+      Kpow1or2 = (N > 1 ? (K*K) : K),
+      M_round = (1 << M_bits);  // M rounded up to power of 2.
 
   // For now just use 1 thread, we'll gradually parallelize operations.  The
   // following arrays are all located in shared memory.  Trailing underscore
@@ -257,15 +269,22 @@ void sample_combined_forward_kernel(
       *sorted_topK_cumsums_reduced_ = sorted_topK_cumsums_ + K, // [K]
       *unreduced_samples_ = sorted_topK_cumsums_reduced_ + K; // [K]
   uint32_t *topK_indexes_ = reinterpret_cast<uint32_t*>(unreduced_samples_ + K), // [K*N]
-      *P_cumsum_ = topK_indexes_ + (K*N); // [(M+1) * N]
-  uint64_t *sort_buf64_ = reinterpret_cast<uint64_t*>(P_cumsum_ + (M+1) * N), // [K**N]
-      *P_sum_cumprod_ = sort_buf64_ + KpowN,  // [N+1]
+      *P_cumsum_ = topK_indexes_ + (K*N); // [(M_round+1) * N]
+  uint64_t *sort_buf64_ = reinterpret_cast<uint64_t*>(P_cumsum_ + (M_round+1) * N), // [Kpow1or2]
+      *P_sum_cumprod_ = sort_buf64_ + Kpow1or2,  // [N+1]
       *B_ptr_ = P_sum_cumprod_ + (N+1);  // [1]
   uint32_t *indexes_for_samples_ = reinterpret_cast<uint32_t*>(B_ptr_ + 1), // [K*N]
-      *sort_buf32_ = indexes_for_samples_;  // [M+(N-1)*K], shares memory with indexes_for_samples
+      *sort_buf32_ = indexes_for_samples_;  // [M_round+(N-1)*K], shares memory with indexes_for_samples
 
-  if (threadIdx.x < N) {
-    P_cumsum_[(M+1) * threadIdx.x] = 0;
+
+  {
+    // Zero the P_cumsum_ array.  Actually we only need to zero a subset of
+    // indexes: the first element in each row of (M_round+1) elements, plus
+    // the trailing (M_round-M) elements in each row, but it's easier to just
+    // zero everything.
+    uint32_t P_cumsum_len = (M_round+1) * N;
+    for (int i = threadIdx.x; i < P_cumsum_len; i += blockDim.x)
+      P_cumsum_[i] = 0;
   }
 
   for (int b = blockIdx.x; b < B; b += gridDim.x) {
@@ -307,7 +326,8 @@ void sample_combined_forward_kernel(
 
     for (uint32_t n = 0; n < N; n++) {
       __syncthreads();
-      print_array(P_cumsum_ + n*(M+1), M+1, "P_cumsum, prior to cumsum");
+      print_array(P_cumsum_ + n*(M_round+1), M_round+1,
+                  "P_cumsum, prior to cumsum");
     }
 
     { // ComputeKLargest() in sampling_cpu.cpp.
@@ -323,7 +343,7 @@ void sample_combined_forward_kernel(
 
         sort_buf[m] = (P << M_bits) + m;
 
-        merge_based_partial_sort_reverse(sort_buf, K, M);
+        merge_based_partial_sort_reverse(sort_buf, K, M_round);
 
         // in CUDA we'll just sort the entire array.  Note, we don't need the
         // sorting algorithm to sort the indexes because we include them manually.
@@ -410,9 +430,9 @@ void sample_combined_forward_kernel(
         // Compute inclusive cumulative sum of size M; we already padded on the
         // left with 0, so the effect is the same as exclusive sum.
         uint32_t *this_P = P_cumsum_ + (M+1) * n + 1; // + 1: skip the 0.
-        simple_inclusive_scan(this_P, M);
+        simple_inclusive_scan(this_P, M_round);
 
-        print_array(this_P-1, M+1, "this_P");
+        print_array(this_P-1, M_round+1, "this_P");
       }
       __syncthreads();
       if (threadIdx.x == 0) {
@@ -446,13 +466,6 @@ inline int find_num_bits_for(int n) {
   while ((int(1) << num_bits) < n)
     num_bits++;
   return num_bits;
-}
-
-inline int round_up_to_power_of_two(int n) {
-  int ans = 1;
-  while (ans < n)
-    ans *= 2;
-  return ans;
 }
 
 uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
@@ -531,14 +544,13 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
                         std::min((63/N) - K_bits,  // for when we sort `sort_combinations`.
                                  31 - M_bits)), // for when we sort `sort_buf` in ComputeKLargest()
       M_unique = find_prod_unique_prime_factors(M),
-      M_round = round_up_to_power_of_two(N);
+      M_round = 1 << M_bits;
 
-  // TODO: allocate buffers..
-  int KpowN = 1 << (K_bits * N),
+  int Kpow1or2 = (N > 1 ? (K*K) : K),
       size64 = sizeof(uint64_t),
       size32 = sizeof(uint32_t);
   int grid_dim_x = std::min<int>(B, 256),
-      block_dim_x = std::max(M, KpowN);  // M will normally be larger.
+      block_dim_x = std::max(M, Kpow1or2);  // M will normally be larger.
 
 
 
@@ -556,11 +568,11 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       size64 * K + // sorted_topK_cumsums_reduced_
       size64 * K + // unreduced_samples_
       size32 * (K*N) + // topK_indexes_
-      size32 * (M+1) * N + // P_cumsum_
-      size64 * KpowN + // sort_buf64_, because double the element size
+      size32 * (M_round+1) * N + // P_cumsum_
+      size64 * Kpow1or2 + // sort_buf64_, because double the element size
       size64 * (N+1) +  // P_sum_cumprod_
       size64 * 1 + // B_.
-      size32 * std::max<int>((M+(N-1)*K), // sort_buf32_,
+      size32 * std::max<int>((M_round+(N-1)*K), // sort_buf32_,
                              K*N); // indexes_for_samples_
 
 
