@@ -227,8 +227,8 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
 
 
 def _test_sample_combined_forward_compare():
-    B = 1  # so only 1 is printed
-    N = 2
+    B = 1
+    N = 3
     M = 24
     K = 4
     l = 6.0 * torch.randn(B, N, M)
@@ -250,6 +250,10 @@ def _test_sample_combined_forward_compare():
     print("weights_cuda = ", weights_cuda)
     assert torch.all((weights_cuda.sum(dim=-1) - 1.0).abs() < 0.1)
 
+    assert torch.all(indexes == indexes_cuda.to('cpu'))
+    assert torch.all(indexes_combined == indexes_combined_cuda.to('cpu'))
+    assert torch.all((weights - weights_cuda.to('cpu')).abs() < 0.01)
+
 def _test_sample_combined_forward():
     for device in [torch.device('cpu'), torch.device('cuda')]:
         B = 2
@@ -267,7 +271,7 @@ def _test_sample_combined_forward():
 
 
 def _test_sample_combined_forward_average():
-    B = 2
+    B = 1
     N = 2
     M = 32
     K = 8
