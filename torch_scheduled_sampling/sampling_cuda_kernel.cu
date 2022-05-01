@@ -22,13 +22,15 @@ extern __shared__ char extern_buf[];
 
 template <typename IntT>
 __device__ void print_array(IntT *buf, int num_items, const char *name) {
+  /*
+   __syncthreads();
   if (threadIdx.x == 0) {
     printf("%s = [", name);
     for (int i = 0; i < num_items; i++) {
       printf("%ld ",  (long int)buf[i]);
     }
     printf("]\n");
-  }
+    }*/
 }
 
 
@@ -342,11 +344,12 @@ void sample_combined_forward_kernel(
       }
     }
 
+    /*
     for (uint32_t n = 0; n < N; n++) {
       __syncthreads();
       print_array(P_cumsum_ + n*(M+1), M+1,
                   "P_cumsum, prior to cumsum");
-    }
+                  }*/
 
     { // compute_k_largest() in sampling_cpu.cpp.
       // This loop populates sort_buf32_ with the top-K probabilities
@@ -573,6 +576,14 @@ void sample_combined_forward_kernel(
       }
       __syncthreads();
       simple_inclusive_scan(sorted_topK_delta_P_cumsum_, K);
+
+      if (threadIdx.x == 0) {
+        uint64_t Psum = P_sum_cumprod_[N],
+            B = *B_,
+            delta_P_sum = sorted_topK_delta_P_cumsum_[K-1] + sorted_topK_delta_P_[K-1],
+            err = Psum - delta_P_sum - (B * K);
+        assert(err == 0); // this is a canary in
+      }
 
       {
         __syncthreads(); // TEMP

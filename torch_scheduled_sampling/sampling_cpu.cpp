@@ -27,13 +27,16 @@ template <typename IterType> int find_class(
 }
 
 
+
 template <typename IntT>
 void print_array(IntT *buf, int num_items, const char *name) {
+  /*
   printf("%s = [", name);
   for (int i = 0; i < num_items; i++) {
     printf("%ld ",  (long)buf[i]);
   }
   printf("]\n");
+  */
 }
 
 
@@ -48,7 +51,7 @@ void print_array(IntT *buf, int num_items, const char *name) {
   Caution: this only works correctly if the elements x to be sorted satisfy
   x > (x-1) [not true, for example, for 0 in unsigned arithmetic];
   this is due to the subtraction of 1 in "x_val_mod" below.
- */
+
 template <typename IntT> void merge_based_partial_sort_reverse(
     IntT* start, uint32_t num_keep, uint32_t num_items) {
   // num_keep == max_elements_needed in python.
@@ -94,6 +97,7 @@ template <typename IntT> void merge_based_partial_sort_reverse(
   }
   print_array(start, num_items, "merge-sort-at-exit");
 }
+*/
 
 
 
@@ -491,15 +495,15 @@ class CombinedSampler {
         }
       }
       // work out the K-best combinations so far.
-      //std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + (K*K),
-      //                 std::greater<uint64_t>());
-      merge_based_partial_sort_reverse(sort_combinations, K, K*K);
+      std::nth_element(sort_combinations, sort_combinations + K, sort_combinations + (K*K),
+                       std::greater<uint64_t>());
+      // merge_based_partial_sort_reverse(sort_combinations, K, K*K);
     }
-    if (N == 1) {
-      merge_based_partial_sort_reverse(sort_combinations, K, K);
-    }
-    print_array(sort_combinations, K, "sort-combinations-n=N");
-    //std::sort(sort_combinations, sort_combinations + K, std::greater<uint64_t>());
+    //if (N == 1) {
+    //  merge_based_partial_sort_reverse(sort_combinations, K, K);
+    //}
+    //print_array(sort_combinations, K, "sort-combinations-n=N");
+    std::sort(sort_combinations, sort_combinations + K, std::greater<uint64_t>());
 
     uint32_t M_mask = (1 << M_bits) - 1; // M may not be a power of 2, can't use M-1.
     for (uint32_t k = 0; k < K; k++) {  // we'll parallelize over k on GPU.
