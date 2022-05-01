@@ -231,7 +231,7 @@ def _test_sample_combined_forward_compare():
     N = 2
     M = 24
     K = 4
-    l = 3.0 * torch.randn(B, N, M)
+    l = 6.0 * torch.randn(B, N, M)
     l = l.softmax(dim=-1)
     print("p = ", l)
     l_cuda = l.to(device='cuda')

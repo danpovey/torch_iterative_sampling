@@ -251,7 +251,6 @@ void sample_combined_forward_kernel(
   int B = probs.size(0);  // batch size
   uint32_t N = probs.size(1),  // num distributions
       M = probs.size(2),  // num classes
-      Kpow1or2 = (N > 1 ? (K*K) : K),
       M_round = (1 << M_bits);  // M rounded up to power of 2.
 
   // For now just use 1 thread, we'll gradually parallelize operations.  The
@@ -270,11 +269,17 @@ void sample_combined_forward_kernel(
       *unreduced_samples_ = sorted_topK_cumsums_reduced_ + K; // [K]
   uint32_t *topK_indexes_ = reinterpret_cast<uint32_t*>(unreduced_samples_ + K), // [K*N]
       *P_cumsum_ = topK_indexes_ + (K*N); // [(M_round+1) * N]
-  uint64_t *sort_buf64_ = reinterpret_cast<uint64_t*>(P_cumsum_ + (M_round+1) * N), // [Kpow1or2]
-      *P_sum_cumprod_ = sort_buf64_ + Kpow1or2,  // [N+1]
-      *B_ptr_ = P_sum_cumprod_ + (N+1);  // [1]
-  uint32_t *indexes_for_samples_ = reinterpret_cast<uint32_t*>(B_ptr_ + 1), // [K*N]
-      *sort_buf32_ = indexes_for_samples_;  // [M_round+(N-1)*K], shares memory with indexes_for_samples
+  uint64_t *P_sum_cumprod_ = reinterpret_cast<uint64_t*>(P_cumsum_ + (M_round+1) * N), // [N+1]
+      *B_ = P_sum_cumprod_ + (N+1);  // [1]
+  uint32_t *indexes_for_samples_ = reinterpret_cast<uint32_t*>(B_ + 1); // [K*N]
+  // sort_buf32_ shares memory with indexes_for_samples_.  It is of length M +
+  // K*(N-1).
+  uint32_t *sort_buf32_ = indexes_for_samples_;
+  // sort_buf64_ is of size (K*K).  It
+  // does not overlap with the first (K*N) elements of sort_buf32_, or with indexes_for_samples_,
+  // which is the same size (K*N); but it overlaps with later elements of sort_buf32_.
+  uint64_t *sort_buf64_ = reinterpret_cast<uint64_t*>(sort_buf32_ + (K*N));
+
 
 
   {
@@ -294,7 +299,7 @@ void sample_combined_forward_kernel(
     uint64_t rand_source = rand[b];
 
 
-    { // LoadP()
+    { // load_p() in sampling_cpu.cpp
       for (uint32_t n = 0; n < N; n++) {
         uint32_t multiple = 1 + M_unique * (rand_source >> (M_bits * n)) % (M / M_unique);
         if(threadIdx.x == 0) {
@@ -330,8 +335,8 @@ void sample_combined_forward_kernel(
                   "P_cumsum, prior to cumsum");
     }
 
-    { // ComputeKLargest() in sampling_cpu.cpp.
-      // This next loop populates sort_buf32_ with the top-K probabilities
+    { // compute_k_largest() in sampling_cpu.cpp.
+      // This loop populates sort_buf32_ with the top-K probabilities
       // for each source distribution.
       for (uint32_t n = 0; n < N; n++) {
         __syncthreads();
@@ -423,7 +428,7 @@ void sample_combined_forward_kernel(
       print_array(topK_P_, K, "topK_P_");
     }
 
-    {  // This next block corresponds to ComputePCumsum() in sampling_cpu.cpp.
+    {  // This block corresponds to compute_p_cumsum() in sampling_cpu.cpp.
       // P_cumsum_ currently stores integerized probs P, preceded by a zero; after
       // this function it will store the [exclusive] cumulative sum, of size M+1.
       for (uint32_t n = 0; n < N; n++) {
@@ -444,6 +449,92 @@ void sample_combined_forward_kernel(
         P_sum_cumprod_[N] = P_sum_cumprod;
       }
       print_array(P_sum_cumprod_, (N+1), "P_sum_cumprod_");
+    }
+
+    { // This block corresponds to compute_beta() in sampling_cpu.cpp, and
+      // compute_bets_prods() in sampling_ref.py.  It computes B which
+      // is integerized beta.
+      // outputs: B_, and the array topK_delta_P_.
+      __syncthreads();
+      uint64_t Psum = P_sum_cumprod_[N];   // This is the total probability mass.
+      // is_ok will be 1 if this i the chosen k, 0 otherwise, undefined if threadIdx.x >= K.
+      uint32_t is_ok;
+      uint32_t remainder_k;
+      uint64_t this_P;
+      if (threadIdx.x < K) {
+        uint32_t k = threadIdx.x;
+        uint64_t prev_P = (k == 0 ? (~((uint64_t)0)) : // infinity
+                           topK_P_[k-1]),
+            S1 = Psum - topK_P_exclusive_sum_[k],  // corresponds to 1-s_k in the math.
+            B_k = S1 / (K-k);
+        this_P = topK_P_[k];
+        remainder_k = S1 % (K-k);
+        is_ok = prev_P > B_k && this_P <= B_k;
+        if (is_ok) { // should happen for exactly one k!!
+          *B_ = B_k;
+        }
+      }
+      __syncthreads();
+      if (threadIdx.x < K) {
+        uint32_t k = threadIdx.x;
+        uint64_t B = *B_;  // read from the one
+        // The following is equivalent to the following in sampling_cpu.cpp:
+        // delta_P = (remainder * (k == chosen_k)) + P - std::min<uint64_t>(P, B);
+        topK_delta_P_[k] = (this_P > B) * (this_P - B)  + (is_ok * remainder_k);
+      }
+      __syncthreads(); print_array(topK_delta_P_, K, "topK_delta_P_");
+    }
+
+    { // this block corresponds to compute_unreduced_samples() in sampling_cpu.cpp.
+
+      uint64_t to_sum;
+      if (threadIdx.x < K * K) {
+        // k2 corresponds to the output samples, k to the top-K probs
+        uint32_t k2 = threadIdx.x % K,
+            k = threadIdx.x / K;
+        uint64_t B = *B_;
+
+        // each k2 has a different `rand`.  Treat rand as "reduced" at this
+        // point, meaning it's in a space where disallowed regions (of size,
+        // delta_P_[k]), have been removed.
+        uint64_t rand = (rand_source % B) + B * k2;
+
+
+        uint64_t reduced_cumsum_k = sorted_topK_cumsums_reduced_[k],
+            delta_P =  sorted_topK_delta_P_[k];
+        to_sum = (rand >= reduced_cumsum_k) * delta_P;
+      }
+
+
+        // uint64_t *delta_P_buf_ = M_buf64_;
+      //        uint64_t delta_P_sum = 0;  // we'll compute this via a reduction in CUDA.
+      //                           // assume K is power of 2.
+
+      /*
+
+        delta_P_sum += (rand >= reduced_cumsum_k) * delta_P;
+
+        uint64_
+
+      // the following is compute_unreduced_samples() in python.
+      // Note: we should be able to parallelize over (k2, k) pairs, summing
+      // using some kind of logarithmic reduction.
+      for (uint32_t k = 0; k < K; k++) {
+        uint64_t reduced_cumsum_k = sorted_topK_cumsums_reduced_[k],
+            delta_P =  sorted_topK_delta_P_[k];
+        delta_P_sum += (rand >= reduced_cumsum_k) * delta_P;
+      }
+      uint64_t rand_shifted = rand + delta_P_sum;
+      unreduced_samples_[k2] = rand_shifted;
+
+      for (uint32_t k = 0; k < K; k++) { // check_unreduced_samples()
+        uint64_t topK_disallowed_start = sorted_topK_cumsums_[k],
+            topK_disallowed_end = topK_disallowed_start + sorted_topK_delta_P_[k];
+        TORCH_CHECK(!(rand_shifted >= topK_disallowed_start &&
+                      rand_shifted < topK_disallowed_end));
+        TORCH_CHECK(rand_shifted < P_sum_cumprod_[N]);
+      }
+      } */
     }
   }
 }
@@ -550,7 +641,7 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       size64 = sizeof(uint64_t),
       size32 = sizeof(uint32_t);
   int grid_dim_x = std::min<int>(B, 256),
-      block_dim_x = std::max(M, Kpow1or2);  // M will normally be larger.
+      block_dim_x = std::max(M, K*K);
 
 
 
@@ -572,8 +663,9 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       size64 * Kpow1or2 + // sort_buf64_, because double the element size
       size64 * (N+1) +  // P_sum_cumprod_
       size64 * 1 + // B_.
-      size32 * std::max<int>((M_round+(N-1)*K), // sort_buf32_,
-                             K*N); // indexes_for_samples_
+      std::max<int>(size32 * ((K-1)*N + M),  // sort_buf32_
+                    size32 * K*N + size64 * K*K); // indexes_for_samples_+sort_buf64_
+
 
 
   AT_DISPATCH_FLOATING_TYPES(probs.scalar_type(), "sample_combined_cpu_forward_dispatch", ([&] {

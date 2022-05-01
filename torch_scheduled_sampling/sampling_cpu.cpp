@@ -561,7 +561,7 @@ class CombinedSampler {
     for (k = 0; k < K; k++) {  // We can parallelize over k.
       // We are trying out to see whether we get an admissible B (i.e.,
       // integerized beta) value with exactly k top probabilities exceeding B.  Exactly
-      // one such k index will "work".  We can parallelize over this "k".
+      // one such k index will "work".
       uint64_t prev_P = (k == 0 ? (~((uint64_t)0)) : // infinity
                          topK_P_[k-1]),
           this_P = topK_P_[k];
@@ -588,9 +588,9 @@ class CombinedSampler {
     }
     uint64_t err = Psum - delta_P_sum - (B * K);
     TORCH_CHECK(err == 0);
-    // outputs: B_, and the arrays delta_P_ and topK_delta_P.
+    // outputs: B_, and the array topK_delta_P_.
+    print_array(topK_delta_P_, K, "topK_delta_P_");
   }
-
 
   void compute_topk_cumsums() {
     // Computes top-K cumulative sums; these are the cumulative sums of probabilities of
