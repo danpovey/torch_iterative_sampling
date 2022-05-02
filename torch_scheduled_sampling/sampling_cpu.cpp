@@ -99,6 +99,14 @@ template <typename IntT> void merge_based_partial_sort_reverse(
 }
 */
 
+// returns num_bits >= 1 such that (1 << num_bits) >= n.
+inline uint32_t find_num_bits_for(uint32_t n) {
+  uint32_t num_bits = 1;
+  while ((uint32_t(1) << num_bits) < n)
+    num_bits++;
+  return num_bits;
+}
+
 
 
 class CombinedSampler {
@@ -108,8 +116,8 @@ class CombinedSampler {
       M_unique_(find_prod_unique_prime_factors(M)) {
     TORCH_CHECK(N < 5);
     TORCH_CHECK((K&(K-1)) == 0);  // require K is a power of 2.
-    M_bits_ = FindNumBitsFor(M);
-    K_bits_ = FindNumBitsFor(K);
+    M_bits_ = find_num_bits_for(M);
+    K_bits_ = find_num_bits_for(K);
 
     p_bits_ = std::min(uint32_t(54) / N, // so product of N of these is
                                          // comfortably less than 64, search for
@@ -179,6 +187,10 @@ class CombinedSampler {
     p += size;
   }
 
+  float epsilon() {
+    uint32_t N = N_, K_nthroot = 1 << ((K_bits_ + N - 1) / N);
+    return float(K_nthroot) / float(1 << p_bits_);
+  }
 
   // returns a pseudo random number coprime to M_, as a function of n.
   // this is deterministic within a batch.
@@ -583,7 +595,7 @@ class CombinedSampler {
         break;
       }
     }
-    TORCH_CHECK(B != 0);
+    TORCH_CHECK(B != 0, "Make sure your input is properly normalized");
     B_ = B;
     TORCH_CHECK(k < K);  // check that we broke from the loop.
 
@@ -729,15 +741,6 @@ class CombinedSampler {
     }
     print_array(indexes_for_samples_, K*N, "indexes_for_samples_");
   }
-
-  // returns num_bits >= 1 such that (1 << num_bits) >= n.
-  inline uint32_t FindNumBitsFor(uint32_t n) {
-    uint32_t num_bits = 1;
-    while ((uint32_t(1) << num_bits) < n)
-      num_bits++;
-    return num_bits;
-  }
-
 };
 
 
@@ -767,7 +770,7 @@ class CombinedSampler {
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
 
-    Returns: (indexes, combined_indexes, weights)
+    Returns: (indexes, combined_indexes, weights, epsilon)
        indexes: of shape (B, K, N), for each of K samples from a distribution it contains
             an N-tuple of indexes saying which combination of indexes from the
             component distributions were sampled.
@@ -777,6 +780,10 @@ class CombinedSampler {
             which will equal max(p, beta) for a beta specific to the batch element,
             i.e. to the product of the distributions (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
+       epsilon: this is only needed by calling code if input_is_log == False.
+            Of shape (,), i.e. a scalar, this is a small value that will be
+            used in the backward pass to prevent division by zero; it corresponds
+            to the amount we added to the distribution in the forward pass before sampling.
 */
 std::vector<torch::Tensor>
 sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
@@ -807,6 +814,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
       combined_indexes = torch::empty({B, K}, long_opts);
 
   torch::Tensor weights = torch::empty({B, K}, real_opts);
+  float epsilon;
 
   AT_DISPATCH_FLOATING_TYPES(probs.scalar_type(), "sample_combined_cpu_forward_dispatch", ([&] {
         auto probs_a = probs.packed_accessor32<scalar_t, 3>();  // scalar_t comes from the macro.
@@ -816,7 +824,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
         auto combined_indexes_a = combined_indexes.packed_accessor32<int64_t, 2>();
 
         CombinedSampler sampler(N, M, K);
-
+        epsilon = sampler.epsilon();
         for (int b = 0; b < B; b++) {
           uint64_t rand = uint64_t(rand_a[b]);
           //          torch_scheduled_sampling/sampling_cpu.cpp:563:55: error: no matching function for call to 'CombinedSampler::LoadP(uint64_t&, bool&, at::TensorAccessor<double, 2, at::DefaultPtrTraits, int>)'
@@ -827,8 +835,11 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
           sampler.get_indexes_for_samples(indexes_a[b], combined_indexes_a[b]);
         }
       }));
-  //  std::cout << "combined_indexes = " << combined_indexes;
-  return std::vector<torch::Tensor>({indexes, combined_indexes, weights});
+
+  // if Real == torch::Half this will round to zero but we'll never use it in that
+  // case as we require input_is_log == True for half precision.
+  torch::Tensor epsilon_tensor = torch::full({}, epsilon, real_opts);
+  return std::vector<torch::Tensor>({indexes, combined_indexes, weights, epsilon_tensor});
 }
 
 

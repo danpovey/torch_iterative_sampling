@@ -66,7 +66,7 @@ _max_bits = 54  # used in sample_combined_forward and sample_combined_backward,
                 # see comment in sample_combined_forward.
 
 def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
-                            rand: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+                            rand: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
     """
     Sample from a distribution that is the product of softmaxes.  We will sample
     K *distinct* samples.  This entails using sampling weights of the form min(1, p/beta)
@@ -78,8 +78,10 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
          K: An integer, the number of samples required, with 0 < K < N
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
+       rand: of shape (*,), containing random numbers in 0..2**63-1, this is provided
+           for testing purposes, you will not normally need to pass this in.
 
-    Returns: (indexes, combined_indexes, weights)
+    Returns: (indexes, combined_indexes, weights, epsilon)
        indexes: of shape (*, K, N), for each of K samples from a distribution it contains
             an N-tuple of indexes saying which combination of indexes from the
             component distributions were sampled.
@@ -90,8 +92,8 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
             which will equal max(p, beta) for a beta specific to the batch element,
             i.e. to the product of the distributions (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
-        rand: of shape (*,), containing random numbers in 0..2**63-1, this is provided
-           for testing purposes, you will not normally need to pass this in.
+       epsilon: of shape (,), i.e. a scalar, contains a small value that
+           can be used to prevent division by zero in the backward pass.
     """
     p = p.detach()  # call sample_combined() if you need derivatives.
     N = p.shape[-2]
@@ -106,15 +108,15 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
         rand = torch.randint(2**63 - 1, (B,), device=p.device, dtype=torch.int64)
     else:
         rand = rand.flatten()
-    (indexes, indexes_combined, weights) = _sample_combined_forward_dispatcher(p, rand, K, input_is_log)
+    (indexes, indexes_combined, weights, epsilon) = _sample_combined_forward_dispatcher(p, rand, K, input_is_log)
     star = pshape[:-2]
     indexes = indexes.reshape(*star, K, N)
     indexes_combined = indexes_combined.reshape(*star, K)
     weights = weights.reshape(*star, K)
-    return (indexes, indexes_combined, weights)
+    return (indexes, indexes_combined, weights, epsilon)
 
 def sample_combined_backward(p: Tensor, input_is_log: bool, indexes: Tensor,
-                             weights: Tensor, weights_grad: Tensor) -> Tensor:
+                             weights: Tensor, epsilon: Tensor, weights_grad: Tensor) -> Tensor:
     """
     Backward for sample_combined(); see sample_combined_forward() for detailed docs on
     the forward pass.  Notice that we don't use Torch's inbuilt autograd for this;
@@ -143,6 +145,8 @@ def sample_combined_backward(p: Tensor, input_is_log: bool, indexes: Tensor,
          be normalized log-probs, e.g. the output of log_softmax.
       weights: the `weights` output of simple_combined_forward, of shape (*, K)
       indexes:  the `indexes` output of simple_combined_forward, of shape (*, K, N)
+      epsilon: of shape (,), i.e. a scalar, contains a small value that can
+           be used to prevent division by zero in backprop if input_is_log is False.
    weights_grad: the loss-function gradient w.r.t the output weights, of shape
                (*, K)
     """
@@ -163,9 +167,7 @@ def sample_combined_backward(p: Tensor, input_is_log: bool, indexes: Tensor,
             raise ValueError("For float16 input you have to use log-space for input probabilities, "
                              "require input_is_log=True")
         num_bits_per_sample = _max_bits // N
-        # 2**-num_bits_per_sample is very small, so don't worry about renormalizing p.
-        # This is just to stop division by zero.
-        p_smoothed = p + (2.0**-num_bits_per_sample)
+        p_smoothed = p + epsilon
         log_p_grad.divide_(p_smoothed)
         return log_p_grad
     return log_p_grad
@@ -177,17 +179,17 @@ class SampleCombinedFunction(torch.autograd.Function):
     @custom_fwd
     def forward(ctx, p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
         with torch.no_grad():
-            indexes, combined_indexes, weights = sample_combined_forward(p, K, input_is_log)
-        ctx.save_for_backward(p, indexes, weights)
+            indexes, combined_indexes, weights, epsilon = sample_combined_forward(p, K, input_is_log)
+        ctx.save_for_backward(p, indexes, weights, epsilon)
         ctx.input_is_log = input_is_log
         return indexes, combined_indexes, weights
 
     @staticmethod
     @custom_bwd
     def backward(ctx, indexes_grad: Optional[Tensor], combined_indexes_grad: Optional[Tensor], weights_grad: Optional[Tensor]) -> Tuple[Tensor, None, None]:
-        p, indexes, weights = ctx.saved_tensors
+        p, indexes, weights, epsilon = ctx.saved_tensors
         p_grad = sample_combined_backward(p, ctx.input_is_log, indexes,
-                                          weights, weights_grad)
+                                          weights, epsilon, weights_grad)
         return p_grad, None, None
 
 
@@ -241,16 +243,17 @@ def _test_sample_combined_forward_compare():
         l = 6.0 * torch.randn(B, T, N, M)
         l = l.softmax(dim=-1)
         rand = torch.randint(2**63 - 1, (B, T), device=l.device, dtype=torch.int64)
-        (indexes, indexes_combined, weights) = sample_combined_forward(l, K, False, rand)
+        (indexes, indexes_combined, weights, epsilon) = sample_combined_forward(l, K, False, rand)
         print(f"B={B}, T={T}, N={N}, M={M}, K={K}")
 
         l_cuda = l.to(device='cuda')
         rand_cuda = rand.to(l_cuda.device)
         try:
-            (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
+            (indexes_cuda, indexes_combined_cuda, weights_cuda, epsilon_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
             assert torch.all((weights - weights_cuda.to('cpu')).abs() < 0.01)
             assert torch.all(indexes == indexes_cuda.to('cpu'))
             assert torch.all(indexes_combined == indexes_combined_cuda.to('cpu'))
+            assert epsilon == epsilon_cuda.to('cpu')
         except:
             print("indexes = ", indexes)
             print("indexes_combined = ", indexes_combined)
@@ -271,16 +274,18 @@ def _test_sample_combined_forward_compare0():
         l = 6.0 * torch.randn(B, N, M)
         l = l.softmax(dim=-1)
         rand = torch.randint(2**63 - 1, (B,), device=l.device, dtype=torch.int64)
-        (indexes, indexes_combined, weights) = sample_combined_forward(l, K, False, rand)
+        (indexes, indexes_combined, weights, epsilon) = sample_combined_forward(l, K, False, rand)
         print(f"B={B}, N={N}, M={M}, K={K}")
 
         l_cuda = l.to(device='cuda')
         rand_cuda = rand.to(l_cuda.device)
 
-        (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
+        (indexes_cuda, indexes_combined_cuda, weights_cuda,
+         epsilon_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
         print("indexes = ", indexes)
         print("indexes_combined = ", indexes_combined)
         print("weights = ", weights)
+        print("epsilon = ", epsilon)
         assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
         print("indexes_cuda = ", indexes_cuda)
         print("indexes_combined_cuda = ", indexes_combined_cuda)
@@ -289,7 +294,7 @@ def _test_sample_combined_forward_compare0():
         assert torch.all((weights - weights_cuda.to('cpu')).abs() < 0.01)
         assert torch.all(indexes == indexes_cuda.to('cpu'))
         assert torch.all(indexes_combined == indexes_combined_cuda.to('cpu'))
-
+        assert epsilon == epsilon_cuda
 
 def _test_sample_combined_forward():
     for device in [torch.device('cpu'), torch.device('cuda')]:
@@ -300,10 +305,11 @@ def _test_sample_combined_forward():
         l = 3.0 * torch.randn(B, N, M, device=device)
         l = l.log_softmax(dim=-1)
         print("p = ", l.exp())
-        (indexes, indexes_combined, weights) = sample_combined_forward(l, K, True)
+        (indexes, indexes_combined, weights, epsilon) = sample_combined_forward(l, K, True)
         print("indexes = ", indexes)
         print("indexes_combined = ", indexes_combined)
         print("weights = ", weights)
+        print("epsilon = ", epsilon)
         assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
 
 
@@ -322,8 +328,7 @@ def _test_sample_combined_forward_average():
     for _ in range(num_samples):
         # weights: (B, K)
         # indexes: (B, K, N)
-        indexes, indexes_combined, weights = sample_combined_forward(l, K, True)
-
+        indexes, indexes_combined, weights, epsilon = sample_combined_forward(l, K, True)
         sampled_p = torch.zeros_like(l)
         weights_expanded = weights.unsqueeze(-2).expand(*weights.shape[:-1], N, K)
         sampled_p.scatter_add_(dim=-1, index=indexes.transpose(-2, -1),
@@ -346,8 +351,7 @@ def _test_sample_combined_mean():
         for _ in range(num_samples):
             # weights: (1, 2, K)
             # indexes: (1, 2, K, N)
-            indexes, combined_indexes, weights = sample_combined_forward(p, K, True)
-
+            indexes, combined_indexes, weights, epsilon = sample_combined_forward(p, K, True)
             sampled_p = torch.zeros_like(p)
             weights_expanded = weights.unsqueeze(-2).expand(*weights.shape[:-1], N, K)
             sampled_p.scatter_add_(dim=-1, index=indexes.transpose(-2, -1),
@@ -358,9 +362,45 @@ def _test_sample_combined_mean():
 
         print("max err = ", (p.exp()-avg_p).abs().max())
 
+def _get_num_iters(func) -> int:
+    # finds how many times we can call func() in 0.1 second.
+    import time
+    max_time = 0.2
+    num_iters = 0
+    start_time = time.perf_counter()
+    while time.perf_counter() - start_time < max_time:
+        func()
+        num_iters = num_iters + 1
+    return num_iters
+
+def _test_sample_combined_speed():
+    B = 512
+    M = 256
+    N = 2
+    K = 16
+    l = 3.0 * torch.randn(B, N, M)
+    l = l.log_softmax(dim=-1)  # normalize.
+
+    sample_combined_forward_test = lambda : sample_combined_forward(l, K, True)
+
+    num_iters = _get_num_iters(sample_combined_forward_test)
+    print(f"Num-iters in 0.2 sec on CPU with B={B}, M={M}, N={N}, K={K} {num_iters}")
+    l = l.to('cuda')
+    num_iters = _get_num_iters(sample_combined_forward_test)
+    print(f"Num-iters in 0.2sec on GPU with B={B}, M={M}, N={N}, K={K} {num_iters}")
+
+    import sampling_ref
+    l = l.to('cpu')
+    sample_combined_forward_ref_test = lambda : sampling_ref.sample_combined(l, K, True)
+    num_iters = _get_num_iters(sample_combined_forward_ref_test)
+    print(f"[sampling_ref.py]: Num-iters in 0.2sec on CPU with B={B}, M={M}, N={N}, K={K} {num_iters}")
+    l = l.to('cuda')
+    num_iters = _get_num_iters(sample_combined_forward_ref_test)
+    print(f"[sampling_ref.py]: Num-iters in 0.2sec on GPU with B={B}, M={M}, N={N}, K={K} {num_iters}")
 
 
 if __name__ == '__main__':
+    _test_sample_combined_speed()
     _test_sample_combined_forward_compare()
     _test_sample_combined_forward()
     _test_sample_combined_forward_average()

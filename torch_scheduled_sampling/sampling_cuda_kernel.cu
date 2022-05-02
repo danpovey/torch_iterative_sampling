@@ -826,6 +826,8 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       M_round = 1 << M_bits,
       K_nthroot = 1 << ((K_bits + N - 1) / N);  // such that (K_nthroot**N) >= K,
 
+  float epsilon = float(K_nthroot) / float(1 << p_bits);
+
   int size64 = sizeof(uint64_t),
       size32 = sizeof(uint32_t);
   int grid_dim_x = std::min<int>(B, 256),
@@ -864,5 +866,8 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       }));
   gpuErrchk(cudaGetLastError());
 
-  return std::vector<torch::Tensor>({indexes, combined_indexes, weights});
+  // if Real == torch::Half this will round to zero but we'll never use it in that
+  // case as we require input_is_log == True for half precision.
+  torch::Tensor epsilon_tensor = torch::full({}, epsilon, real_opts);
+  return std::vector<torch::Tensor>({indexes, combined_indexes, weights, epsilon_tensor});
 }

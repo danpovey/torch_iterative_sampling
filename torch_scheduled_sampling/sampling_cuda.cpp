@@ -37,6 +37,10 @@
             which will equal max(p, beta) for a beta specific to the batch element,
             i.e. to the product of the distributions (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
+       epsilon: this is only needed by calling code if input_is_log == False.
+            Of shape (,), i.e. a scalar, this is a small value that will be
+            used in the backward pass to prevent division by zero; it corresponds
+            to the amount we added to the distribution in the forward pass before sampling.
 */
 std::vector<torch::Tensor>
 sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
