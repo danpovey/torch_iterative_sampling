@@ -501,6 +501,15 @@ def get_weights_for_samples(P: Tensor,
     return ans
 
 
+def _nth_root_k(K: int, N: int) -> int:
+    kbits = 1
+    while (1 << kbits) < K:
+        kbits += 1
+    kbits = (kbits + N - 1) // N
+    ans = (1 << kbits)
+    assert (ans ** N) >= K
+    return ans
+
 _max_bits = 54  # used in sample_combined_forward and sample_combined_backward,
                 # see comment in sample_combined_forward.
 
@@ -557,10 +566,15 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tens
     p = torch.gather(p, dim=-1, index=rand_perm_indexes)
 
 
-    # the + 1 is because we need all elements of P to be nonzero (this will avoid
-    # some nasty edge cases)  .to(torch.float32) is because we can't multiply
-    # by such a large number in half precision
-    P = (p.to(torch.float32) * (2**(num_bits_per_sample)) + 1).to(dtype=torch.int64)
+    # the + nth_root_k is because: (a) to prevent zero probs, which causes all
+    # kinds of nasty edge cases, (b) it must be large enough that "remainder_k",
+    # which could be as large as K-2 in the cases that we are worried about,
+    # does not exceed the k'th largest product of probs.  Ensuring products of
+    # probs are at least K satisfies this.
+    # to(torch.float32) is because we can't multiply by such a large number in
+    # half precision
+    epsilon = _nth_root_k(K, N)
+    P = (p.to(torch.float32) * (2**(num_bits_per_sample)) + epsilon).to(dtype=torch.int64)
     values, indexes = compute_k_largest(P, K);
     prod_values, prod_indexes = compute_products(values, indexes)
 
@@ -680,9 +694,11 @@ def sample_combined_backward(p: Tensor, input_is_log: bool, indexes: Tensor,
     where q is the sparse output of the forward pass.  In log-space, this is just
     equivalent to log_p_grad = log_output_grad.
     In non-log space, division by p could lead to infinite output if p is zero;
-    in the forward pass we smoothed p by adding 2**-(num_bits_per_sample), and
+    in the forward pass we smoothed p by adding
+           _nth_root_k(K,N) * 2**-(num_bits_per_sample),
+    and
     if you work it out, the backprop rule correcting for this would just become
-          p_grad = q / (p + 2**-(num_bits_per_sample) * output_grad
+          p_grad = q / (p + _nth_root_k(K,N) * 2**-(num_bits_per_sample) * output_grad
 
     Args:
          p: the probabilities as used in the forward pass, of shape (*, N, M)
@@ -710,9 +726,9 @@ def sample_combined_backward(p: Tensor, input_is_log: bool, indexes: Tensor,
             raise ValueError("For float16 input you have to use log-space for input probabilities, "
                              "require input_is_log=True")
         num_bits_per_sample = _max_bits // N
-        # 2**-num_bits_per_sample is very small, so don't worry about renormalizing p.
+        # _nth_root_k(K, N) * (2**-num_bits_per_sample) is very small, so don't worry about renormalizing p.
         # This is just to stop division by zero.
-        p_smoothed = p + (2.0**-num_bits_per_sample)
+        p_smoothed = p + (_nth_root_k(K, N) * (2.0**-num_bits_per_sample))
         log_p_grad.divide_(p_smoothed)
         return log_p_grad
     return log_p_grad

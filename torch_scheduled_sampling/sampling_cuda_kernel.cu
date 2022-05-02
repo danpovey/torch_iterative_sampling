@@ -30,7 +30,7 @@ __device__ void print_array(IntT *buf, int num_items, const char *name) {
       printf("%ld ",  (long int)buf[i]);
     }
     printf("]\n");
-    }*/
+    } */
 }
 
 
@@ -256,7 +256,8 @@ void sample_combined_forward_kernel(
     torch::PackedTensorAccessor32<int64_t, 2> combined_indexes,     // [B][K]
     torch::PackedTensorAccessor32<Real, 2> weights,     // [B][K]
     uint32_t K, bool input_is_log, uint32_t p_bits,
-    uint32_t M_bits, uint32_t K_bits, uint32_t M_unique) {
+    uint32_t M_bits, uint32_t K_bits, uint32_t M_unique,
+    uint32_t K_nthroot) {
   //__shared__ typename BlockScan::TempStorage temp_storage;
   int B = probs.size(0);  // batch size
   uint32_t N = probs.size(1),  // num distributions
@@ -281,7 +282,7 @@ void sample_combined_forward_kernel(
                                              // but dont change name for easier
                                              // comparison with CPu code.
       *sorted_topK_delta_P_cumsum_ = sorted_topK_cumsums_ + K, // [K]
-      *sorted_topK_cumsums_reduced_ = sorted_topK_cumsums_ + K, // [K]
+      *sorted_topK_cumsums_reduced_ = sorted_topK_delta_P_cumsum_, // [K], share with sorted_topK_delta_P_cumsum_
       *unreduced_samples_ = sorted_topK_cumsums_reduced_ + K, // [K]
       *P_sum_cumprod_ = unreduced_samples_ + K, // [N+1]
       *B_ = P_sum_cumprod_ + (N+1);  // [1]
@@ -317,15 +318,18 @@ void sample_combined_forward_kernel(
     { // load_p() in sampling_cpu.cpp
       for (uint32_t n = 0; n < N; n++) {
         uint32_t multiple = 1 + M_unique * ((rand_source >> (M_bits * n)) % (M / M_unique));
-        //if(threadIdx.x == 0)  printf("multiple = %ld\n", (long int) multiple);
         // First load P linearly from global memory to shared memory.
         uint32_t m = threadIdx.x;
         if (m < M) {
           Real p = probs[b][n][m];
           if (input_is_log)
             p = exp_wrapper(p);
-          // add 1 because if we allow zero probabilities, we get nasty edge cases.
-          uint32_t P = uint32_t(1) + uint32_t((1 << p_bits) * p);
+          // add K_nthroot for 2 reasons: (a) to prevent zero probs, which causes
+          // all kinds of nasty edge cases, (b) it must be large enough that
+          // "remainder_k", which could be as large as K-2 in the cases that
+          // we are worried about, does not exceed the k'th largest product
+          // of probs.  Ensuring products of probs are at least K satisfies this.
+          uint32_t P = K_nthroot + uint32_t((1 << p_bits) * p);
           P_cumsum_[n * (M+1) + 1 + m] = P;
         }
         // .. then pseudo-randomly reorder/shuffle P based on "multiple".
@@ -600,7 +604,6 @@ void sample_combined_forward_kernel(
     }
 
     { // this block corresponds to compute_unreduced_samples() in sampling_cpu.cpp.
-      uint64_t to_sum;
       uint64_t *buf = sort_buf64_;
       // k2 corresponds to the output samples, k to the top-K probs
       // note, we might have k2 > K at this point.
@@ -614,8 +617,7 @@ void sample_combined_forward_kernel(
       if (k2 < K) {
         uint64_t reduced_cumsum_k = sorted_topK_cumsums_reduced_[k],
             delta_P =  sorted_topK_delta_P_[k];
-        to_sum = (rand >= reduced_cumsum_k) * delta_P;
-        buf[threadIdx.x] = to_sum;
+        buf[threadIdx.x] = (rand >= reduced_cumsum_k) * delta_P;
       }
       __syncthreads();
       for (uint32_t s = 1; s < K; s *= 2) {
@@ -639,50 +641,49 @@ void sample_combined_forward_kernel(
                       rand_shifted < topK_disallowed_end));
         assert(rand_shifted < P_sum_cumprod_[N]);
       }
-      __syncthreads(); print_array(unreduced_samples_, K, "unreduced_samples_");
+      __syncthreads();
+      print_array(unreduced_samples_, K, "unreduced_samples_");
     }
     { // this block corresponds to compute_indexes_for_samples() in sampling_cpu.cpp.
       // We make the thread_group_size blockDim.x / K so that all threads can
       // participate; this removes any problems with needing a guard if any
       // threads do not participate.
-      uint32_t thread_group_size = blockDim.x / K;
+      // it seems thread group size >32 may not be supported, at least there
+      // is some
+      uint32_t thread_group_size = std::min<uint32_t>(blockDim.x / K, uint32_t(32));
       cooperative_groups::thread_group tile =
           cooperative_groups::tiled_partition(cooperative_groups::this_thread_block(),
                                               thread_group_size);
+
+
       // buf is of size [K], overlaps with topK_P_ == topK_P_sorted_.
       int32_t *buf = reinterpret_cast<int32_t*>(topK_P_);
 
       __syncthreads();
       uint32_t k2 = threadIdx.x / thread_group_size;
-      uint64_t cur_sample = unreduced_samples_[k2];
+      if (k2 < K) {
+        uint64_t cur_sample = unreduced_samples_[k2];
 
-      {
-        __syncthreads();
-        for (uint32_t n = 0; n < N; n++) {
-          uint32_t *this_P = P_cumsum_ + (M+1) * n;
-          print_array(this_P, (M+1), "this_P[n]");
+        for (uint32_t n = N-1; ; --n) {  // we break in the loop if n == 0.
+          uint64_t P_sum_cumprod = P_sum_cumprod_[n];  // product of previous Psum's.
+          uint32_t this_sample = uint32_t(cur_sample / P_sum_cumprod);
+
+          uint32_t *P_cumsum_start = P_cumsum_ + n * (M+1);
+          uint32_t this_m_idx = find_class(tile,
+                                           buf + k2,
+                                           P_cumsum_start,
+                                           (int)0, (int)M, this_sample);
+          if (threadIdx.x % thread_group_size == 0)
+            indexes_for_samples_[k2 * N + n] = this_m_idx;
+          if (n == 0)
+            break;
+          uint32_t this_cumsum = P_cumsum_start[this_m_idx],
+              next_cumsum = P_cumsum_start[this_m_idx + 1],
+              this_P = next_cumsum - this_cumsum;
+
+          uint64_t remainder = cur_sample - this_cumsum * P_sum_cumprod;
+          cur_sample = remainder / this_P;
         }
-      }
-
-      for (uint32_t n = N-1; ; --n) {  // we break in the loop if n == 0.
-        uint64_t P_sum_cumprod = P_sum_cumprod_[n];  // product of previous Psum's.
-        uint32_t this_sample = uint32_t(cur_sample / P_sum_cumprod);
-
-        uint32_t *P_cumsum_start = P_cumsum_ + n * (M+1);
-        uint32_t this_m_idx = find_class(tile,
-                                         buf + k2,
-                                         P_cumsum_start,
-                                         (int)0, (int)M, this_sample);
-        if (threadIdx.x % thread_group_size == 0)
-          indexes_for_samples_[k2 * N + n] = this_m_idx;
-        if (n == 0)
-          break;
-        uint32_t this_cumsum = P_cumsum_start[this_m_idx],
-            next_cumsum = P_cumsum_start[this_m_idx + 1],
-            this_P = next_cumsum - this_cumsum;
-
-        uint64_t remainder = cur_sample - this_cumsum * P_sum_cumprod;
-        cur_sample = remainder / this_P;
       }
       __syncthreads(); // keep this __syncthreads(), it guards next block.
       print_array(indexes_for_samples_, K*N, "indexes_for_samples_");
@@ -703,7 +704,7 @@ void sample_combined_forward_kernel(
         float p = (float)prod_P / denom;
         weights[b][k2] = (Real)std::max(p, beta);
         if (p < 0 || p > 1) {
-          printf("k2=%d, denom=%f, beta=%f, prod_P=%ul, p=%f", k2, denom, beta, prod_P, p);
+          printf("ERROR: k2=%d, denom=%f, beta=%f, prod_P=%ul, p=%f", k2, denom, beta, prod_P, p);
         }
       }
     }
@@ -818,14 +819,12 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
   int M_bits = find_num_bits_for(M),
       K_bits = find_num_bits_for(K),
       p_bits = std::min(54 / N, // so product of N of these is comfortably less
-                                // than 64, search for "headroom" [actually this
-                                // "headroom" is not needed in CUDA but we keep
-                                // it so the calculation is identical to the C++
-                                // version.
+                                // than 64, search for "headroom".
                         std::min((63/N) - K_bits,  // for when we sort `sort_combinations`.
                                  31 - M_bits)), // for when we sort `sort_buf` in ComputeKLargest()
       M_unique = find_prod_unique_prime_factors(M),
-      M_round = 1 << M_bits;
+      M_round = 1 << M_bits,
+      K_nthroot = 1 << ((K_bits + N - 1) / N);  // such that (K_nthroot**N) >= K,
 
   int size64 = sizeof(uint64_t),
       size32 = sizeof(uint32_t);
@@ -840,14 +839,13 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
       size64 * K + // topK_P_exclusive_sum_
       size64 * K + // topK_delta_P_,sorted_topK_delta_P_
       size64 * K + // topK_cumsums_,sorted_topK_cumsums_
-      size64 * K + // sorted_topK_delta_P_cumsum_
-      size64 * K + // sorted_topK_cumsums_reduced_
+      size64 * K + // sorted_topK_delta_P_cumsum_,sorted_topK_cumsums_reduced_
       size64 * K + // unreduced_samples_
       size64 * (N+1) +  // P_sum_cumprod_
       size64 * 1 + // B_.
       size32 * (K*N) + // topK_indexes_
       size32 * (M+1) * N + // P_cumsum_
-      std::max<int>(size32 * ((K-1)*N + M_round),  // sort_buf32_
+      std::max<int>(size32 * (K*(N-1) + M_round),  // sort_buf32_
                     size32 * (K*N + 1) + size64 * K*K); // [(indexes_for_samples_ or alternatively the 1st
                                                         // K*N elements of sort_buf32_), and then+sort_buf64_. [
                                                         // the +1 is for int64
@@ -861,7 +859,8 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
             indexes.packed_accessor32<int64_t, 3>(),
             combined_indexes.packed_accessor32<int64_t, 2>(),
             weights.packed_accessor32<scalar_t, 2>(),
-            K, input_is_log, p_bits, M_bits, K_bits, M_unique);
+            K, input_is_log, p_bits, M_bits, K_bits, M_unique,
+            K_nthroot);
       }));
   gpuErrchk(cudaGetLastError());
 

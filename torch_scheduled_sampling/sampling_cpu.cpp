@@ -192,7 +192,8 @@ class CombinedSampler {
              AccessorT p) { // p: [N][M]
     rand_source_ = rand_source;
 
-    uint32_t N = N_, M = M_;
+    uint32_t N = N_, M = M_,
+        K_nthroot = 1 << ((K_bits_ + N - 1) / N);
     for (uint32_t n = 0; n < N; n++) {
       auto p_n = p[n];
 
@@ -211,8 +212,12 @@ class CombinedSampler {
         Real src_p = p_n[src_m];
         if (input_is_log)
           src_p = exp_wrapper(src_p);
-        // add 1 because if we allow zero probabilities, we get nasty edge cases.
-        uint32_t P = uint32_t(1) + uint32_t(p_multiple * src_p);
+        // add K_nthroot for 2 reasons: (a) to prevent zero probs, which causes
+        // all kinds of nasty edge cases, (b) it must be large enough that
+        // "remainder_k", which could be as large as K-2 in the cases that
+        // we are worried about, does not exceed the k'th largest product
+        // of probs.  Ensuring products of probs are at least K satisfies this.
+        uint32_t P = K_nthroot + uint32_t(p_multiple * src_p);
 
         // the index is m + 1 because we shift it right by 1, this will be convenient when
         // creating the exclusive-sum.

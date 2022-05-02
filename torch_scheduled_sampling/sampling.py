@@ -261,6 +261,36 @@ def _test_sample_combined_forward_compare():
             print("weights_cuda = ", weights_cuda)
             print("weights diff = ", weights - weights_cuda.to('cpu'))
 
+
+def _test_sample_combined_forward_compare0():
+    if True:
+        B = 1
+        N = 4
+        M = 104
+        K = 16
+        l = 6.0 * torch.randn(B, N, M)
+        l = l.softmax(dim=-1)
+        rand = torch.randint(2**63 - 1, (B,), device=l.device, dtype=torch.int64)
+        (indexes, indexes_combined, weights) = sample_combined_forward(l, K, False, rand)
+        print(f"B={B}, N={N}, M={M}, K={K}")
+
+        l_cuda = l.to(device='cuda')
+        rand_cuda = rand.to(l_cuda.device)
+
+        (indexes_cuda, indexes_combined_cuda, weights_cuda) = sample_combined_forward(l_cuda, K, False, rand_cuda)
+        print("indexes = ", indexes)
+        print("indexes_combined = ", indexes_combined)
+        print("weights = ", weights)
+        assert torch.all((weights.sum(dim=-1) - 1.0).abs() < 0.1)
+        print("indexes_cuda = ", indexes_cuda)
+        print("indexes_combined_cuda = ", indexes_combined_cuda)
+        print("weights_cuda = ", weights_cuda)
+        print("weights diff = ", weights - weights_cuda.to('cpu'))
+        assert torch.all((weights - weights_cuda.to('cpu')).abs() < 0.01)
+        assert torch.all(indexes == indexes_cuda.to('cpu'))
+        assert torch.all(indexes_combined == indexes_combined_cuda.to('cpu'))
+
+
 def _test_sample_combined_forward():
     for device in [torch.device('cpu'), torch.device('cuda')]:
         B = 2
@@ -332,6 +362,6 @@ def _test_sample_combined_mean():
 
 if __name__ == '__main__':
     _test_sample_combined_forward_compare()
-    #_test_sample_combined_forward()
-    #_test_sample_combined_forward_average()
-    #_test_sample_combined_mean()
+    _test_sample_combined_forward()
+    _test_sample_combined_forward_average()
+    _test_sample_combined_mean()
