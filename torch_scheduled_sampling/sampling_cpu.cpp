@@ -2,10 +2,8 @@
 #include <torch/extension.h>
 
 
-
-inline torch::Half exp_wrapper(torch::Half f) { return (torch::Half)expf((float)f); }
-inline float exp_wrapper(float f) { return expf(f); }
 inline double exp_wrapper(double f) { return exp(f); }
+inline float exp_wrapper(float f) { return expf(f); }
 
 /*
   Return the index i into cumsum, with begin <= i < end,
@@ -107,6 +105,16 @@ inline uint32_t find_num_bits_for(uint32_t n) {
   return num_bits;
 }
 
+template<typename T>
+class PromoteHalfToFloat {
+ public:
+  using Type = T;
+};
+template<>
+class PromoteHalfToFloat<torch::Half> {
+ public:
+  using Type = float;
+};
 
 
 class CombinedSampler {
@@ -221,7 +229,7 @@ class CombinedSampler {
       uint32_t p_multiple = 1 << (p_bits_);
       for (uint32_t m = 0; m < M; m++) {
         uint32_t src_m = (m * multiple) % M;
-        Real src_p = p_n[src_m];
+        typename PromoteHalfToFloat<Real>::Type src_p = p_n[src_m];
         if (input_is_log)
           src_p = exp_wrapper(src_p);
         // add K_nthroot for 2 reasons: (a) to prevent zero probs, which causes
@@ -262,8 +270,8 @@ class CombinedSampler {
   void get_weights_for_samples(
       AccessorT weights) {
     uint32_t N = N_, M = M_, K = K_;
-    float denom = (float)P_sum_cumprod_[N];
-    float beta = (float)B_ / denom;
+    typename PromoteHalfToFloat<Real>::Type denom = P_sum_cumprod_[N],
+        beta = B_ / denom;
 
     for (uint32_t k2 = 0; k2 < K; k2++) { // parallelize over k2
       uint64_t prod_P = 1;
@@ -272,7 +280,7 @@ class CombinedSampler {
         uint32_t this_P = P_cumsum_[n * (M + 1) + this_m_idx + 1] - P_cumsum_[n * (M + 1) + this_m_idx];
         prod_P *= this_P;
       }
-      float p = (float)prod_P / denom;
+      auto p = prod_P / denom;
       weights[k2] = (Real)std::max(p, beta);
     }
   }
@@ -816,7 +824,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
   torch::Tensor weights = torch::empty({B, K}, real_opts);
   float epsilon;
 
-  AT_DISPATCH_FLOATING_TYPES(probs.scalar_type(), "sample_combined_cpu_forward_dispatch", ([&] {
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(probs.scalar_type(), "sample_combined_cpu_forward_dispatch", ([&] {
         auto probs_a = probs.packed_accessor32<scalar_t, 3>();  // scalar_t comes from the macro.
         auto weights_a = weights.packed_accessor32<scalar_t, 2>();
         auto rand_a = rand.packed_accessor32<int64_t, 1>();

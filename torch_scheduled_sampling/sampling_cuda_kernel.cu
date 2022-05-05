@@ -223,8 +223,18 @@ __forceinline__ __device__ int find_class(
 }
 
 inline __device__ double exp_wrapper(double f) { return exp(f); }
-template<typename Real>
-inline __device__ Real exp_wrapper(Real f) { return Real(expf(float(f))); }
+inline __device__ float exp_wrapper(float f) { return expf(f); }
+
+template<typename T>
+class PromoteHalfToFloat {
+ public:
+  using Type = T;
+};
+template<>
+class PromoteHalfToFloat<torch::Half> {
+ public:
+  using Type = float;
+};
 
 /*
   Return the index i into cumsum, with begin <= i < end,
@@ -244,8 +254,6 @@ template <typename IterType> __device__ int find_class_1thread(
   }
   return begin;
 }
-
-
 
 template<typename Real>
 __global__
@@ -321,7 +329,7 @@ void sample_combined_forward_kernel(
         // First load P linearly from global memory to shared memory.
         uint32_t m = threadIdx.x;
         if (m < M) {
-          Real p = probs[b][n][m];
+          typename PromoteHalfToFloat<Real>::Type p = probs[b][n][m];
           if (input_is_log)
             p = exp_wrapper(p);
           // add K_nthroot for 2 reasons: (a) to prevent zero probs, which causes
@@ -329,6 +337,7 @@ void sample_combined_forward_kernel(
           // "remainder_k", which could be as large as K-2 in the cases that
           // we are worried about, does not exceed the k'th largest product
           // of probs.  Ensuring products of probs are at least K satisfies this.
+
           uint32_t P = K_nthroot + uint32_t((1 << p_bits) * p);
           P_cumsum_[n * (M+1) + 1 + m] = P;
         }
@@ -690,8 +699,8 @@ void sample_combined_forward_kernel(
     }
     { // this block corresponds to get_weights_for_samples() in sampling_cpu.cpp.
       // can't use half precision here or we'd get overflow.
-      float denom = (float)P_sum_cumprod_[N];
-      float beta = (float)*B_ / denom;
+      typename PromoteHalfToFloat<Real>::Type denom = P_sum_cumprod_[N],
+          beta = *B_ / denom;
       uint64_t prod_P = 1;
       if (threadIdx.x < K) {
         uint32_t k2 = threadIdx.x;
@@ -701,7 +710,7 @@ void sample_combined_forward_kernel(
               P_cumsum_[n * (M + 1) + this_m_idx];
           prod_P *= this_P;
         }
-        float p = (float)prod_P / denom;
+        typename PromoteHalfToFloat<Real>::Type p = prod_P / denom;
         weights[b][k2] = (Real)std::max(p, beta);
         if (p < 0 || p > 1) {
           printf("ERROR: k2=%d, denom=%f, beta=%f, prod_P=%ul, p=%f", k2, denom, beta, prod_P, p);
@@ -853,7 +862,7 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
                                                         // the +1 is for int64
                                                         // alignment issues.]
 
-  AT_DISPATCH_FLOATING_TYPES(probs.scalar_type(), "sample_combined_cpu_forward_dispatch", ([&] {
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(probs.scalar_type(), "sample_combined_cpu_forward_dispatch", ([&] {
         // scalar_t is defined by the macro AT_DISPATCH_FLOATING_TYPES
         sample_combined_forward_kernel<scalar_t><<<grid_dim_x, block_dim_x, extern_memory_bytes>>>(
             probs.packed_accessor32<scalar_t, 3>(),
