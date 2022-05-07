@@ -448,6 +448,11 @@ void sample_combined_forward_kernel(
       print_array(sort_combinations, K, "sort-combinations-n=0");
       for (n = 1; n < N; n++) {
         __syncthreads();
+        uint64_t *topK_buf = sorted_topK_cumsums_;  // just a random unused buffer of size K.
+        if (threadIdx.x < K)
+          topK_buf[threadIdx.x] = sort_combinations[threadIdx.x];
+        __syncthreads();
+
         uint64_t K_mask = (uint64_t(1) << uint64_t(n * K_bits)) - 1;
         for (uint32_t offset = 0; offset < K * K; offset += blockDim.x) {
           uint64_t new_S;
@@ -457,7 +462,7 @@ void sample_combined_forward_kernel(
                 new_k = i / K;
             // best_k is an index into the 1st K elements of array
             // `sort_combinations`
-            uint64_t S = sort_combinations[best_k],
+            uint64_t S = topK_buf[best_k],
                 P = S & ~K_mask,
                 prev_ks = S & K_mask;
             uint64_t combined_k = prev_ks | (new_k << (n * K_bits));
