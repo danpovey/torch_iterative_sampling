@@ -234,7 +234,7 @@ def _test_sample_combined_forward_compare():
     for _ in range(1000):
         B = random.randint(1, 1000)
         N = random.randint(1, 4)
-        M = random.randint(16, 256)
+        M = random.randint(16, 1024)
         T = random.randint(1, 2)
         while True:
             K = 2 ** (random.randint(0, 4))

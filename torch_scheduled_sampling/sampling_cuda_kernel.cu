@@ -40,10 +40,13 @@ __device__ void print_array(IntT *buf, int num_items, const char *name) {
   A simple inclusive scan algorithm.  Require num_items <= blockDim.x,
   num_items does not need to be a power of 2, or the same as
   blockDim.x, but must be <= blockDim.x.
+
+  Assumes blockDim is of the form (blockDim.x, 1, 1)
 */
 template <typename IntT>
 __device__ void simple_inclusive_scan(IntT *buf, int num_items) {
   print_array(buf, num_items, "simple-inclusive-scan-at-entry");
+
   for (int offset = 1; offset < num_items; offset *= 2) {
     IntT src_prev, src_cur;
     __syncthreads();
@@ -63,8 +66,35 @@ __device__ void simple_inclusive_scan(IntT *buf, int num_items) {
   }
 }
 
+/*
+  This is a wrapper for simple_inclusive_scan() that is to be called only in cases
+  where num_items > blockDim.x.  Assumes blockDim is of the form (blockDim.x, 1, 1)
 
+  Args:
+     data: an array of length `num_items`, of items to be inclusive-scanned
+      buf: an array of length at least `blockDim.x` that we can use temporarily.
 
+ */
+template <typename IntT>
+__device__ void inclusive_scan(IntT *data, IntT *buf, int num_items) {
+  IntT sum = 0;
+  int block_size = (num_items + blockDim.x - 1) / blockDim.x;
+  for (int i = 0; i < block_size; i++) {
+    int idx = threadIdx.x * block_size + i;
+    if (idx < num_items)
+      sum += data[idx];
+  }
+  buf[threadIdx.x] = sum;
+  simple_inclusive_scan(buf, blockDim.x);
+  IntT cur_value = buf[threadIdx.x] - sum;  // `-sum` makes it exclusive-sum for now
+  for (int i = 0; i < block_size; i++) {
+    int idx = threadIdx.x * block_size + i;
+    if (idx < num_items) {
+      cur_value += data[idx];
+      data[idx] = cur_value;
+    }
+  }
+}
 
 /*
   This function does a partial sort of an array, in reverse order, so that it's
@@ -82,9 +112,9 @@ __device__ void simple_inclusive_scan(IntT *buf, int num_items) {
   Args:
         buf: pointer to start of buffer
         num_keep: number of items we need to be correct at output,
-           must be a power of 2.
+           must be a power of 2 with num_keep >= 1, and must be < blockIdx.x.
         num_items: number of items in the array, must be a power of 2
-           and >= num_keep.
+           and >= num_keep.  Does not necessarily have to be <= blockIdx.x.
  */
 template <typename IntT>
 __device__ void merge_based_partial_sort_reverse(
@@ -92,40 +122,67 @@ __device__ void merge_based_partial_sort_reverse(
   // num_keep == max_elements_needed in python.
   print_array(buf, num_items, "merge-sort-at-entry");
   __syncthreads();
-  for (uint32_t new_sublist_size = 2;
-       new_sublist_size <= num_items;
-       new_sublist_size *= 2) {
-    uint32_t old_sublist_size = new_sublist_size / 2;
-    __syncthreads();
-    uint32_t i = threadIdx.x,
-        new_pos;
-    IntT x_val;
-    if (i < num_items) {
-      x_val = buf[i];
-      uint32_t offset_in_old = i & (old_sublist_size - 1);
+  uint32_t old_sublist_size = 1;
+  while (old_sublist_size < num_items) {
+    uint32_t new_sublist_size = old_sublist_size * 2;
 
-      uint32_t new_sublist_start = i & ~(new_sublist_size - 1),
-          is_rhs = (i & old_sublist_size), // equals old_sublist_size for right
-                                                     // half of input
-          other_list_start = new_sublist_start | (is_rhs ^ old_sublist_size),
-          search_offset = other_list_start,
-          search_begin = 0,
-          search_end = std::min<uint32_t>(uint32_t(num_keep),
-                                          old_sublist_size) + 1;
+    for (uint32_t offset = 0; offset < num_items; offset += blockDim.x) {
+      __syncthreads();
+      uint32_t new_pos, i = offset + threadIdx.x;
+      IntT x_val;
+      if (i < num_items) {
+        x_val = buf[i];
+        uint32_t offset_in_old = i & (old_sublist_size - 1);
 
-      IntT x_val_mod = x_val - (is_rhs != 0);
-      while (search_begin + 1 < search_end) {
-        uint32_t mid = (search_begin + search_end) / 2;
-        // we are implementing reversed sorting, so replace the ">" in the
-        // Python with "<".
-        if (x_val_mod < buf[search_offset + mid - 1]) search_begin = mid;
-        else search_end= mid;
+        uint32_t new_sublist_start = i & ~(new_sublist_size - 1),
+            is_rhs = (i & old_sublist_size), // equals old_sublist_size for right
+            // half of input
+            other_list_start = new_sublist_start | (is_rhs ^ old_sublist_size),
+            search_offset = other_list_start,
+            search_begin = 0,
+            search_end = std::min<uint32_t>(uint32_t(num_keep),
+                                            old_sublist_size) + 1;
+
+        IntT x_val_mod = x_val - (is_rhs != 0);
+        while (search_begin + 1 < search_end) {
+          uint32_t mid = (search_begin + search_end) / 2;
+          // we are implementing reversed sorting, so replace the ">" in the
+          // Python with "<".
+          if (x_val_mod < buf[search_offset + mid - 1]) search_begin = mid;
+          else search_end= mid;
+        }
+        new_pos = new_sublist_start + offset_in_old + search_begin;
       }
-      new_pos = new_sublist_start + offset_in_old + search_begin;
+      __syncthreads();
+      if (i < num_items)
+        buf[new_pos] = x_val;
     }
-    __syncthreads();
-    if (i < num_items) {
-      buf[new_pos] = x_val;
+    if (old_sublist_size < num_keep || num_items <= blockDim.x) {
+      // The "|| num_items <= blockDim.x" is just to save a little time.
+      old_sublist_size *= 2;
+    } else {
+      // old_sublist_size == num_keep.  we'll be splitting each block of size
+      // (new_sublist_size == 2*num_keep) items into two halves and keeping only
+      // the 1st half, getting rid of the empty space and halving the number of
+      // items while keeping old_sublist_size the same, i.e. a list like 12345678
+      // is reduced to 1256, assuming num_keep == 2.  This is a mechanism
+      // to support larger num_items than blockDim.x.
+      num_items = num_items / 2;
+      for (uint32_t offset = 0; offset < num_items; offset += blockDim.x) {
+        __syncthreads();
+        // i corresponds to the index into the reduced list of items.
+        uint32_t i = threadIdx.x + offset;
+        IntT my_item;
+        if (i < num_items) {
+          uint32_t reduced_sublist_start = i & ~(old_sublist_size - 1),
+              old_idx = i + reduced_sublist_start;
+          my_item = buf[old_idx];
+        }
+        __syncthreads();
+        if (i < num_items) {
+          buf[i] = my_item;
+        }
+      }
     }
   }
   print_array(buf, num_items, "merge-sort-at-exit");
@@ -328,8 +385,9 @@ void sample_combined_forward_kernel(
       for (uint32_t n = 0; n < N; n++) {
         uint32_t multiple = 1 + M_unique * ((rand_source >> (M_bits * n)) % (M / M_unique));
         // First load P linearly from global memory to shared memory.
-        uint32_t m = threadIdx.x;
-        if (m < M) {
+        uint32_t *P_buf = sort_buf32_;
+        __syncthreads();  // re-use P_buf from last iter over n.
+        for (uint32_t m = threadIdx.x; m < M; m += blockDim.x) {
           typename PromoteHalfToFloat<Real>::Type p = probs[b][n][m];
           if (input_is_log)
             p = exp_wrapper(p);
@@ -340,18 +398,13 @@ void sample_combined_forward_kernel(
           // of probs.  Ensuring products of probs are at least K satisfies this.
 
           uint32_t P = K_nthroot + uint32_t((1 << p_bits) * p);
-          P_cumsum_[n * (M+1) + 1 + m] = P;
+          P_buf[m] = P;
         }
         // .. then pseudo-randomly reorder/shuffle P based on "multiple".
         __syncthreads();
-        int32_t P;
-        if (m < M) {
+        for (uint32_t m = threadIdx.x; m < M; m += blockDim.x) {
           uint32_t src_m = (m * multiple) % M;
-          P = P_cumsum_[n * (M+1) + 1 + src_m];
-        }
-        __syncthreads();
-        if (m < M) {
-          P_cumsum_[n * (M+1) + 1 + m] = P;
+          P_cumsum_[n * (M+1) + 1 + m] = P_buf[src_m];
         }
       }
     }
@@ -368,18 +421,14 @@ void sample_combined_forward_kernel(
       // for each source distribution.
       for (uint32_t n = 0; n < N; n++) {
         __syncthreads();
-
-        uint32_t m = threadIdx.x;
-        uint32_t P = (m < M ? P_cumsum_[n*(M+1) + m + 1] : 0);
-
         uint32_t *sort_buf = sort_buf32_ + (K*n);
 
-        sort_buf[m] = (P << M_bits) + m;
-
+        for (uint32_t m = threadIdx.x; m < M_round; m += blockDim.x) {
+          uint32_t P = (m < M ? P_cumsum_[n*(M+1) + m + 1] : 0);
+          sort_buf[m] = (P << M_bits) + m;
+        }
         merge_based_partial_sort_reverse(sort_buf, K, M_round);
 
-        // in CUDA we'll just sort the entire array.  Note, we don't need the
-        // sorting algorithm to sort the indexes because we include them manually.
         //std::nth_element(sort_buf, sort_buf + K, sort_buf + M, std::greater<>());
         //std::sort(sort_buf, sort_buf + K, std::greater<>());
       }
@@ -399,25 +448,27 @@ void sample_combined_forward_kernel(
       print_array(sort_combinations, K, "sort-combinations-n=0");
       for (n = 1; n < N; n++) {
         __syncthreads();
-
         uint64_t K_mask = (uint64_t(1) << uint64_t(n * K_bits)) - 1;
-        uint64_t new_S;
-        if (threadIdx.x < K * K) {
-          uint32_t best_k = threadIdx.x % K,
-              new_k = threadIdx.x / K;
-          // best_k is an index into the 1st K elements of array
-          // `sort_combinations`
-          uint64_t S = sort_combinations[best_k],
-              P = S & ~K_mask,
-              prev_ks = S & K_mask;
-          uint64_t combined_k = prev_ks | (new_k << (n * K_bits));
-          // one of the k-best probs for the n'th softmax
-          uint32_t this_P = (sort_buf32_[K*n + new_k] >> M_bits);
-          new_S = (P * this_P) | combined_k;
-        }
-        __syncthreads();
-        if (threadIdx.x < K * K) {
-          sort_combinations[threadIdx.x] = new_S;
+        for (uint32_t offset = 0; offset < K * K; offset += blockDim.x) {
+          uint64_t new_S;
+          uint32_t i = threadIdx.x + offset;
+          if (i < K * K) {
+            uint32_t best_k = i % K,
+                new_k = i / K;
+            // best_k is an index into the 1st K elements of array
+            // `sort_combinations`
+            uint64_t S = sort_combinations[best_k],
+                P = S & ~K_mask,
+                prev_ks = S & K_mask;
+            uint64_t combined_k = prev_ks | (new_k << (n * K_bits));
+            // one of the k-best probs for the n'th softmax
+            uint32_t this_P = (sort_buf32_[K*n + new_k] >> M_bits);
+            new_S = (P * this_P) | combined_k;
+          }
+          __syncthreads();
+          if (i < K * K) {
+            sort_combinations[i] = new_S;
+          }
         }
         merge_based_partial_sort_reverse(sort_combinations, K, K*K);
       }
@@ -463,8 +514,12 @@ void sample_combined_forward_kernel(
         // Compute inclusive cumulative sum of size M; we already padded on the
         // left with 0, so the effect is the same as exclusive sum.
         uint32_t *this_P_cumsum = P_cumsum_ + (M+1) * n + 1; // + 1: skip the 0.
-        simple_inclusive_scan(this_P_cumsum, M);
 
+        if (M <= blockDim.x) {
+          simple_inclusive_scan(this_P_cumsum, M);
+        } else {
+          inclusive_scan(this_P_cumsum, sort_buf32_, M);
+        }
         print_array(this_P_cumsum-1, M+1, "this_P_cumsum");
       }
       __syncthreads();
@@ -553,19 +608,29 @@ void sample_combined_forward_kernel(
         // uint8_t if we can assume K <= 256.
         uint16_t *buf = reinterpret_cast<uint16_t*>(sort_buf64_);
         __syncthreads();
-        uint32_t this_k = threadIdx.x / K, other_k = threadIdx.x % K;
-        if (this_k < K)
-          buf[threadIdx.x] = (topK_cumsums_[other_k] < topK_cumsums_[this_k]); // 0 or 1
-        // sum up each block of K elements of `buf`, to work out how many
+
+        // K_reduced will normally equal K; it's less than K of K*K > blockDim.x.
+        uint32_t K_reduced = std::min<uint32_t>(K, blockDim.x / K);  // power of 2
+        uint64_t this_topK_cumsum;
+        uint32_t this_k = threadIdx.x / K_reduced, other_k = threadIdx.x % K_reduced;
+
+        if (this_k < K) {
+          this_topK_cumsum = topK_cumsums_[this_k];
+          uint32_t count = 0;
+          for (uint32_t other_kk = other_k; other_kk < K; other_kk += K_reduced)
+            count += (topK_cumsums_[other_kk] < this_topK_cumsum); // add 0 or 1
+          buf[threadIdx.x] = count;
+        }
+        // sum up each block of K_reduced elements of `buf`, to work out how many
         // other elements of topK_cumsums_ are less than this element.
         __syncthreads();
-        for (uint32_t s = 1; s < K; s *= 2) {
+        for (uint32_t s = 1; s < K_reduced; s *= 2) {
           if (this_k < K && threadIdx.x % (2*s) == 0)
             buf[threadIdx.x] += buf[threadIdx.x + s];
           __syncthreads();
         }
         uint32_t new_k;
-        uint64_t topK_P, topK_delta_P, this_topK_cumsum;
+        uint64_t topK_P, topK_delta_P;
         if (other_k == 0 && this_k < K) {
           new_k = buf[threadIdx.x];
           this_topK_cumsum = topK_cumsums_[this_k];
@@ -841,7 +906,7 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
   int size64 = sizeof(uint64_t),
       size32 = sizeof(uint32_t);
   int grid_dim_x = std::min<int>(B, 256),
-      block_dim_x = std::max(M_round, K*K);
+      block_dim_x = std::min(std::max(M_round, K*K), 256);
 
 
   // the order in which we list these buffers differs from their declaration ordere,
