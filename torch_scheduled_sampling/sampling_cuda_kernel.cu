@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>  // for getCurrentCUDAStream()
 
+/*
 // We have included cub as a submodule as ../cub, and added the flag "-Icub" via
 // setup.py.  This is fixed to the tag v1.8.0, since the current master gave us
 // a compilation error; the choice of v1.8.0 was very random, just "an older
@@ -11,7 +12,7 @@
 // device-level, it will be used purely as a template library without causing
 // any C-language global or namespace variables to be instantiated (I think
 // those are what cause the compatibility problems with Torch).
-#include <cub/cub.cuh>
+#include <cub/cub.cuh>*/
 #include <cooperative_groups.h>
 #include <cmath>  // for INFINITY
 #include <stdio.h>
