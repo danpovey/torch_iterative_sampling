@@ -268,9 +268,9 @@ def _test_sample_combined_forward_compare():
 def _test_sample_combined_forward_compare0():
     if True:
         B = 1
-        N = 4
-        M = 104
-        K = 16
+        N = 2
+        M = 667
+        K = 32
         l = 6.0 * torch.randn(B, N, M)
         l = l.softmax(dim=-1)
         rand = torch.randint(2**63 - 1, (B,), device=l.device, dtype=torch.int64)
@@ -294,7 +294,7 @@ def _test_sample_combined_forward_compare0():
         assert torch.all((weights - weights_cuda.to('cpu')).abs() < 0.01)
         assert torch.all(indexes == indexes_cuda.to('cpu'))
         assert torch.all(indexes_combined == indexes_combined_cuda.to('cpu'))
-        assert epsilon == epsilon_cuda
+        assert epsilon == epsilon_cuda.to('cpu')
 
 def _test_sample_combined_forward():
     for device in [torch.device('cpu'), torch.device('cuda')]:
@@ -400,6 +400,7 @@ def _test_sample_combined_speed():
 
 
 if __name__ == '__main__':
+    _test_sample_combined_forward_compare0()
     _test_sample_combined_speed()
     _test_sample_combined_forward_compare()
     _test_sample_combined_forward()

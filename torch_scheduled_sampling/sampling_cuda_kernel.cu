@@ -23,15 +23,16 @@ extern __shared__ char extern_buf[];
 
 template <typename IntT>
 __device__ void print_array(IntT *buf, int num_items, const char *name) {
-  /*
    __syncthreads();
+   /*
   if (threadIdx.x == 0) {
     printf("%s = [", name);
     for (int i = 0; i < num_items; i++) {
       printf("%ld ",  (long int)buf[i]);
     }
     printf("]\n");
-    } */
+  }
+   */
 }
 
 
@@ -460,8 +461,8 @@ void sample_combined_forward_kernel(
           if (i < K * K) {
             uint32_t best_k = i % K,
                 new_k = i / K;
-            // best_k is an index into the 1st K elements of array
-            // `sort_combinations`
+            // best_k is an index into the 1st K elements of the previously
+            // sorted indexes.
             uint64_t S = topK_buf[best_k],
                 P = S & ~K_mask,
                 prev_ks = S & K_mask;
@@ -687,26 +688,31 @@ void sample_combined_forward_kernel(
       uint64_t *buf = sort_buf64_;
       // k2 corresponds to the output samples, k to the top-K probs
       // note, we might have k2 > K at this point.
-      uint32_t k2 = threadIdx.x / K,
-          k = threadIdx.x % K;
+      uint32_t K_reduced = std::min<uint32_t>(K, blockDim.x / K);  // power of 2
+      uint32_t k2 = threadIdx.x / K_reduced,
+          k = threadIdx.x % K_reduced;
       // each k2 has a different `rand`.  Treat rand as "reduced" at this
       // point, meaning it's in a space where disallowed regions (of size,
       // delta_P_[k]), have been removed.
       uint64_t B = *B_,
           rand = (rand_source % B) + B * k2;
       if (k2 < K) {
-        uint64_t reduced_cumsum_k = sorted_topK_cumsums_reduced_[k],
-            delta_P =  sorted_topK_delta_P_[k];
-        buf[threadIdx.x] = (rand >= reduced_cumsum_k) * delta_P;
+        uint64_t partial_sum = 0;
+        for (uint32_t kk = k; kk < K; kk += K_reduced) {
+          uint64_t reduced_cumsum_k = sorted_topK_cumsums_reduced_[kk],
+              delta_P = sorted_topK_delta_P_[kk];
+          partial_sum += (rand >= reduced_cumsum_k) * delta_P;
+        }
+        buf[threadIdx.x] = partial_sum;
       }
       __syncthreads();
-      for (uint32_t s = 1; s < K; s *= 2) {
+      for (uint32_t s = 1; s < K_reduced; s *= 2) {
         if (k2 < K && threadIdx.x % (2*s) == 0)
           buf[threadIdx.x] += buf[threadIdx.x + s];
         __syncthreads();
       }
       if (k2 < K) {
-        uint64_t delta_P_sum = buf[k2 * K],
+        uint64_t delta_P_sum = buf[k2 * K_reduced],
             rand_shifted = rand + delta_P_sum;
         if (k == 0)
           unreduced_samples_[k2] = rand_shifted;
@@ -913,6 +919,7 @@ sample_combined_forward_cuda(torch::Tensor probs, // [B][N][M]
   int grid_dim_x = std::min<int>(B, 256),
       block_dim_x = std::min(std::max(M_round, K*K), 256);
 
+  TORCH_CHECK(K < 256);
 
   // the order in which we list these buffers differs from their declaration ordere,
   // because we are trying to keep the expressions for working out addresses, generally

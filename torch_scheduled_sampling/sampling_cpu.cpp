@@ -33,8 +33,7 @@ void print_array(IntT *buf, int num_items, const char *name) {
   for (int i = 0; i < num_items; i++) {
     printf("%ld ",  (long)buf[i]);
   }
-  printf("]\n");
-  */
+  printf("]\n"); */
 }
 
 
