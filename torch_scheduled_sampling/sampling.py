@@ -72,7 +72,7 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
     K *distinct* samples.  This entails using sampling weights of the form min(1, p/beta)
     for a computed beta.
     Args:
-         p: A Tensor of shape (*, N, M): either normalized log-probs (if input_is_log==False),
+         p: A Tensor of shape (*, N, M): either normalized log-probs (if input_is_log==True),
              or normalized probabilities; normalized along the M axis.  M must be
              a power of 2, and N must be in [1,2,3,4].
          K: An integer, the number of samples required, with 0 < K < N
@@ -85,7 +85,7 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
        indexes: of shape (*, K, N), for each of K samples from a distribution it contains
             an N-tuple of indexes saying which combination of indexes from the
             component distributions were sampled.
-      combined_indexes: of shape(*, K),  contains the same information as `indexes` but
+      combined_indexes: of shape (*, K),  contains the same information as `indexes` but
             in a different format, specifically:
                `combined_indexes[...,k] = sum_n indexes[...,k,n] * M**n`
        weights: of shape (*, K), gives the weight associated with each sample,
@@ -224,7 +224,7 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
                `combined_indexes[...,k] = sum_n indexes[...,k,n] * M**n`
        weights: of shape (*, K), gives the weight associated with each sample,
             which will equal max(p, beta) for a beta specific to the batch element,
-            i.e. to the product of the distributions (0 < beta <= 1/K).  The
+            i.e. to the input product distribution (0 < beta <= 1/K).  The
             weights will sum to 1 along the K axis.
     """
     return SampleCombinedFunction.apply(p, K, input_is_log)
