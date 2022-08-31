@@ -300,7 +300,15 @@ def sample_from_target_marginals(target_marginals: Tensor,
          will have exactly K values per frame set to 1 and the remaining
          values set to 0.
     """
-    int_scale = (2**30) // K
+    # Make sure that K is a power of 2.  This avoids certain potential errors
+    # due to rounding effects, e.g. the possibility that (target_marginals * int_scale)
+    # would get rounded up due to limited float precision, prior to conversion to
+    # integer, leading to elements of int_marginals greater than int_scale, so potentially
+    # duplicates of the same class.
+    assert K & (K-1) == 0, K
+    # note: for testing and validation of the code, I used a small power here, 7 instead of
+    # 30.
+    int_scale = (2**30) // K  # the scale on 1.0 in the marginals, when we integerize.
     int_marginals = (target_marginals * int_scale).to(torch.int32)
     int_marginals_cumsum = int_marginals.cumsum(dim=-1)
     # excsum means exclusive cumsum
@@ -338,17 +346,25 @@ def sample_from_target_marginals(target_marginals: Tensor,
                                  device=target_marginals.device, dtype=torch.int64) %
                    (r_end - r_start))
 
-    # the "+ int_scale" is to avoid the discontinuity in how integer division behaves when the
+    # the "+ K * int_scale" is to avoid the discontinuity in how integer division behaves when the
     # numerator becomes negative.
-    cum_remainder = int_marginals_cumsum + int_scale - r
-    exc_remainder = int_marginals_excsum + int_scale - r
-    print("r_start = ", r_start)
-    print("r_end = ", r_end)
+    # the reason for the "-1" is as follows...
+    # We want a discontinuity between, say,
+    #     (r+n*K - cumsum)==-1, and (r+n*K - cumsum == 0)
+    # but because we are subtracting r from cumsum, the sign is flipped, so we want
+    # a discontinuity between (cumsum-r) == n*K and (cumsum-r) == n*K+1, so we have
+    # to subtract one because it's between n*K-1 and n*K that operator "//" gives a
+    # discontinuity.
+    #
+    # cur_remainder == r -> (int_scale - 1) -> divide by int_scale -> 0
+    # cur_remainder == r+1 -> int_scale -> divide by int_scale -> 1.
+    cum_remainder = int_marginals_cumsum + (int_scale - 1) - r
+    exc_remainder = int_marginals_excsum + (int_scale - 1) - r
 
     is_this_class = ((exc_remainder // int_scale) < (cum_remainder // int_scale)).to(torch.int64)
-    sum = is_this_class.sum(dim=1)
-    print(f"K={K}, sum={sum}")
-    assert torch.all(is_this_class.sum(dim=1) == K)
+    #sum = is_this_class.sum(dim=1)
+    #print(f"K={K}, sum={sum}, r={r.flatten()}")
+    #assert torch.all(is_this_class.sum(dim=1) == K)
     return is_this_class
 
 
