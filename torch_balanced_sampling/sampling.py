@@ -15,35 +15,74 @@ def _resolve(name):
 
 
 try:
-    import torch_balanced_sampling_cpu
+    import balanced_sampling_cpu
 except ImportError:
     if VERBOSE:
-        print('Falling back to JIT compiling torch_balanced_sampling_cpu')
+        print('Falling back to JIT compiling balanced_sampling_cpu')
     if False:
-        torch_balanced_sampling_cpu = load(
-        name='sample_combined_forward_cpu',
+        balanced_sampling_cpu = load(
+        name='balanced_sampling_cpu',
         sources=[
-            _resolve('sampling_cpu.cpp'),
+            _resolve('balanced_sampling_cpu.cpp'),
         ],
         verbose=VERBOSE,
     )
 
-
 try:
-    import torch_balanced_sampling_cuda
+    import balanced_sampling_cuda
 except ImportError:
     if VERBOSE:
-        print('Falling back to JIT compiling torch_balanced_sampling_cuda')
-    torch_balanced_sampling_cuda = None
+        print('Falling back to JIT compiling balanced_sampling_cuda')
+    balanced_sampling_cuda = None
     if False and torch.cuda.is_available(): # TEMP
-        torch_balanced_sampling_cuda = load(
-            name='sample_combined_forward_cuda',
+        balanced_sampling_cuda = load(
+            name='balanced_sampling_cuda',
             sources=[
-                _resolve('sampling_cuda.cpp'),
-                _resolve('sampling_cuda_kernel.cu'),
+                _resolve('balanced_sampling_cuda.cpp'),
+                _resolve('balanced_sampling_cuda_kernel.cu'),
             ],
             verbose=VERBOSE,
         )
+
+
+def compute_count_indexes(
+        counts: torch.Tensor,
+        max_count: int) -> Tensor:
+    """
+    Returns a Tensor of torch.int32 containing the indexes (e.g. class indexes)
+    that have nonzero counts, or -1 for padding.  The indexes will be indexes into
+    the last dim of `counts`.
+    Args:
+        counts: a Tensor containing counts >= 0, of type torch.int32;
+            usually these will be zero or 1, but in any case
+            for efficiency they should be fairly small numbers (the implementation
+            has a loop on GPU)
+     max_count: the largest number of counts that might appear in any given
+            "row" of counts, i.e. the user asserts that:
+            torch.all(counts.sum(dim=-1) <= max_count)
+   Returns:
+      a Tensor of shape (*, max_count), with the size of the final dim of `counts`
+      replaced with `max_count`.  For as many counts as exist for each row,
+      the final index into `counts` will be present; then -1's will be present.
+    """
+    orig_shape = counts.shape
+    if len(counts.shape) != 2:
+        counts = counts.reshape(counts.numel // counts.shape[-1],
+                                counts.shape[-1])
+    num_frames = counts.shape[0]
+    num_classes = counts.shape[1]
+    ans = torch.full(num_frames, num_classes, -1,
+                     dtype=torch.int32, device=counts.device)
+
+    if counts.is_cuda:
+        if balanced_sampling_cuda is None:
+            raise EnvironmentError(f'Failed to load native CUDA module')
+        balanced_sampling_cuda.compute_count_indexes(counts, max_count, ans)
+    else:
+        balanced_sampling_cpu.compute_count_indexes(counts, max_count, ans)
+
+    counts = counts.reshape(*orig_shape[:-1], max_count)
+    return counts
 
 
 
@@ -342,9 +381,9 @@ def sample_from_target_marginals(target_marginals: Tensor,
     r_end = tot - ((K-1) * int_scale)
 
     num_frames = target_marginals.shape[0]
-    r = r_start + (torch.randint(low=0, high=2**63-1, size=(num_frames, 1),
+    r = r_start + ((torch.randint(low=0, high=2**63-1, size=(num_frames, 1),
                                  device=target_marginals.device, dtype=torch.int64) %
-                   (r_end - r_start))
+                   (r_end - r_start))).to(torch.int32)
 
     # the "+ K * int_scale" is to avoid the discontinuity in how integer division behaves when the
     # numerator becomes negative.
@@ -361,7 +400,7 @@ def sample_from_target_marginals(target_marginals: Tensor,
     cum_remainder = int_marginals_cumsum + (int_scale - 1) - r
     exc_remainder = int_marginals_excsum + (int_scale - 1) - r
 
-    is_this_class = ((exc_remainder // int_scale) < (cum_remainder // int_scale)).to(torch.int64)
+    is_this_class = ((exc_remainder // int_scale) < (cum_remainder // int_scale)).to(torch.int32)
     #sum = is_this_class.sum(dim=1)
     #print(f"K={K}, sum={sum}, r={r.flatten()}")
     #assert torch.all(is_this_class.sum(dim=1) == K)
@@ -500,17 +539,26 @@ where samples_per_class == (F*K) // M
                                    torch.zeros(F-B, 1, device=probs.device, dtype=probs.dtype)),
                                   dim=0)
 
+    # Approximately rebalance logprobs so target marginals are approx. equal; compute
+    # target marginals.
     log_p = balance_target_marginals(log_p, padding_scale, K, num_iters=2)
     p = log_p.softmax(dim=-1)  # 'adjusted' probability.
 
     target_marginals = compute_target_marginals(p, K)
 
+    # class_counts: zero or one counts of shape (F, M)
+    # i.e. (num_frames_padded, num_classes)
+    class_counts = sample_from_target_marginals(target_marginals, K)
+    # zero class counts that are on padding frames.
+    class_counts *= padding_scale.to(class_counts.dtype)
+
+    class_counts_Fcumsum = class_counts.cumsum(dim=0)
+    class_counts_Mcumsum = class_counts.cumsum(dim=1)
+
+    # class_counts_tot: total counts per class, of shape (M,)
+    class_counts_tot = class_counts_Fcumsum[-1,:]
 
 
-
-
-    # (2) approximately rebalance logprobs so target marginals are approx. equal; compute
-    #     target marginals.
 
 
 
@@ -833,11 +881,26 @@ def _test_sample_from_target_marginals():
     assert torch.all(samples.sum(dim=1) == K)
 
 
+def _test_compute_count_indexes():
+    counts = torch.tensor([ [ 0, 1, 0, 0 ],
+                            [ 0, 0, 1, 1 ],
+                            [ 2, 0, 0, 0 ] ],
+                          dtype=torch.int32)
+    max_count = 2
+    ans = compute_count_indexes(counts, max_count)
+    ans_ref = torch.tensor([ [ 1, -1 ],
+                             [ 2, 3 ],
+                             [ 0, 0 ] ],
+                           dtype=torch.int32)
+    assert torch.all(ans == ans_ref)
+
+
+
+
 if __name__ == '__main__':
     _test_sample_from_target_marginals()
-
-
-    _test_sample_combined_forward_compare0()
+    _test_compute_count_indexes()
+    _test_sample_combined_forward_compare()
     _test_sample_combined_speed()
     _test_sample_combined_forward_compare()
     _test_sample_combined_forward()

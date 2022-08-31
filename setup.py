@@ -24,7 +24,7 @@ to model the probability of the output distribution.
 def configure_extensions():
     out = [
         CppExtension(
-            'torch_balanced_sampling_cpu',
+            'balanced_sampling_cpu',
             [
                 os.path.join('torch_balanced_sampling', 'sampling_cpu.cpp'),
             ],
@@ -36,10 +36,10 @@ def configure_extensions():
         this_dir = pathlib.Path(__file__).parent.resolve()
         out.append(
             CUDAExtension(
-                'torch_balanced_sampling_cuda',
+                'balanced_sampling_cuda',
                 [
-                    os.path.join('torch_balanced_sampling', 'sampling_cuda.cpp'),
-                    os.path.join('torch_balanced_sampling', 'sampling_cuda_kernel.cu'),
+                    os.path.join('torch_balanced_sampling', 'balanced_sampling_cuda.cpp'),
+                    os.path.join('torch_balanced_sampling', 'balanced_sampling_cuda_kernel.cu'),
                 ],
                 extra_compile_args={'cxx': [], 'nvcc': [f'-I{this_dir}/cub']}
             )
