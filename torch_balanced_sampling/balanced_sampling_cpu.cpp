@@ -851,9 +851,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
 
 
 
-
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("sample_combined_forward_cpu", &sample_combined_forward_cpu,
-        "Multi-softmax sampling function forward (CPU)");
+  m.def("compute_count_indexes", &compute_count_indexes,
+        "Utility function to compute count indexes")
 }
