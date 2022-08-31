@@ -19,8 +19,7 @@ try:
 except ImportError:
     if VERBOSE:
         print('Falling back to JIT compiling balanced_sampling_cpu')
-    if False:
-        balanced_sampling_cpu = load(
+    balanced_sampling_cpu = load(
         name='balanced_sampling_cpu',
         sources=[
             _resolve('balanced_sampling_cpu.cpp'),
@@ -71,15 +70,16 @@ def compute_count_indexes(
                                 counts.shape[-1])
     num_frames = counts.shape[0]
     num_classes = counts.shape[1]
-    ans = torch.full(num_frames, num_classes, -1,
+    ans = torch.full((num_frames, max_count), -1,
                      dtype=torch.int32, device=counts.device)
 
     if counts.is_cuda:
         if balanced_sampling_cuda is None:
             raise EnvironmentError(f'Failed to load native CUDA module')
-        balanced_sampling_cuda.compute_count_indexes(counts, max_count, ans)
+        counts_cumsum = counts.cumsum(dim=1)
+        balanced_sampling_cuda.compute_count_indexes(counts_cumsum, ans)
     else:
-        balanced_sampling_cpu.compute_count_indexes(counts, max_count, ans)
+        balanced_sampling_cpu.compute_count_indexes(counts, ans)
 
     counts = counts.reshape(*orig_shape[:-1], max_count)
     return counts
