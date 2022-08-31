@@ -853,5 +853,5 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("compute_count_indexes", &compute_count_indexes,
-        "Utility function to compute count indexes")
+        "Utility function to compute count indexes");
 }

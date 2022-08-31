@@ -26,7 +26,7 @@ def configure_extensions():
         CppExtension(
             'balanced_sampling_cpu',
             [
-                os.path.join('torch_balanced_sampling', 'sampling_cpu.cpp'),
+                os.path.join('torch_balanced_sampling', 'balanced_sampling_cpu.cpp'),
             ],
             extra_compile_args=['-g', '-O0'],
         )
