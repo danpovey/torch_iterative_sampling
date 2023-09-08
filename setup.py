@@ -41,7 +41,7 @@ def configure_extensions():
                     os.path.join('torch_scheduled_sampling', 'sampling_cuda.cpp'),
                     os.path.join('torch_scheduled_sampling', 'sampling_cuda_kernel.cu'),
                 ],
-                extra_compile_args={'cxx': [], 'nvcc': [f'-I{this_dir}/cub']}
+                extra_compile_args={'cxx': [], 'nvcc': []}
             )
         )
     except Exception as e:

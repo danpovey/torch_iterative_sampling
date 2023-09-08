@@ -1,3 +1,0 @@
-[submodule "torch_iterative_sampling/cub"]
-	path = cub
-	url = https://github.com/NVlabs/cub.git

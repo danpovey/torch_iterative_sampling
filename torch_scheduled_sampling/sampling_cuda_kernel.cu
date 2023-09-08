@@ -1,18 +1,6 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>  // for getCurrentCUDAStream()
 
-/*
-// We have included cub as a submodule as ../cub, and added the flag "-Icub" via
-// setup.py.  This is fixed to the tag v1.8.0, since the current master gave us
-// a compilation error; the choice of v1.8.0 was very random, just "an older
-// version", hopefully old enough to be easy to compile but not so old as to be
-// significantly worse.  In general it is not OK to use cub in a torch
-// submodule, as it can lead to linking problems; however, I am hoping that
-// since we only use block-level functionality (BlockScan), and not
-// device-level, it will be used purely as a template library without causing
-// any C-language global or namespace variables to be instantiated (I think
-// those are what cause the compatibility problems with Torch).
-#include <cub/cub.cuh>*/
 #include <cooperative_groups.h>
 #include <cmath>  // for INFINITY
 #include <stdio.h>
@@ -325,7 +313,7 @@ void sample_combined_forward_kernel(
     uint32_t K, bool input_is_log, uint32_t p_bits,
     uint32_t M_bits, uint32_t K_bits, uint32_t M_unique,
     uint32_t K_nthroot) {
-  //__shared__ typename BlockScan::TempStorage temp_storage;
+
   int B = probs.size(0);  // batch size
   uint32_t N = probs.size(1),  // num distributions
       M = probs.size(2),  // num classes

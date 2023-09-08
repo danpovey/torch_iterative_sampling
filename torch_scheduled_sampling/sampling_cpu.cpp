@@ -469,9 +469,6 @@ class CombinedSampler {
     //     and the corresponding [K] products of probabilities, ordered from
     //     largest to smallest.
 
-    // in CUDA we'll do this sequentially over n (to save memory) and
-    // via a parallel sorting algorithm from cub over k.
-
     uint32_t M_bits = M_bits_, M = M_, N = N_, K = K_;
 
     for (uint32_t n = 0; n < N; n++) {
@@ -540,7 +537,7 @@ class CombinedSampler {
       }
     }
     uint64_t topK_P_sum = 0;
-    for (uint32_t k = 0; k < K; k++) {  // this would be done using a cub exclusive-sum.
+    for (uint32_t k = 0; k < K; k++) {
       topK_P_exclusive_sum_[k] = topK_P_sum;
       topK_P_sum += topK_P_[k];
     }
