@@ -1,7 +1,6 @@
 include requirements.txt
 include pyproject.toml
 include LICENSE*
-recursive-include torch_iterative_sampling *
-recursive-include doc/img *
+recursive-include torch_scheduled_sampling *
 recursive-include tests *
 global-exclude *.pyc

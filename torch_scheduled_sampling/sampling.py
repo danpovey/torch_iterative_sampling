@@ -73,9 +73,9 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
     for a computed beta.
     Args:
          p: A Tensor of shape (*, N, M): either normalized log-probs (if input_is_log==True),
-             or normalized probabilities; normalized along the M axis.  M must be
-             a power of 2, and N must be in [1,2,3,4].
-         K: An integer, the number of samples required, with 0 < K < N
+             or normalized probabilities; normalized along the M axis.
+             N must be in [1,2,3,4].
+         K: An integer, the number of samples required, with 0 < K < M
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
        rand: of shape (*,), containing random numbers in 0..2**63-1, this is provided
@@ -193,25 +193,17 @@ class SampleCombinedFunction(torch.autograd.Function):
         return p_grad, None, None
 
 
-def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor]:
+def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tensor, Tensor]:
     """
     Sample from a distribution that is the product of softmaxes.  We will sample
     K *distinct* samples.  This entails using sampling weights of the form min(1, p/beta)
     for a computed beta.
     Args:
          p: A Tensor of shape (*, N, M): either normalized log-probs (if input_is_log==False),
-             or normalized probabilities; normalized along the M axis.  M must be
-             a power of 2, and N must be in [1,2,3,4].
-             [We can later relax the requirement that M be a power of 2.  The assumption is now
-              only used for convenience of sampling a random number coprime to M, i.e. with
-              s = 1 + 2*(torch.randint(M//2, shape)), but in general we can replace the 2 in
-              this formula by the product of distinct prime factors in M, e.g. for 768
-              this would be 6 because the prime factors are 2 and 3.  This is not totally optimal
-              as we end up only choosing a subset of the numbers coprime to M,
-              but it will be fine for typical cases because no sane person chooses parameter sizes
-              with large prime factors and anyway we only need to randomize the order a little
-              bit to reduce the correlation between indexes to a reasonable level.]
-         K: An integer, the number of samples required, with 0 < K < N
+             or normalized probabilities; normalized along the M axis.
+             N must be in [1,2,3,4]; in the common case, N will be 1, you can use unsqueeze().
+
+         K: An integer, the number of samples required, with 0 < K < M
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
 
