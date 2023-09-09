@@ -294,8 +294,8 @@ def compute_beta_prods(Psum, Ptop):
     return B, topK_delta_P
 
 def compute_unreduced_samples(topK_cumsums_reduced: Tensor,
-                            topK_delta_P: Tensor,
-                            samples: Tensor) -> Tensor:
+                              topK_delta_P: Tensor,
+                              samples: Tensor) -> Tensor:
     """
     Modified randomly sampled values by adding values to correct for "disallowed regions",
     i.e. parts of probability space that we skip because they correspond to a probability
@@ -865,7 +865,7 @@ def _test_soft_sample():
 
 def _test_combined():
     N = 2
-    K = 4
+    K = 6
     M = 8
 
     P = ((5 * torch.randn(2, N, M)).softmax(dim=-1) * 16 + 1).to(dtype=torch.int64)
@@ -999,7 +999,7 @@ def _test_combined():
 
 def _test_sample_combined():
     for N in [2, 3]:
-        K = 4
+        K = 6
         M = 8
 
         p = torch.randn(2, N, M).log_softmax(dim=-1)

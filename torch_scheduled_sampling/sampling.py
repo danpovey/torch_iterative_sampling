@@ -75,7 +75,9 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
          p: A Tensor of shape (*, N, M): either normalized log-probs (if input_is_log==True),
              or normalized probabilities; normalized along the M axis.
              N must be in [1,2,3,4].
-         K: An integer, the number of samples required, with 0 < K < M
+         K: An integer, the number of samples required, with 0 < K < M,
+            Currently required to be a power of 2, due to specifics of the CUDA
+            implementation.
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
        rand: of shape (*,), containing random numbers in 0..2**63-1, this is provided
@@ -98,6 +100,9 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
     p = p.detach()  # call sample_combined() if you need derivatives.
     N = p.shape[-2]
     M = p.shape[-1]
+    assert K & (K-1) == 0  # power of 2, required by the CUDA code I believe,
+                           # likely this was done to make coding certain reductions
+                           # easier.
     assert K > 0 and K < M
 
     pshape = p.shape
@@ -202,7 +207,8 @@ def sample_combined(p: Tensor, K: int, input_is_log: bool) -> Tuple[Tensor, Tens
              or normalized probabilities; normalized along the M axis.
              N must be in [1,2,3,4]; in the common case, N will be 1, you can use unsqueeze().
 
-         K: An integer, the number of samples required, with 0 < K < M
+         K: An integer, the number of samples required, with 0 < K < M; currently this is
+            required to be a power of 2.
    input_is_log:  True if p represents normalized log-probs, False if it represents
              probabilities.
 

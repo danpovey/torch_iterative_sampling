@@ -122,6 +122,7 @@ class CombinedSampler {
       N_(N), M_(M), K_(K),
       M_unique_(find_prod_unique_prime_factors(M)) {
     TORCH_CHECK(N < 5);
+    //TORCH_CHECK((K&(K-1)) == 0);  // require K is a power of 2.  (have to figure why I required this.    )
     M_bits_ = find_num_bits_for(M);
     K_bits_ = find_num_bits_for(K);
 
@@ -445,7 +446,7 @@ class CombinedSampler {
    */
   uint32_t *indexes_for_samples_;
 
-  uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to
+  uint32_t find_prod_unique_prime_factors(uint32_t i) { // returns smallest number coprime to i
     TORCH_CHECK(i != 0);
     uint32_t ans = 1;
     for (uint32_t p = 2; i != 1; p++) {
@@ -530,7 +531,7 @@ class CombinedSampler {
       for (uint32_t n = 0; n < N ; n++) {
         // src_k is the k index among the top-K source items for this `n`.  We
         // need to look up the original 'm' index
-        uint32_t src_k = (combination >> (n * K_bits)) & (K-1),
+        uint32_t src_k = (combination >> (n * K_bits)) & ((1 << K_bits) - 1),
             src_m = sort_buf32_[K*n + src_k] & M_mask;
         topK_indexes_[k*N + n] = src_m;
       }
@@ -652,7 +653,7 @@ class CombinedSampler {
 
     for (uint32_t k = 0; k < K; k++) {
       uint64_t cumsum_with_k = topK_cumsums_[k];
-      uint32_t k_orig = cumsum_with_k & (K-1);
+      uint32_t k_orig = cumsum_with_k & ((1 << K_bits) - 1);
       uint64_t cumsum = cumsum_with_k >> K_bits;
       sorted_topK_cumsums_[k] = cumsum;  // remove the index.
 
@@ -802,7 +803,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
       M = probs.size(2);  // num classes
   TORCH_CHECK(rand.size(0) == B);
 
-  TORCH_CHECK(K > 0 && K < M);  // K is sequence length
+  TORCH_CHECK(K > 0 && K < M); //  && ((K&(K-1))==0));  // K is sequence length
   TORCH_CHECK(N >= 0 && N <= 4);
   TORCH_CHECK(rand.size(0) == B);
 
