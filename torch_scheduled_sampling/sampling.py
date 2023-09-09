@@ -66,7 +66,7 @@ _max_bits = 54  # used in sample_combined_forward and sample_combined_backward,
                 # see comment in sample_combined_forward.
 
 def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
-                            rand: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
+                            rand: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """
     Sample from a distribution that is the product of softmaxes.  We will sample
     K *distinct* samples.  This entails using sampling weights of the form min(1, p/beta)
@@ -81,7 +81,7 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
        rand: of shape (*,), containing random numbers in 0..2**63-1, this is provided
            for testing purposes, you will not normally need to pass this in.
 
-    Returns: (indexes, combined_indexes, weights, epsilon)
+    Returns: (indexes, combined_indexes, weights)
        indexes: of shape (*, K, N), for each of K samples from a distribution it contains
             an N-tuple of indexes saying which combination of indexes from the
             component distributions were sampled.
@@ -98,7 +98,6 @@ def sample_combined_forward(p: Tensor, K: int, input_is_log: bool,
     p = p.detach()  # call sample_combined() if you need derivatives.
     N = p.shape[-2]
     M = p.shape[-1]
-    assert K & (K-1) == 0
     assert K > 0 and K < M
 
     pshape = p.shape
@@ -289,7 +288,7 @@ def _test_sample_combined_forward_compare0():
         assert epsilon == epsilon_cuda.to('cpu')
 
 def _test_sample_combined_forward():
-    for device in [torch.device('cpu'), torch.device('cuda')]:
+    for device in [torch.device('cpu')] +  ([torch.device('cuda')] if torch.cuda.is_available() else []):
         B = 2
         N = 2
         M = 16
@@ -392,9 +391,10 @@ def _test_sample_combined_speed():
 
 
 if __name__ == '__main__':
-    _test_sample_combined_forward_compare0()
-    _test_sample_combined_speed()
-    _test_sample_combined_forward_compare()
+    if torch.cuda.is_available():
+        _test_sample_combined_forward_compare0()
+        _test_sample_combined_speed()
+        _test_sample_combined_forward_compare()
     _test_sample_combined_forward()
     _test_sample_combined_forward_average()
     _test_sample_combined_mean()

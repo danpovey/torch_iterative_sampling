@@ -122,7 +122,6 @@ class CombinedSampler {
       N_(N), M_(M), K_(K),
       M_unique_(find_prod_unique_prime_factors(M)) {
     TORCH_CHECK(N < 5);
-    TORCH_CHECK((K&(K-1)) == 0);  // require K is a power of 2.
     M_bits_ = find_num_bits_for(M);
     K_bits_ = find_num_bits_for(K);
 
@@ -803,7 +802,7 @@ sample_combined_forward_cpu(torch::Tensor probs, // [B][N][M]
       M = probs.size(2);  // num classes
   TORCH_CHECK(rand.size(0) == B);
 
-  TORCH_CHECK(K > 0 && K < M && ((K&(K-1))==0));  // K is sequence length
+  TORCH_CHECK(K > 0 && K < M);  // K is sequence length
   TORCH_CHECK(N >= 0 && N <= 4);
   TORCH_CHECK(rand.size(0) == B);
 
