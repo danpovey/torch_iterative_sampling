@@ -70,7 +70,7 @@ indexes, _combined_indexes, weights = sample_combined(logprobs, K=2, input_is_lo
 print(indexes.shape)
 print(indexes.squeeze(-1))
 print(weights.squeeze(-1))
-windexes, _combined_indexes, weights = sample_combined(logprobs, K=2, input_is_log=True)
+indexes, _combined_indexes, weights = sample_combined(logprobs, K=2, input_is_log=True)
 importance_logprobs = weights.log() - torch.gather(logprobs, dim=2, index=indexes.transpose(1, 2)).squeeze(1)
 print(importance_logprobs)
 ```
